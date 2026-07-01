@@ -293,6 +293,7 @@ class AREDAdapter:
         meta = meta or {}
         emb = np.asarray(embedding, dtype=np.float32).reshape(-1)
 
+        print(f"[ARED] received tile for process (meta={meta})")
         with self._lock:
             abs_idx = self.ared.abs_index + 1   # what it will become inside
 
@@ -304,11 +305,20 @@ class AREDAdapter:
             obtained_label = None
             obtained_rel = None
 
+            # Track invocations of answer_query during this single process() call.
+            # ARED always does a "peek" answer_query (for stats) on every point.
+            # Only on "real" query decisions (anomalous/near-relevant) does it call a 2nd time.
+            # We must NOT force GUI/human on peeks, only on actual A/RED query decisions.
+            hook_calls = [0]
+
             def _interactive_answer(_abs_index: int) -> Tuple[str, bool]:
                 nonlocal was_queried, obtained_label, obtained_rel
-                was_queried = True
+                hook_calls[0] += 1
+                call_num = hook_calls[0]
 
-                # 1. Try persistent cache first (the "query future runs without user" feature)
+                is_peek = (call_num == 1 and self.num_points_processed > 0)
+
+                # 1. Try persistent cache first -- always, for both peek and real queries
                 if getattr(self, "_label_store", None) is not None:
                     cached = self._label_store.lookup(emb)
                     if cached is not None:
@@ -317,16 +327,42 @@ class AREDAdapter:
                         obtained_rel = rel
                         self.oracle.y[_abs_index] = [label, rel]  # type: ignore
                         self.discovered_labels.add(label)
-                        # Still count as a "query" from ARED's perspective, but it was a cache hit
+                        if is_peek:
+                            print(f"[ARED]   -> Cache HIT on peek for abs_idx={_abs_index}. Auto (no GUI).")
+                        else:
+                            print(f"[ARED]   -> Cache HIT for this query. Auto-labeled as '{label}' (relevant={rel}). No GUI.")
                         return label, rel
+                    else:
+                        if is_peek:
+                            print(f"[ARED]   -> Cache MISS on peek (will use provisional, no GUI).")
+                        else:
+                            print(f"[ARED]   -> Cache MISS. Will request label from provider (GUI or fallback).")
 
-                # 2. Fall back to the registered provider (normally the GUI)
+                if is_peek:
+                    # Peek call (internal ARED accounting for non-queried points).
+                    # Do NOT call human/GUI provider here -- that would query on every tile.
+                    # Supply a provisional so ARED can continue; real cluster label may be back-filled later.
+                    label = meta.get("label", f"__PEEK_{abs_idx % 100}")
+                    rel = bool(meta.get("relevant", False))
+                    obtained_label = label
+                    obtained_rel = rel
+                    self.oracle.y[_abs_index] = [label, rel]  # type: ignore
+                    print(f"[ARED] Peek answer_query (call#{call_num}) for abs_idx={_abs_index} -- provisional (no oracle query to user).")
+                    return label, rel
+
+                # This is a real query path (2nd hook call during process, or first_point).
+                was_queried = True
+                print(f"[ARED] A_RED decided to QUERY (sending request to oracle shim) for abs_idx={_abs_index} (tile meta: {meta}) (real decision, call#{call_num})")
+
+                # 2. Fall back to the registered provider (normally the GUI) -- only for real queries
                 if self._label_provider is None:
                     # Fallback for headless / synthetic tests
                     label = meta.get("label", f"auto_{abs_idx % 5}")
                     rel = bool(meta.get("relevant", False))
+                    print(f"[ARED]   -> No provider, using fallback label '{label}' (relevant={rel})")
                 else:
                     label, rel = self._label_provider(emb, tile_image, meta)
+                    print(f"[ARED]   -> Provider returned label '{label}' (relevant={rel})")
 
                 obtained_label = label
                 obtained_rel = rel
@@ -337,8 +373,9 @@ class AREDAdapter:
                 if getattr(self, "_label_store", None) is not None:
                     try:
                         self._label_store.add(emb, label, rel)
-                    except Exception:
-                        pass
+                        print(f"[ARED]   -> Added to label store for future cache hits.")
+                    except Exception as e:
+                        print(f"[ARED]   -> WARNING: Failed to add to label store: {e}")
                 return label, rel
 
             # Temporarily install
@@ -371,8 +408,10 @@ class AREDAdapter:
                         cluster_key = cb.get(-1)
                         if cluster_key in self.ared.subspace_partition.cluster_dict:
                             cl = self.ared.subspace_partition.cluster_dict[cluster_key]
-                            self.oracle.y[abs_idx] = [cl.label, cl.relevance]  # type: ignore
-                            self.discovered_labels.add(cl.label)
+                            obtained_label = cl.label
+                            obtained_rel = cl.relevance
+                            self.oracle.y[abs_idx] = [obtained_label, obtained_rel]  # type: ignore
+                            self.discovered_labels.add(obtained_label)
                 except Exception:
                     pass  # best effort only
 
@@ -389,6 +428,11 @@ class AREDAdapter:
                 "num_clusters": len(self.ared.subspace_partition.cluster_dict),
                 "num_known_labels": len(self.ared.subspace_partition.set_of_known_labels),
             }
+            if not was_queried:
+                print(f"[ARED] Point abs_idx={abs_idx} did NOT trigger a (real) query. ARED assigned internally (peek satisfied with provisional or cache). label='{obtained_label}'")
+            else:
+                print(f"[ARED] A_RED query to oracle COMPLETE for abs_idx={abs_idx}. Label='{obtained_label}' (relevant={obtained_rel})")
+            print(f"[ARED] Finished processing point. Total processed: {self.num_points_processed}, queries so far: {self.num_queries}")
             return info
 
     # ------------------------------------------------------------------

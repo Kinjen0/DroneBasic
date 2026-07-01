@@ -188,16 +188,22 @@ class DroneAREDController:
             # This runs in the ARED worker thread.
             # A/RED decides whether a "query" is needed (anomalous or near-relevant cluster).
             # We only pop the GUI when we cannot satisfy from the persistent label cache.
+            print(f"[Pipeline] _gui_label_provider called for tile: {meta} (emb shape: {emb.shape if hasattr(emb,'shape') else 'N/A'})")
+
             if self.label_store is not None:
                 hit = self.label_store.lookup(emb)
                 if hit:
                     self.stats["cache_hits"] = self.stats.get("cache_hits", 0) + 1
+                    print(f"[Pipeline]   -> Label store CACHE HIT: '{hit[0]}' (relevant={hit[1]}). Returning without GUI.")
                     # Important: still return the label so A/RED can use it to grow clusters
                     # without forcing a human every time.
                     return hit
+                else:
+                    print(f"[Pipeline]   -> Label store CACHE MISS.")
 
             # Real human labeling needed
             self.stats["user_queries"] = self.stats.get("user_queries", 0) + 1
+            print(f"[Pipeline]   -> Requesting HUMAN label via GUI (user_queries now {self.stats['user_queries']})  meta={meta}")
 
             req = LabelRequest(tile=tile_img or Tile(image=Image.new("RGB", (64, 64)), frame_idx=0, tile_row=0, tile_col=0, bbox=(0,0,0,0)),
                                embedding=emb, meta=meta)
@@ -205,29 +211,46 @@ class DroneAREDController:
                 self.label_request_queue.put(req, timeout=5)
             except queue.Full:
                 # Fallback: treat as irrelevant background if GUI is overwhelmed
+                print("[Pipeline]   -> WARNING: label queue full, falling back to __BACKGROUND__")
                 return "__BACKGROUND__", False
 
+            print("[Pipeline]   -> Waiting for GUI response (blocking worker thread)...")
             result = req.wait(timeout=300)  # 5 minutes max for a single label - generous
             if result is None:
+                print("[Pipeline]   -> TIMEOUT waiting for label, using __TIMEOUT__")
                 return "__TIMEOUT__", False
+            print(f"[Pipeline]   -> Received label from GUI: '{result[0]}' (relevant={result[1]})")
             return result
 
         self.ared_adapter.set_label_provider(_gui_label_provider)
 
     def _run_loop(self):
         """Main worker loop: for each video, for selected frames, tile -> embed -> ARED."""
+        print("[Pipeline] Worker thread started. Processing will log each tile and any ARED queries.")
         self.stats["status"] = "running"
         videos = self.config.video_paths or []
 
-        for vpath in videos:
-            if self._stop_event.is_set():
-                break
-            self.stats["current_video"] = Path(vpath).name
-            self._process_one_video(vpath)
+        try:
+            for vpath in videos:
+                if self._stop_event.is_set():
+                    break
+                self.stats["current_video"] = Path(vpath).name
+                self._process_one_video(vpath)
 
-        self.stats["status"] = "finished"
-        if self.on_stats:
-            self.on_stats(self.stats.copy())
+            self.stats["status"] = "finished"
+            print(f"[Pipeline] All videos finished. Final stats: {self.stats}")
+            if self.on_stats:
+                self.on_stats(self.stats.copy())
+        except Exception as e:
+            print("[Pipeline] FATAL ERROR in worker thread (this would cause silent freeze):", e)
+            import traceback
+            traceback.print_exc()
+            self.stats["status"] = "error"
+            if self.on_stats:
+                try:
+                    self.on_stats(self.stats.copy())
+                except Exception:
+                    pass
 
     def _process_one_video(self, video_path: str):
         if not HAS_CV2:
@@ -239,85 +262,116 @@ class DroneAREDController:
             print(f"[Controller] Failed to open {video_path}")
             return
 
+        print(f"[Pipeline] Starting video: {video_path}")
         frame_idx = -1
         frame_stride = max(1, self.config.tiling.frame_stride)
         batch_imgs: List[Image.Image] = []
         batch_tiles: List[Tile] = []
 
         try:
-            while not self._stop_event.is_set():
-                # Pause handling
-                self._pause_event.wait()  # blocks while paused
-                if self._stop_event.is_set():
-                    break
+            try:
+                while not self._stop_event.is_set():
+                    # Pause handling
+                    self._pause_event.wait()  # blocks while paused
+                    if self._stop_event.is_set():
+                        break
 
-                ret, frame = cap.read()
-                if not ret:
-                    break
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
 
-                frame_idx += 1
-                self.stats["frames_read"] = frame_idx + 1
+                    frame_idx += 1
+                    self.stats["frames_read"] = frame_idx + 1
 
-                if frame_idx % frame_stride != 0:
-                    continue
+                    if frame_idx % frame_stride != 0:
+                        continue
 
-                # Convert BGR (cv2) -> RGB
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    print(f"[Pipeline] Processing frame {frame_idx} (stride={frame_stride})")
 
-                # Tile
-                tiles = self.tiler.tile_frame(frame_rgb, frame_idx, self._global_tile_counter)
-                if not tiles:
-                    continue
+                    # Convert BGR (cv2) -> RGB
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-                # Collect for batched feature extraction
-                for t in tiles:
-                    batch_tiles.append(t)
-                    batch_imgs.append(t.image)
-                    self._global_tile_counter += 1
+                    # Tile
+                    tiles = self.tiler.tile_frame(frame_rgb, frame_idx, self._global_tile_counter)
+                    if not tiles:
+                        continue
 
-                    # Flush batch when full or at end of logical group
-                    if len(batch_imgs) >= self.config.features.batch_size:
+                    # Collect for batched feature extraction
+                    for t in tiles:
+                        batch_tiles.append(t)
+                        batch_imgs.append(t.image)
+                        self._global_tile_counter += 1
+
+                        # Flush batch when full or at end of logical group
+                        if len(batch_imgs) >= self.config.features.batch_size:
+                            self._process_batch(batch_tiles, batch_imgs)
+                            batch_tiles = []
+                            batch_imgs = []
+
+                    # Also flush small remainder periodically
+                    if len(batch_imgs) >= 4:
                         self._process_batch(batch_tiles, batch_imgs)
                         batch_tiles = []
                         batch_imgs = []
 
-                # Also flush small remainder periodically
-                if len(batch_imgs) >= 4:
+                    # Throttle a little so GUI can keep up
+                    time.sleep(0.001)
+
+                # Final flush
+                if batch_imgs:
                     self._process_batch(batch_tiles, batch_imgs)
-                    batch_tiles = []
-                    batch_imgs = []
 
-                # Throttle a little so GUI can keep up
-                time.sleep(0.001)
+                print(f"[Pipeline] Finished video: {video_path}. Total tiles processed so far: {self.stats['tiles_processed']}")
 
-            # Final flush
-            if batch_imgs:
-                self._process_batch(batch_tiles, batch_imgs)
-
-        finally:
-            cap.release()
+            finally:
+                cap.release()
+        except Exception as e:
+            print(f"[Pipeline] ERROR while processing video {video_path}: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _process_batch(self, tiles: List[Tile], pil_images: List[Image.Image]):
         if not tiles or not self.feature_extractor or not self.ared_adapter:
             return
 
-        embs = self.feature_extractor.extract_images(pil_images)
+        try:
+            embs = self.feature_extractor.extract_images(pil_images)
 
-        for tile, emb in zip(tiles, embs):
-            info = self.ared_adapter.process(emb, tile_image=tile, meta={
-                "frame": tile.frame_idx,
-                "row": tile.tile_row,
-                "col": tile.tile_col,
-            })
-            self.stats["tiles_processed"] += 1
-            # "queried" here means A/RED decided it needed a label (cache or human).
-            # We track user_queries separately when we actually show the dialog.
+            for tile, emb in zip(tiles, embs):
+                print(f"[Pipeline->ARED] passing new tile global={tile.global_idx} (frame={tile.frame_idx}, r={tile.tile_row}, c={tile.tile_col}) to A_RED")
+                info = self.ared_adapter.process(emb, tile_image=tile, meta={
+                    "frame": tile.frame_idx,
+                    "row": tile.tile_row,
+                    "col": tile.tile_col,
+                })
+                self.stats["tiles_processed"] += 1
 
-            # Update ARED internal state for GUI display
-            if self.ared_adapter:
-                self.stats["ared_clusters"] = self.ared_adapter.num_clusters
-                self.stats["ared_known_labels"] = self.ared_adapter.num_known_labels
+                ared_queried = info.get("queried", False)
+                label = info.get("label")
+                # Always log finish of tile processing so we can see forward progress even when A/RED is not querying.
+                # This is key to confirm that "Waiting for next query" in the GUI just means A/RED chose not to ask for a label.
+                print(f"[Pipeline] Finished tile global={tile.global_idx} (frame={tile.frame_idx}, r={tile.tile_row}, c={tile.tile_col}). "
+                      f"ARED queried? {ared_queried}  label='{label}'  clusters={info.get('num_clusters', '?')} known_labels={info.get('num_known_labels', '?')}")
 
-            # Push stats to GUI occasionally
-            if self.on_stats and (self.stats["tiles_processed"] % 8 == 0):
-                self.on_stats(self.stats.copy())
+                # "queried" here means A/RED decided it needed a label (cache or human).
+                # We track user_queries separately when we actually show the dialog.
+
+                # Update ARED internal state for GUI display
+                if self.ared_adapter:
+                    self.stats["ared_clusters"] = self.ared_adapter.num_clusters
+                    self.stats["ared_known_labels"] = self.ared_adapter.num_known_labels
+
+                # Push stats to GUI occasionally
+                if self.on_stats and (self.stats["tiles_processed"] % 8 == 0):
+                    self.on_stats(self.stats.copy())
+
+                # Progress heartbeat (uses reliable stats counter so it fires even for long non-query stretches)
+                if (self.stats["tiles_processed"] % 10 == 0) or ared_queried:
+                    print(f"[Pipeline] Progress: tiles_processed={self.stats['tiles_processed']}, "
+                          f"ared_clusters={self.stats.get('ared_clusters', 0)}, "
+                          f"user_queries={self.stats.get('user_queries', 0)}, "
+                          f"cache_hits={self.stats.get('cache_hits', 0)}")
+        except Exception as e:
+            print(f"[Pipeline] ERROR in _process_batch: {e}")
+            import traceback
+            traceback.print_exc()

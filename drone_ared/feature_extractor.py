@@ -121,10 +121,12 @@ class DINOFeatureExtractor(FeatureExtractor):
         if not images:
             return np.empty((0, self.output_dim), dtype=np.float32)
 
+        print(f"[DINO] Processing {len(images)} new tile(s) for feature extraction (model={self.model_name})")
         all_feats: List[np.ndarray] = []
 
         for start in range(0, len(images), self.batch_size):
             batch = images[start : start + self.batch_size]
+            print(f"[DINO]   sub-batch {start}-{start+len(batch)-1} ({len(batch)} tiles)")
             inputs = self.processor(images=batch, return_tensors="pt")
             inputs = {k: v.to(self.device) for k, v in inputs.items()}
 

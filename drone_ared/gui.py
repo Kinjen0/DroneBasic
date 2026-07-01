@@ -67,6 +67,7 @@ class LabelingDialog(tk.Toplevel):
         self._build_ui()
         self._load_and_show_image()
         self._refresh_class_list()
+        self._update_info()
 
         # Keyboard bindings for power users labeling many tiles
         self.bind("<Return>", lambda e: self._assign_selected())
@@ -77,18 +78,12 @@ class LabelingDialog(tk.Toplevel):
         self.after(150, lambda: self.class_list.focus_set())
 
     def _build_ui(self):
-        # Top info bar
+        # Top info bar - use variable so it can be updated for each new tile in persistent window
         info = ttk.Frame(self)
         info.pack(fill="x", padx=8, pady=4)
 
-        req = getattr(self, 'current_req', None) or getattr(self, 'request', None)
-        meta = getattr(req, 'meta', {}) if req else {}
-        tile_obj = getattr(req, 'tile', None) if req else None
-        gidx = getattr(tile_obj, 'global_idx', '?') if tile_obj else '?'
-        info_text = (f"Frame {meta.get('frame', '?')} | "
-                     f"Tile r{meta.get('row', '?')} c{meta.get('col', '?')} | "
-                     f"Global #{gidx}")
-        ttk.Label(info, text=info_text, font=("TkDefaultFont", 12)).pack(side="left")
+        self.info_var = tk.StringVar(value="Loading tile info...")
+        ttk.Label(info, textvariable=self.info_var, font=("TkDefaultFont", 12)).pack(side="left")
 
         ttk.Label(info, text="  (Double-click class or press Enter to assign. Resize me!)", foreground="gray").pack(side="right")
 
@@ -185,7 +180,7 @@ class LabelingDialog(tk.Toplevel):
             self._original_pil = Image.new("RGB", (224, 224), "gray")
 
         # Delay the first display to ensure canvas has real size after layout
-        self.after(80, lambda: (self.update_idletasks(), self._display_image_on_canvas()))
+        self.after(80, lambda: (self.update_idletasks(), self._display_image_on_canvas(), self._update_info()))
 
     def _display_image_on_canvas(self, target_max=None):
         """Fit the tile image nicely inside the canvas while preserving aspect ratio.
@@ -229,6 +224,22 @@ class LabelingDialog(tk.Toplevel):
         # Redraw scaled image when user resizes the window
         self.after(10, lambda: self._display_image_on_canvas())
 
+    def _update_info(self):
+        """Update the dynamic tile info (frame, row, col, global) for the current req.
+        This must be called when a new tile/query is loaded into the persistent window.
+        """
+        req = getattr(self, 'current_req', None) or getattr(self, 'request', None)
+        if not req:
+            self.info_var.set("No current tile")
+            return
+        meta = getattr(req, 'meta', {}) or {}
+        tile = getattr(req, 'tile', None)
+        gidx = getattr(tile, 'global_idx', '?') if tile else '?'
+        text = (f"Frame {meta.get('frame', '?')} | "
+                f"Tile r{meta.get('row', '?')} c{meta.get('col', '?')} | "
+                f"Global #{gidx}")
+        self.info_var.set(text)
+
     # ---------------- Class list management ----------------
     def _refresh_class_list(self, filter_text: str = ""):
         self.class_list.delete(0, "end")
@@ -262,6 +273,7 @@ class LabelingDialog(tk.Toplevel):
         """Submit the chosen label for the current pending ARED query.
         Does NOT destroy the window (persistent for user repositioning).
         """
+        print(f"[GUI Dialog] User assigned label '{label}' (relevant={relevant}) for current tile.")
         if getattr(self, 'current_req', None):
             self.current_req.set_result(label, relevant)
             self.current_req = None
@@ -274,12 +286,16 @@ class LabelingDialog(tk.Toplevel):
         self._prepare_for_next(label, relevant)
 
     def _prepare_for_next(self, last_label: str = "", last_relevant: bool = False):
-        """Keep the window open, update status, clear for next query."""
+        """Keep the window open, update status, clear for next query.
+        IMPORTANT: This window only receives new tiles when A/RED decides to query.
+        Non-query tiles are handled automatically by A/RED internally (no label needed).
+        """
         self.new_var.set("")  # clear for next
         self._refresh_class_list(self.filter_var.get())
-        msg = f"Submitted: {last_label} (relevant={last_relevant}). Window stays open for next A/RED query."
+        msg = f"Submitted: {last_label} (relevant={last_relevant}). Waiting for next A/RED query (window stays positioned for you)."
         self.dialog_status_var.set(msg)
-        # Keep the last image or could blank it; for now keep for reference
+        self.info_var.set(f"Last labeled: {last_label} | Waiting for next A/RED query...")
+        # Keep the last image for reference; it will be replaced when next A/RED query arrives.
         self.lift()
 
     def _assign_selected(self):
@@ -324,6 +340,14 @@ class LabelingDialog(tk.Toplevel):
 
     def _close_window(self):
         # User explicitly wants to close (will be recreated on next query if needed)
+        # Satisfy the pending req so the worker does not hang forever waiting for a label.
+        if getattr(self, 'current_req', None):
+            print("[GUI Dialog] Window closed without assign - satisfying worker with __BACKGROUND__ to avoid freeze.")
+            try:
+                self.current_req.set_result("__BACKGROUND__", False)
+            except Exception:
+                pass
+            self.current_req = None
         self.destroy()
 
     def _on_double_click(self, event):
@@ -349,6 +373,9 @@ class LabelingDialog(tk.Toplevel):
         self._load_and_show_image()
         filt = self.filter_var.get() if hasattr(self, 'filter_var') else ""
         self._refresh_class_list(filt)
+        self._update_info()
+        # Force immediate refresh of image for the new tile (after layout update)
+        self.after(20, lambda: (self.update_idletasks(), self._display_image_on_canvas()))
         self.dialog_status_var.set("New A/RED query. Label this tile (select or create), then Assign.")
         self.lift()
         self.focus_force()
@@ -380,6 +407,7 @@ class MainWindow:
         self._stats_job = None
         self._pending_label_request: Optional[LabelRequest] = None
         self.discovered_classes: set = set()  # labels we have assigned in this run (for immediate UI feedback)
+        self._last_queried_global = -1
 
         self._build_ui()
         self._start_stat_poller()
@@ -575,7 +603,22 @@ class MainWindow:
         except queue.Empty:
             return
 
+        print(f"[GUI] Received label REQUEST from ARED for tile global={getattr(getattr(req,'tile',None),'global_idx','?')} meta={getattr(req,'meta',{})}")
         self._pending_label_request = req
+
+        # Guard against duplicate req for the exact same tile (shouldn't happen, but prevents "same tile twice")
+        tile = getattr(req, 'tile', None)
+        gidx = getattr(tile, 'global_idx', -1) if tile else -1
+        if gidx != -1 and getattr(self, '_last_queried_global', -1) == gidx:
+            # Already handled this tile's query; ignore stale/duplicate
+            # CRITICAL: still satisfy the req or the worker thread will block forever on wait()
+            print("[GUI]   -> Duplicate request for same global_idx, ignoring (but satisfying req to unblock worker).")
+            try:
+                req.set_result("__DUPLICATE__", False)
+            except Exception:
+                pass
+            return
+        self._last_queried_global = gidx
 
         # Gather current known classes from both store and ARED
         classes = []
@@ -597,13 +640,17 @@ class MainWindow:
         def _assign_cb(label: str, relevant: bool):
             # This is now purely notification / UI update.
             # The dialog itself calls set_result on the req it holds.
+            print(f"[GUI] Label SUBMITTED from dialog: '{label}' (relevant={relevant})")
             self._pending_label_request = None
             self.discovered_classes.add(label)
             self._refresh_class_list()
             self.status_var.set(f"Last label assigned: {label} (relevant={relevant})")
+            print("[GUI] Dialog back to WAITING state for next A/RED query (worker continues processing non-queried tiles in background).")
+            # After submit, the window is prepared with waiting status; it will only update again on next A/RED query req
 
         # Persistent window: create once, then update for new requests
         if not hasattr(self, '_labeling_win') or not self._labeling_win.winfo_exists():
+            print("[GUI] Creating new persistent LabelingDialog for this query.")
             self._labeling_win = LabelingDialog(
                 self.root,
                 req,
@@ -612,6 +659,7 @@ class MainWindow:
                 class_counts=counts,
             )
         else:
+            print("[GUI] Updating existing persistent LabelingDialog with new query tile.")
             self._labeling_win.set_current_request(req, known_classes=classes, class_counts=counts)
 
     def _refresh_class_list(self):
@@ -635,12 +683,18 @@ class MainWindow:
     # ------------------------------------------------------------------
     def _start_stat_poller(self):
         def poll():
-            self._poll_label_requests()
-            if self.controller.stats:
-                self._update_stats_display(self.controller.stats)
-            # Periodically refresh the discovered classes list so counts update after labeling
-            if self.controller.stats and int(self.controller.stats.get("tiles_processed", 0)) % 5 == 0:
-                self._refresh_class_list()
+            try:
+                self._poll_label_requests()
+                if self.controller.stats:
+                    self._update_stats_display(self.controller.stats)
+                # Periodically refresh the discovered classes list so counts update after labeling
+                if self.controller.stats and int(self.controller.stats.get("tiles_processed", 0)) % 5 == 0:
+                    self._refresh_class_list()
+            except Exception as e:
+                print(f"[GUI] ERROR in stat/label poll (this would previously freeze polling!): {e}")
+                import traceback
+                traceback.print_exc()
+            # ALWAYS reschedule even on error, otherwise worker can block forever on next query
             self._stats_job = self.root.after(80, poll)
         self._stats_job = self.root.after(120, poll)
 
