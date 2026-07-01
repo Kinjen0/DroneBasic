@@ -1,0 +1,8 @@
+# Additional packages needed on top of the original A_RED environment
+opencv-python
+Pillow
+# torch and transformers are already used by the A_RED DINO code
+# scikit-learn, numpy, bidict already present
+
+# For faster vector search in the future you can add:
+# faiss-cpu
