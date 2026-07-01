@@ -45,17 +45,24 @@ class LabelingDialog(tk.Toplevel):
     """
 
     def __init__(self, master, request: LabelRequest, known_classes: List[str],
-                 on_assign: callable, class_counts: Optional[Dict[str, int]] = None):
+                 on_assign: callable, class_counts: Optional[Dict[str, int]] = None,
+                 ui_scale: float = 1.6):
         super().__init__(master)
         self.title("Review Queried Tile - A/RED Drone  [Persistent - reposition me once!]")
         self.current_req = request
         self.on_assign = on_assign  # notification callback (refresh etc.), we do set_result ourselves
         self.class_counts = class_counts or {}
         self.known_classes = sorted(set(known_classes))
+        self.ui_scale = float(ui_scale) if ui_scale else 1.6
+        self._zoom_level = 1.0
 
         # Larger default + fully resizable for high-res displays and comfort during long labeling sessions
-        self.geometry("1050x820")
-        self.minsize(650, 520)
+        # Scale the dialog size with ui_scale for better defaults on large screens
+        base_w, base_h = 1050, 820
+        scaled_w = int(base_w * min(self.ui_scale, 2.5))
+        scaled_h = int(base_h * min(self.ui_scale, 2.5))
+        self.geometry(f"{scaled_w}x{scaled_h}")
+        self.minsize(int(650 * min(self.ui_scale, 2.0)), int(520 * min(self.ui_scale, 2.0)))
         self.resizable(True, True)
 
         # Use StringVar for reliable .get() on the new class entry
@@ -78,53 +85,94 @@ class LabelingDialog(tk.Toplevel):
         self.after(150, lambda: self.class_list.focus_set())
 
     def _build_ui(self):
+        # Compute scaled sizes once (ui_scale passed from MainWindow config)
+        s = self.ui_scale
+        fs = int(12 * s)
+        fs_big = int(13 * s)
+        fs_bigger = int(14 * s)
+        pady_s = int(3 * s)
+        padx_s = int(4 * s)
+
+        # Configure ttk styles here so that themed widgets (especially Checkbutton, Labels)
+        # get the proper scaled fonts. Passing font= directly to ttk.Checkbutton (and some
+        # other ttk widgets) raises "unknown option -font".
+        style = ttk.Style()
+        style.configure("TLabel", font=("TkDefaultFont", fs))
+        style.configure("TCheckbutton", font=("TkDefaultFont", fs))
+        style.configure("TButton", font=("TkDefaultFont", fs_big))
+
         # Top info bar - use variable so it can be updated for each new tile in persistent window
         info = ttk.Frame(self)
-        info.pack(fill="x", padx=8, pady=4)
+        info.pack(fill="x", padx=int(8 * s), pady=int(4 * s))
 
         self.info_var = tk.StringVar(value="Loading tile info...")
-        ttk.Label(info, textvariable=self.info_var, font=("TkDefaultFont", 12)).pack(side="left")
+        ttk.Label(info, textvariable=self.info_var).pack(side="left")
 
         ttk.Label(info, text="  (Double-click class or press Enter to assign. Resize me!)", foreground="gray").pack(side="right")
 
         # Main area: image (left) + classes (right)
         main = ttk.Frame(self)
-        main.pack(fill="both", expand=True, padx=8, pady=4)
+        main.pack(fill="both", expand=True, padx=int(8*s), pady=int(4*s))
 
-        # --- IMAGE (resizable canvas) ---
-        img_frame = ttk.LabelFrame(main, text="Tile Image (resize window to fit)")
+        # --- IMAGE (resizable canvas with zoom + scroll support) ---
+        img_frame = ttk.LabelFrame(main, text="Tile Image (resize window to fit; use zoom buttons + scrollbars when enlarged)")
         img_frame.pack(side="left", fill="both", expand=True)
 
-        self.canvas = tk.Canvas(img_frame, bg="#222", highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True)
+        # Use a container + grid for canvas + scrollbars so "Larger View" can overflow and be pannable
+        canvas_container = ttk.Frame(img_frame)
+        canvas_container.pack(fill="both", expand=True)
+        canvas_container.rowconfigure(0, weight=1)
+        canvas_container.rowconfigure(1, weight=0)
+        canvas_container.columnconfigure(0, weight=1)
+        canvas_container.columnconfigure(1, weight=0)
+
+        self.canvas = tk.Canvas(canvas_container, bg="#222", highlightthickness=0)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+
+        v_scroll = ttk.Scrollbar(canvas_container, orient="vertical", command=self.canvas.yview)
+        v_scroll.grid(row=0, column=1, sticky="ns")
+        h_scroll = ttk.Scrollbar(canvas_container, orient="horizontal", command=self.canvas.xview)
+        h_scroll.grid(row=1, column=0, sticky="ew")
+
+        self.canvas.configure(yscrollcommand=v_scroll.set, xscrollcommand=h_scroll.set)
         self.canvas.bind("<Configure>", self._on_canvas_resize)
 
-        # Fit controls for comfort (very useful when labeling hundreds of tiles)
+        # Mouse wheel scrolling for the zoomed tile image (cross platform)
+        self.canvas.bind("<MouseWheel>", self._on_mousewheel)       # Windows / mac
+        self.canvas.bind("<Button-4>", self._on_mousewheel)         # Linux scroll up
+        self.canvas.bind("<Button-5>", self._on_mousewheel)         # Linux scroll down
+
+        # Fit/zoom controls - now functional with scrollregion for >fit renders
         fit_bar = ttk.Frame(img_frame)
         fit_bar.pack(fill="x")
-        ttk.Button(fit_bar, text="Fit to Window", command=lambda: (self.update_idletasks(), self._display_image_on_canvas())).pack(side="left", padx=2)
-        ttk.Button(fit_bar, text="Larger View", command=lambda: (self.update_idletasks(), self._zoom(1.2))).pack(side="left")
-        ttk.Button(fit_bar, text="Smaller View", command=lambda: (self.update_idletasks(), self._zoom(0.8))).pack(side="left")
+        ttk.Button(fit_bar, text="Fit to Window", command=lambda: (
+            self.update_idletasks(),
+            setattr(self, '_zoom_level', 1.0),
+            self._display_image_on_canvas(),
+            self.after(5, getattr(self, '_center_view', lambda: None))
+        )).pack(side="left", padx=int(3*s))
+        ttk.Button(fit_bar, text="Larger View", command=lambda: (self.update_idletasks(), self._zoom(1.25))).pack(side="left", padx=int(2*s))
+        ttk.Button(fit_bar, text="Smaller View", command=lambda: (self.update_idletasks(), self._zoom(0.8))).pack(side="left", padx=int(2*s))
 
         # --- CLASSES SIDE ---
         right = ttk.Frame(main)
-        right.pack(side="right", fill="y", padx=(8, 0))
+        right.pack(side="right", fill="y", padx=(int(8*s), 0))
 
         ttk.Label(right, text="Existing Classes (double-click or select + Assign)").pack(anchor="w")
 
         # Filter
         filter_frame = ttk.Frame(right)
-        filter_frame.pack(fill="x", pady=2)
+        filter_frame.pack(fill="x", pady=pady_s)
         ttk.Label(filter_frame, text="Filter:").pack(side="left")
         self.filter_var = tk.StringVar()
         self.filter_var.trace_add("write", self._on_filter_changed)
-        ttk.Entry(filter_frame, textvariable=self.filter_var, width=22).pack(side="left", fill="x", expand=True)
+        ttk.Entry(filter_frame, textvariable=self.filter_var, width=int(22 * min(s, 1.8))).pack(side="left", fill="x", expand=True)
 
-        # Class list - bigger font for readability
+        # Class list - scaled font for readability (tk.Listbox accepts font directly)
         list_frame = ttk.Frame(right)
         list_frame.pack(fill="both", expand=True)
 
-        self.class_list = tk.Listbox(list_frame, height=18, exportselection=False, font=("TkDefaultFont", 13))
+        self.class_list = tk.Listbox(list_frame, height=18, exportselection=False, font=("TkDefaultFont", fs_big))
         self.class_list.pack(side="left", fill="both", expand=True)
         self.class_list.bind("<Double-Button-1>", self._on_double_click)
         self.class_list.bind("<Return>", lambda e: self._assign_selected())
@@ -134,32 +182,34 @@ class LabelingDialog(tk.Toplevel):
         self.class_list.configure(yscrollcommand=yscroll.set)
 
         # Assign button for selected
-        ttk.Button(right, text="Assign Selected (Enter / Double-click)", command=self._assign_selected).pack(fill="x", pady=4)
+        ttk.Button(right, text="Assign Selected (Enter / Double-click)", command=self._assign_selected).pack(fill="x", pady=pady_s)
 
         # --- NEW CLASS ---
         new_frame = ttk.LabelFrame(right, text="New Class")
-        new_frame.pack(fill="x", pady=(12, 0))
+        new_frame.pack(fill="x", pady=(int(10*s), 0))
 
         ttk.Label(new_frame, text="Class name:").pack(anchor="w")
-        self.new_entry = ttk.Entry(new_frame, textvariable=self.new_var, font=("TkDefaultFont", 13))
-        self.new_entry.pack(fill="x", pady=2)
+        self.new_entry = ttk.Entry(new_frame, textvariable=self.new_var, font=("TkDefaultFont", fs_big))
+        self.new_entry.pack(fill="x", pady=pady_s)
         self.new_entry.bind("<Return>", lambda e: self._create_and_assign())
 
         self.relevant_var = tk.BooleanVar(value=False)
+        # NOTE: Do NOT pass font= to ttk.Checkbutton. It does not support the option.
+        # We configured the "TCheckbutton" style above instead.
         ttk.Checkbutton(new_frame, text="Relevant (interesting / anomaly)", variable=self.relevant_var).pack(anchor="w")
 
-        ttk.Button(new_frame, text="Create & Assign", command=self._create_and_assign).pack(fill="x", pady=4)
+        ttk.Button(new_frame, text="Create & Assign", command=self._create_and_assign).pack(fill="x", pady=pady_s)
 
         # Bottom quick actions
         bottom = ttk.Frame(self)
-        bottom.pack(fill="x", padx=8, pady=6)
+        bottom.pack(fill="x", padx=int(8*s), pady=pady_s)
 
         ttk.Button(bottom, text="Mark as Background / Irrelevant", command=self._assign_as_background).pack(side="left")
         ttk.Button(bottom, text="Close Window (recreates on next query)", command=self._close_window).pack(side="right")
 
         # Status for the dialog
         self.dialog_status_var = tk.StringVar(value="Choose from list (double-click or button) or type new class + Create & Assign")
-        ttk.Label(self, textvariable=self.dialog_status_var, relief="sunken", font=("TkDefaultFont", 11)).pack(fill="x", padx=8, pady=4)
+        ttk.Label(self, textvariable=self.dialog_status_var, relief="sunken").pack(fill="x", padx=int(8*s), pady=pady_s)
 
         # Make the new entry easy to reach
         self.after(200, lambda: self.new_entry.focus_set() if not self.known_classes else None)
@@ -180,11 +230,12 @@ class LabelingDialog(tk.Toplevel):
             self._original_pil = Image.new("RGB", (224, 224), "gray")
 
         # Delay the first display to ensure canvas has real size after layout
-        self.after(80, lambda: (self.update_idletasks(), self._display_image_on_canvas(), self._update_info()))
+        self.after(80, lambda: (self.update_idletasks(), self._display_image_on_canvas(), self._update_info(), self.after(10, getattr(self, '_center_view', lambda: None))))
 
     def _display_image_on_canvas(self, target_max=None):
         """Fit the tile image nicely inside the canvas while preserving aspect ratio.
-        Called on resize and via the Fit button. This is the 'fit to box' system.
+        Supports zoom_level >1.0 (larger render + scrollbars for panning details).
+        Called on resize, fit, and zoom buttons.
         """
         if not hasattr(self, "_original_pil"):
             return
@@ -196,29 +247,102 @@ class LabelingDialog(tk.Toplevel):
         if cw < 20 or ch < 20:
             cw, ch = 700, 520
 
-        if target_max is None:
-            max_w, max_h = cw - 12, ch - 12
-        else:
+        if target_max is not None:
             max_w, max_h = target_max
+        else:
+            z = getattr(self, '_zoom_level', 1.0)
+            # Base fit size from canvas, multiplied by zoom level (>1 = "zoomed in" / higher res render)
+            max_w = int((cw - 12) * z)
+            max_h = int((ch - 12) * z)
 
-        img = self._original_pil.copy()
-        img.thumbnail((max_w, max_h), Image.Resampling.LANCZOS)
+        # Use resize (not thumbnail) so we can *upscale* for zoom-in (magnification) beyond native tile resolution.
+        # thumbnail never enlarges beyond original pixels; resize + LANCZOS does (interpolated).
+        orig_w, orig_h = self._original_pil.size
+        if orig_w > 0 and orig_h > 0 and max_w > 0 and max_h > 0:
+            ratio = min(max_w / orig_w, max_h / orig_h)
+            new_w = max(1, int(orig_w * ratio))
+            new_h = max(1, int(orig_h * ratio))
+            img = self._original_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        else:
+            img = self._original_pil.copy()
+            img.thumbnail((max_w or 100, max_h or 100), Image.Resampling.LANCZOS)
+
         self._current_img_tk = ImageTk.PhotoImage(img)
+
+        disp_w, disp_h = img.size
         self.canvas.delete("all")
-        self.canvas.create_image(cw // 2, ch // 2, image=self._current_img_tk, anchor="center")
+
+        # When the rendered image is larger than the view, draw at origin so scrollbars can pan it.
+        # When smaller, center it within the canvas area.
+        if disp_w <= cw and disp_h <= ch:
+            x = (cw - disp_w) // 2
+            y = (ch - disp_h) // 2
+            self.canvas.create_image(x, y, image=self._current_img_tk, anchor="nw")
+            self.canvas.config(scrollregion=(0, 0, cw, ch))
+        else:
+            self.canvas.create_image(0, 0, image=self._current_img_tk, anchor="nw")
+            self.canvas.config(scrollregion=(0, 0, disp_w, disp_h))
+
+        # Ensure layout and scrollbars update after image/region change
+        self.canvas.update_idletasks()
 
     def _zoom(self, factor: float):
-        """Simple zoom relative to current view (re-computes from original)."""
+        """Adjust zoom level (multiplier on fit-to-canvas size) and redraw.
+        >1.0 renders larger version of the tile (more detail) using scrollbars to pan.
+        """
         if not hasattr(self, "_original_pil"):
             return
+        current = getattr(self, '_zoom_level', 1.0)
+        self._zoom_level = max(0.2, min(8.0, current * factor))  # clamp reasonable range
         self.update_idletasks()
         self.canvas.update_idletasks()
-        cw = max(120, self.canvas.winfo_width())
-        ch = max(120, self.canvas.winfo_height())
-        # Approximate new target size
-        new_w = int(cw * factor)
-        new_h = int(ch * factor)
-        self._display_image_on_canvas((new_w, new_h))
+        self._display_image_on_canvas()  # uses _zoom_level internally
+        # Re-center the view after zoom so "larger" magnifies around the middle instead of jumping to corner
+        self.after(5, self._center_view)
+
+    def _center_view(self):
+        """Center the current scroll view over the image content (for natural zoom in/out around center)."""
+        try:
+            sr = self.canvas.cget("scrollregion")
+            if not sr:
+                return
+            coords = [int(float(x)) for x in sr.split()]
+            if len(coords) != 4:
+                return
+            _, _, iw, ih = coords
+            cw = max(1, self.canvas.winfo_width())
+            ch = max(1, self.canvas.winfo_height())
+            # For content larger than viewport, scroll so image center aligns with view center
+            if iw > cw:
+                frac_x = max(0.0, (iw / 2.0 - cw / 2.0) / iw)
+                self.canvas.xview_moveto(frac_x)
+            else:
+                self.canvas.xview_moveto(0.0)
+            if ih > ch:
+                frac_y = max(0.0, (ih / 2.0 - ch / 2.0) / ih)
+                self.canvas.yview_moveto(frac_y)
+            else:
+                self.canvas.yview_moveto(0.0)
+        except Exception:
+            # Non-fatal; view centering is best-effort
+            pass
+
+    def _on_mousewheel(self, event):
+        """Scroll the canvas view with the mouse wheel when the tile is zoomed larger than the view."""
+        delta = getattr(event, "delta", 0)
+        num = getattr(event, "num", 0)
+        # Shift + wheel or horizontal scroll -> x axis
+        if getattr(event, "state", 0) & 0x0001 or num in (6, 7):  # shift mask or horiz buttons
+            if num == 7 or delta < 0:
+                self.canvas.xview_scroll(1, "units")
+            else:
+                self.canvas.xview_scroll(-1, "units")
+        else:
+            # Vertical
+            if num == 5 or delta < 0:
+                self.canvas.yview_scroll(1, "units")
+            elif num == 4 or delta > 0:
+                self.canvas.yview_scroll(-1, "units")
 
     def _on_canvas_resize(self, event):
         # Redraw scaled image when user resizes the window
@@ -375,7 +499,7 @@ class LabelingDialog(tk.Toplevel):
         self._refresh_class_list(filt)
         self._update_info()
         # Force immediate refresh of image for the new tile (after layout update)
-        self.after(20, lambda: (self.update_idletasks(), self._display_image_on_canvas()))
+        self.after(20, lambda: (self.update_idletasks(), self._display_image_on_canvas(), self.after(10, getattr(self, '_center_view', lambda: None))))
         self.dialog_status_var.set("New A/RED query. Label this tile (select or create), then Assign.")
         self.lift()
         self.focus_force()
@@ -390,18 +514,25 @@ class MainWindow:
         self.root = root
         self.root.title("Drone A/RED - Tiling + DINO + A_REDIN (High-Volume Labeling)")
 
+        self.config = initial_config or PipelineConfig.default()
+        gui_cfg = self.config.gui
+        self.ui_scale = float(getattr(gui_cfg, 'ui_scale', 1.6))
+
         # --- High DPI / large text support for high-resolution displays ---
-        # This makes text, buttons, listboxes etc. readable on 4K/ retina / high-dpi screens.
-        # You can tune the scaling factor. 1.5-2.0 is common for high-res.
+        # Bound to ui_scale in config (default 1.6 for readability on modern/large screens).
+        # Change in config or GUIConfig.ui_scale and restart for different resolution scaling.
         try:
-            self.root.tk.call('tk', 'scaling', 1.8)
+            self.root.tk.call('tk', 'scaling', self.ui_scale)
         except Exception:
             pass
 
-        self.root.geometry("1200x780")
-        self.root.minsize(950, 600)
+        # Scale initial window size (clamped)
+        base_w, base_h = 1200, 780
+        w = int(base_w * min(self.ui_scale, 2.2))
+        h = int(base_h * min(self.ui_scale, 2.2))
+        self.root.geometry(f"{w}x{h}")
+        self.root.minsize(int(950 * min(self.ui_scale, 1.8)), int(600 * min(self.ui_scale, 1.8)))
 
-        self.config = initial_config or PipelineConfig.default()
         self.controller = DroneAREDController(self.config)
         self.label_store: Optional[PersistentLabelStore] = None
         self._stats_job = None
@@ -417,11 +548,15 @@ class MainWindow:
 
     def _build_ui(self):
         # --- Make UI elements larger and more readable on high-res displays ---
+        # Uses self.ui_scale (from config) for fonts, paddings, etc. Change ui_scale for your display.
         style = ttk.Style()
-        big_font = ("TkDefaultFont", 13)
-        bigger_font = ("TkDefaultFont", 14)
+        s = self.ui_scale
+        base = int(11 * s)
+        big_font = ("TkDefaultFont", base)
+        bigger_font = ("TkDefaultFont", int(base + 2))
+        pad = max(4, int(6 * s))
         style.configure(".", font=big_font)
-        style.configure("TButton", font=bigger_font, padding=6)
+        style.configure("TButton", font=bigger_font, padding=pad)
         style.configure("TLabel", font=big_font)
         style.configure("TCheckbutton", font=big_font)
         style.configure("TLabelframe.Label", font=bigger_font)
@@ -442,30 +577,31 @@ class MainWindow:
 
         # Control bar
         ctrl = ttk.Frame(self.root)
-        ctrl.pack(fill="x", padx=6, pady=4)
+        ctrl.pack(fill="x", padx=int(6 * self.ui_scale), pady=int(4 * self.ui_scale))
 
-        ttk.Button(ctrl, text="Load Videos", command=self._load_videos).pack(side="left", padx=2)
+        s = self.ui_scale
+        ttk.Button(ctrl, text="Load Videos", command=self._load_videos).pack(side="left", padx=int(2*s))
         self.start_btn = ttk.Button(ctrl, text="Start", command=self._start)
-        self.start_btn.pack(side="left", padx=2)
-        ttk.Button(ctrl, text="Pause", command=self.controller.pause).pack(side="left", padx=2)
-        ttk.Button(ctrl, text="Resume", command=self.controller.resume).pack(side="left", padx=2)
-        ttk.Button(ctrl, text="Stop", command=self.controller.stop).pack(side="left", padx=2)
+        self.start_btn.pack(side="left", padx=int(2*s))
+        ttk.Button(ctrl, text="Pause", command=self.controller.pause).pack(side="left", padx=int(2*s))
+        ttk.Button(ctrl, text="Resume", command=self.controller.resume).pack(side="left", padx=int(2*s))
+        ttk.Button(ctrl, text="Stop", command=self.controller.stop).pack(side="left", padx=int(2*s))
 
         # Quick model controls
-        ttk.Button(ctrl, text="Save ARED Model", command=self._save_ared_state).pack(side="left", padx=8)
+        ttk.Button(ctrl, text="Save ARED Model", command=self._save_ared_state).pack(side="left", padx=int(8*s))
         ttk.Button(ctrl, text="Load ARED Model", command=self._load_ared_state).pack(side="left")
 
         # Status line
         self.status_var = tk.StringVar(value="Ready. Load videos and press Start.")
-        ttk.Label(self.root, textvariable=self.status_var, relief="sunken").pack(fill="x", padx=6, pady=2)
+        ttk.Label(self.root, textvariable=self.status_var, relief="sunken").pack(fill="x", padx=int(6*self.ui_scale), pady=int(2*self.ui_scale))
 
         # Main content: left params, center stats + classes, right preview stub
         body = ttk.Frame(self.root)
-        body.pack(fill="both", expand=True, padx=6, pady=4)
+        body.pack(fill="both", expand=True, padx=int(6*self.ui_scale), pady=int(4*self.ui_scale))
 
         # Parameters (many are live for next run)
         param_frame = ttk.LabelFrame(body, text="Parameters (applied on next Start)")
-        param_frame.pack(side="left", fill="y", padx=(0, 6))
+        param_frame.pack(side="left", fill="y", padx=(0, int(6*self.ui_scale)))
 
         self._add_param_row(param_frame, "Tile W (px, uniform)", "tile_w", self.config.tiling.tile_width)
         self._add_param_row(param_frame, "Tile H (px, uniform)", "tile_h", self.config.tiling.tile_height)
@@ -475,22 +611,23 @@ class MainWindow:
         self._add_param_row(param_frame, "Cache threshold (L2)", "cache_thresh", self.config.label_cache.auto_label_threshold, is_float=True)
         self._add_param_row(param_frame, "DINO model name", "dino_model", self.config.features.model_name, is_str=True)
 
-        ttk.Checkbutton(param_frame, text="Use label cache", variable=tk.BooleanVar(value=self.config.label_cache.enabled)).pack(anchor="w", pady=2)
+        s = self.ui_scale
+        ttk.Checkbutton(param_frame, text="Use label cache", variable=tk.BooleanVar(value=self.config.label_cache.enabled)).pack(anchor="w", pady=int(2*s))
 
         # Right side: stats + discovered classes
         right = ttk.Frame(body)
-        right.pack(side="left", fill="both", expand=True)
+        right.pack(side="left", fill="both", expand=True, padx=int(4*s))
 
         stats_frame = ttk.LabelFrame(right, text="Live Stats")
         stats_frame.pack(fill="x")
 
-        self.stats_text = tk.Text(stats_frame, height=6, width=60, state="disabled")
+        self.stats_text = tk.Text(stats_frame, height=6, width=int(60 * min(s, 1.5)), state="disabled", font=("TkDefaultFont", int(11*s)))
         self.stats_text.pack(fill="x", padx=4, pady=4)
 
         classes_frame = ttk.LabelFrame(right, text="Discovered Classes (from current + cache)")
-        classes_frame.pack(fill="both", expand=True, pady=(6, 0))
+        classes_frame.pack(fill="both", expand=True, pady=(int(6*s), 0))
 
-        self.class_listbox = tk.Listbox(classes_frame, height=10, font=("TkDefaultFont", 13))
+        self.class_listbox = tk.Listbox(classes_frame, height=10, font=("TkDefaultFont", int(13 * s)))
         self.class_listbox.pack(fill="both", expand=True, side="left")
         ysb = ttk.Scrollbar(classes_frame, orient="vertical", command=self.class_listbox.yview)
         ysb.pack(side="right", fill="y")
@@ -498,16 +635,19 @@ class MainWindow:
 
         # Preview area (simple for now)
         preview_frame = ttk.LabelFrame(body, text="Preview (last processed frame - stub)")
-        preview_frame.pack(side="left", fill="both", expand=True, padx=(6, 0))
+        preview_frame.pack(side="left", fill="both", expand=True, padx=(int(6 * self.ui_scale), 0))
         self.preview_label = ttk.Label(preview_frame, text="(Preview will show last frame + tile highlights in future)")
         self.preview_label.pack(expand=True)
 
     def _add_param_row(self, parent, label, attr, default, is_float=False, is_str=False):
         row = ttk.Frame(parent)
-        row.pack(fill="x", pady=1)
-        ttk.Label(row, text=label, width=26).pack(side="left")
+        row.pack(fill="x", pady=max(1, int(2 * self.ui_scale)))
+        fs = int(11 * self.ui_scale)
+        # Do not pass font to ttk.Label (can cause "unknown option -font" on some ttk versions).
+        # The global style (configured with ui_scale in _build_ui) handles it.
+        ttk.Label(row, text=label, width=int(26 * min(self.ui_scale, 1.5))).pack(side="left")
         var = tk.StringVar(value=str(default))
-        entry = ttk.Entry(row, textvariable=var, width=20, font=("TkDefaultFont", 12))
+        entry = ttk.Entry(row, textvariable=var, width=int(20 * min(self.ui_scale, 1.5)), font=("TkDefaultFont", fs))
         entry.pack(side="left")
         # Store for later read-back
         setattr(self, f"_{attr}_var", var)
@@ -657,6 +797,7 @@ class MainWindow:
                 known_classes=classes,
                 on_assign=_assign_cb,
                 class_counts=counts,
+                ui_scale=getattr(self, 'ui_scale', 1.6),
             )
         else:
             print("[GUI] Updating existing persistent LabelingDialog with new query tile.")

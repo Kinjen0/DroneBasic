@@ -54,7 +54,7 @@ class FeatureConfig:
     # User asked for DINOV3. Current HF models: try "facebook/dinov2-base" or
     # newer dinov3 variants when released (e.g. "facebook/dinov3-vitb16").
     # The extractor is model-agnostic via transformers AutoModel.
-    model_name: str = "facebook/dinov2-base"
+    model_name: str = "timm/vit_small_patch16_dinov3.lvd1689m" #"facebook/dinov2-base"
     device: Optional[str] = None  # "cuda", "cpu", or None -> auto
     # Whether to L2-normalize the output embeddings (often helpful for DINO)
     normalize: bool = True
@@ -135,6 +135,11 @@ class GUIConfig:
     enable_preview: bool = True
     # Theme / colors can be extended later (e.g. ttk styles)
     use_ttk: bool = True
+
+    # UI scale for high-resolution / 4K displays and readability.
+    # 1.0 = default, 1.5-2.0 common for large screens or to enlarge buttons/fonts.
+    # Affects Tk scaling factor, font point sizes, paddings, etc.
+    ui_scale: float = 1.6
 
 
 @dataclass
