@@ -17,14 +17,24 @@ from pathlib import Path
 
 @dataclass
 class TilingConfig:
-    """How to split video frames into tiles."""
-    tile_width: int = 224
-    tile_height: int = 224
-    # Stride: if None, non-overlapping (stride == tile size)
+    """How to split video frames into tiles.
+
+    IMPORTANT: All produced tiles will be exactly (tile_width, tile_height).
+    Partial / edge rectangles are deliberately skipped so every tile is uniform
+    and compatible with DINO models (which expect consistent input after their
+    internal resize, typically 224/518 etc.). 
+
+    Recommendation: Use 256 or 320+ for more context per tile on drone footage.
+    The DINO preprocessor will still resize the crop to the model's preferred
+    resolution, but a larger original crop preserves more detail/context.
+    """
+    tile_width: int = 256
+    tile_height: int = 256
+    # Stride: if None, non-overlapping (stride == tile size). Overlap if smaller.
     stride_x: Optional[int] = None
     stride_y: Optional[int] = None
-    # Optional: process only every Nth frame (1 = every frame)
-    frame_stride: int = 5
+    # Optional: process only every Nth frame (1 = every frame). Higher = faster, fewer tiles.
+    frame_stride: int = 3
     # Future: support "adaptive" tiling, saliency-based, multi-scale, etc.
     tiling_mode: str = "grid"   # "grid", "sliding", "pyramid" (future)
 
@@ -63,8 +73,14 @@ class FeatureConfig:
 
 @dataclass
 class AREDConfig:
-    """Parameters passed to the core A/RED algorithm (A_REDIN.ARED)."""
-    kappa: float = 0.5          # "paranoia" parameter - lower = more queries
+    """Parameters passed to the core A/RED algorithm (A_REDIN.ARED).
+
+    kappa: "paranoia" parameter (higher value = more paranoid = MORE queries).
+           - Higher kappa → distance * kappa exceeds cluster size more easily → A/RED
+             asks the user (or cache) for labels more often.
+           - Lower kappa → more tolerant of variation → fewer queries.
+    """
+    kappa: float = 1.0          # higher = more queries (more paranoid)
     l_buf_size: int = 2000      # memory bound for labeled points (circular)
     k_comp_pts: int = 2         # how many nearest to consider (enables neighborhood merge)
     qs_var: int = 1             # 0=diameter, 1=average NN distance (single link style)

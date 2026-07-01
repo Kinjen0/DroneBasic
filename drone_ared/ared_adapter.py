@@ -4,6 +4,17 @@ AREDAdapter - Bridge between our drone pipeline and the original A_RED / A_REDIN
 CRITICAL DESIGN GOAL (per project constraint):
     Make **zero** (or at most trivial) modifications inside A_REDimplementation/A_RED/.
 
+Investigation (2026-07-01): The original A_RED code (A_REDIN, main.py, visualizations, Oracle)
+does **not** contain an interactive labeling GUI. It relies exclusively on a pre-populated
+Oracle that holds ground-truth labels + relevance flags for an entire offline dataset
+(used both to answer "queries" during streaming and for final accuracy metrics).
+All "GUIs" in the original repo are matplotlib (TkAgg) plots for post-run analysis
+(cluster evolution, t-SNE, query stats, etc.). No human-in-the-loop tile labeling existed.
+
+We are therefore implementing the first practical interactive version that matches the
+spirit of the A/RED papers (the algorithm decides *when* to query for a label+relevance;
+a human or cache supplies the answer).
+
 Strategy:
   - Use sys.path + sys.modules shim to import cleanly.
   - Monkey-patch / wrap at runtime to support:
@@ -19,7 +30,7 @@ The original ARED expects:
 In our case:
   - Labels are discovered live by a human SME via GUI.
   - We have no ground truth "y" array.
-  - We still want ARED's clustering / query logic.
+  - We still want ARED's clustering / query logic (ARED itself decides when a tile needs a label).
 
 This file contains all adaptation logic so the library files stay untouched.
 """
@@ -475,3 +486,17 @@ class AREDAdapter:
 
     def get_known_labels(self) -> List[str]:
         return sorted(self.ared.subspace_partition.set_of_known_labels)
+
+    @property
+    def num_clusters(self) -> int:
+        try:
+            return len(self.ared.subspace_partition.cluster_dict)
+        except Exception:
+            return 0
+
+    @property
+    def num_known_labels(self) -> int:
+        try:
+            return len(self.ared.subspace_partition.set_of_known_labels)
+        except Exception:
+            return 0

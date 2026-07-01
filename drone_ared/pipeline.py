@@ -82,8 +82,10 @@ class DroneAREDController:
         self.stats: Dict[str, Any] = {
             "frames_read": 0,
             "tiles_processed": 0,
-            "queries": 0,
-            "cache_hits": 0,
+            "user_queries": 0,   # times we actually popped the GUI (real human work)
+            "cache_hits": 0,     # auto-labeled from previous sessions / earlier in run
+            "ared_clusters": 0,
+            "ared_known_labels": 0,
             "current_video": "",
             "status": "idle",
         }
@@ -183,14 +185,20 @@ class DroneAREDController:
 
         # Wire the label provider that the adapter will call on queries
         def _gui_label_provider(emb: np.ndarray, tile_img: Any, meta: Dict):
-            # This runs in the ARED worker thread
+            # This runs in the ARED worker thread.
+            # A/RED decides whether a "query" is needed (anomalous or near-relevant cluster).
+            # We only pop the GUI when we cannot satisfy from the persistent label cache.
             if self.label_store is not None:
                 hit = self.label_store.lookup(emb)
                 if hit:
                     self.stats["cache_hits"] = self.stats.get("cache_hits", 0) + 1
+                    # Important: still return the label so A/RED can use it to grow clusters
+                    # without forcing a human every time.
                     return hit
 
-            # Ask the GUI
+            # Real human labeling needed
+            self.stats["user_queries"] = self.stats.get("user_queries", 0) + 1
+
             req = LabelRequest(tile=tile_img or Tile(image=Image.new("RGB", (64, 64)), frame_idx=0, tile_row=0, tile_col=0, bbox=(0,0,0,0)),
                                embedding=emb, meta=meta)
             try:
@@ -302,8 +310,13 @@ class DroneAREDController:
                 "col": tile.tile_col,
             })
             self.stats["tiles_processed"] += 1
-            if info.get("queried"):
-                self.stats["queries"] = self.ared_adapter.num_queries
+            # "queried" here means A/RED decided it needed a label (cache or human).
+            # We track user_queries separately when we actually show the dialog.
+
+            # Update ARED internal state for GUI display
+            if self.ared_adapter:
+                self.stats["ared_clusters"] = self.ared_adapter.num_clusters
+                self.stats["ared_known_labels"] = self.ared_adapter.num_known_labels
 
             # Push stats to GUI occasionally
             if self.on_stats and (self.stats["tiles_processed"] % 8 == 0):

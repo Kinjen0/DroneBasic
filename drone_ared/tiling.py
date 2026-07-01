@@ -89,6 +89,12 @@ class GridTiler(Tiler):
         return f"grid_{self.tile_w}x{self.tile_h}_s{self.stride_x}x{self.stride_y}"
 
     def tile_frame(self, frame: np.ndarray, frame_idx: int, global_start_idx: int = 0) -> List[Tile]:
+        """Produce ONLY full, exactly-sized tiles.
+
+        This guarantees every tile is identical in dimensions (tile_w x tile_h pixels).
+        Clipped rectangles at frame edges are skipped. This keeps all inputs to DINO
+        uniform before the model's internal resize.
+        """
         if frame.ndim != 3 or frame.shape[2] != 3:
             raise ValueError("GridTiler expects HWC RGB uint8 frame")
 
@@ -96,22 +102,17 @@ class GridTiler(Tiler):
         tiles: List[Tile] = []
         gidx = global_start_idx
 
+        if self.tile_w > w or self.tile_h > h:
+            # Frame too small for even one tile; return empty (or caller can decide to resize whole frame)
+            return tiles
+
         row = 0
         y = 0
-        while y < h:
+        while y + self.tile_h <= h:
             col = 0
             x = 0
-            while x < w:
-                x1 = min(x + self.tile_w, w)
-                y1 = min(y + self.tile_h, h)
-
-                # Only emit tiles that have meaningful area (skip tiny edge slivers if desired)
-                if (x1 - x) < 32 or (y1 - y) < 32:
-                    x += self.stride_x
-                    col += 1
-                    continue
-
-                crop = frame[y:y1, x:x1]
+            while x + self.tile_w <= w:
+                crop = frame[y : y + self.tile_h, x : x + self.tile_w]
                 pil_img = Image.fromarray(crop).convert("RGB")
 
                 tile = Tile(
@@ -119,7 +120,7 @@ class GridTiler(Tiler):
                     frame_idx=frame_idx,
                     tile_row=row,
                     tile_col=col,
-                    bbox=(x, y, x1, y1),
+                    bbox=(x, y, x + self.tile_w, y + self.tile_h),
                     global_idx=gidx,
                 )
                 tiles.append(tile)
