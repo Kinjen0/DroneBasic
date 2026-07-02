@@ -54,7 +54,7 @@ class FeatureConfig:
     # User asked for DINOV3. Current HF models: try "facebook/dinov2-base" or
     # newer dinov3 variants when released (e.g. "facebook/dinov3-vitb16").
     # The extractor is model-agnostic via transformers AutoModel.
-    model_name: str = "timm/vit_small_patch16_dinov3.lvd1689m" #"facebook/dinov2-base"
+    model_name: str = "facebook/dinov3-vitb16-pretrain-lvd1689m" #"facebook/dinov2-base"
     device: Optional[str] = None  # "cuda", "cpu", or None -> auto
     # Whether to L2-normalize the output embeddings (often helpful for DINO)
     normalize: bool = True
@@ -97,16 +97,26 @@ class AREDConfig:
 
 @dataclass
 class LabelCacheConfig:
-    """Settings for the persistent 'I have seen a tile like this before' store."""
+    """Settings for the persistent 'I have seen a tile like this before' store (embedding similarity)."""
     enabled: bool = True
-    db_path: str = "drone_ared_labels.pkl"   # will be resolved relative to cwd or config
-    # Distance threshold for auto-accepting a cached label (same metric as ARED: L2)
-    # Start conservative; tune based on feature space.
+    db_path: str = "drone_ared_labels.pkl"   # embedding similarity cache
     auto_label_threshold: float = 0.15
-    # Rebuild NN index every N additions (tradeoff freshness vs speed)
     rebuild_interval: int = 32
-    # Future: support cosine distance, FAISS, or on-disk vector DB
-    distance_metric: str = "l2"   # or "cosine"
+    distance_metric: str = "l2"
+
+
+@dataclass
+class TileAnnotationConfig:
+    """Settings for the exact identity-based tile label database.
+
+    This is the new primary way to remember labels by (video, absolute frame, tile position, resolution).
+    Enables editing past labels and perfect recall across different frame strides.
+    """
+    enabled: bool = True
+    db_path: str = "drone_tile_annotations.db"   # sqlite file
+    # When True in the GUI, even tiles that have previous exact labels will pop the labeling dialog
+    # so the user can correct mistakes. Normal runs auto-apply saved exact labels.
+    edit_mode_default: bool = False
 
 
 @dataclass
@@ -149,6 +159,7 @@ class PipelineConfig:
     features: FeatureConfig = field(default_factory=FeatureConfig)
     ared: AREDConfig = field(default_factory=AREDConfig)
     label_cache: LabelCacheConfig = field(default_factory=LabelCacheConfig)
+    tile_annotations: TileAnnotationConfig = field(default_factory=TileAnnotationConfig)  # NEW
     model_save: ModelSaveConfig = field(default_factory=ModelSaveConfig)
     gui: GUIConfig = field(default_factory=GUIConfig)
 

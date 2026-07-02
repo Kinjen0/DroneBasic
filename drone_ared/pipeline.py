@@ -37,6 +37,7 @@ from .tiling import GridTiler, Tile
 from .feature_extractor import DINOFeatureExtractor, FeatureExtractor
 from .ared_adapter import AREDAdapter
 from .label_store import PersistentLabelStore
+from .tile_database import TileAnnotationDB  # NEW exact identity DB (optional import for type)
 
 
 class LabelRequest:
@@ -95,10 +96,14 @@ class DroneAREDController:
         self.feature_extractor: Optional[FeatureExtractor] = None
         self.ared_adapter: Optional[AREDAdapter] = None
         self.label_store: Optional[PersistentLabelStore] = None
+        self.tile_db: Optional["TileAnnotationDB"] = None   # NEW: exact identity annotations
 
         self._worker_thread: Optional[threading.Thread] = None
         self._global_tile_counter = 0
         self._current_label_req: Optional[LabelRequest] = None
+
+        # When True, even tiles with previous exact labels will be shown to the user for correction
+        self.edit_mode: bool = False
 
         # Callback the GUI can register to receive periodic status updates
         self.on_stats: Optional[Callable[[Dict], None]] = None
@@ -185,6 +190,15 @@ class DroneAREDController:
         if self.ared_adapter:
             self.ared_adapter.set_label_store(store)
 
+    def set_tile_database(self, db: Optional[TileAnnotationDB]):
+        """NEW: exact-match annotation store (video + abs_frame + tile pos + resolution)."""
+        self.tile_db = db
+
+    def set_edit_mode(self, enabled: bool):
+        """When enabled, the label provider will show the GUI even for previously labeled exact tiles."""
+        self.edit_mode = bool(enabled)
+        print(f"[Controller] Edit mode = {self.edit_mode}")
+
     def update_config(self, new_config: PipelineConfig):
         """Apply new parameters for the *next* start()."""
         self.config = new_config
@@ -220,48 +234,111 @@ class DroneAREDController:
 
         # (Re)wire provider every time (the closure must see current stores etc.)
         def _gui_label_provider(emb: np.ndarray, tile_img: Any, meta: Dict):
-            # This runs in the ARED worker thread.
-            # A/RED decides whether a "query" is needed (anomalous or near-relevant cluster).
-            # We only pop the GUI when we cannot satisfy from the persistent label cache.
+            """
+            Called (via the adapter shim) only when A/RED has decided this point needs a label.
+
+            Priority order for answering (so we honor previous human work):
+            1. Exact identity match from TileAnnotationDB (video + abs_frame + row/col + resolution).
+               - Unless self.edit_mode is True, in which case we still show GUI for correction.
+            2. Old embedding similarity cache (PersistentLabelStore).
+            3. Human via GUI (persistent LabelingDialog).
+
+            After a human decision we save BOTH to the exact DB (for perfect future recall)
+            and to the embedding store (for "similar appearance" on new content).
+            """
+            meta = meta or {}
             print(f"[Pipeline] _gui_label_provider called for tile: {meta} (emb shape: {emb.shape if hasattr(emb,'shape') else 'N/A'})")
 
+            # --- 1. EXACT IDENTITY LOOKUP (new primary mechanism) ---
+            vpath = meta.get("video_path") or meta.get("video") or ""
+            abs_f = meta.get("abs_frame", meta.get("frame", -1))
+            row = meta.get("row", meta.get("tile_row", 0))
+            col = meta.get("col", meta.get("tile_col", 0))
+            tw = meta.get("tile_width", 0) or getattr(tile_img, 'width', 0) if tile_img else 0
+            th = meta.get("tile_height", 0) or getattr(tile_img, 'height', 0) if tile_img else 0
+
+            if self.tile_db is not None and vpath and abs_f >= 0:
+                exact = self.tile_db.lookup(vpath, abs_f, row, col, tw, th)
+                if exact:
+                    label, rel = exact
+                    if not self.edit_mode:
+                        print(f"[Pipeline]   -> EXACT DB HIT for {Path(vpath).name} f{abs_f} [{row},{col}]: '{label}' (relevant={rel}). Auto (no GUI).")
+                        # Still feed embedding store for future similarity if present
+                        if self.label_store is not None:
+                            try:
+                                self.label_store.add(emb, label, rel)
+                            except Exception:
+                                pass
+                        return label, rel
+                    else:
+                        print(f"[Pipeline]   -> EXACT DB HIT but EDIT MODE active -> forcing GUI for correction.")
+
+            # --- 2. FALLBACK: embedding similarity cache (existing behavior) ---
             if self.label_store is not None:
                 hit = self.label_store.lookup(emb)
                 if hit:
                     self.stats["cache_hits"] = self.stats.get("cache_hits", 0) + 1
-                    print(f"[Pipeline]   -> Label store CACHE HIT: '{hit[0]}' (relevant={hit[1]}). Returning without GUI.")
-                    # Important: still return the label so A/RED can use it to grow clusters
-                    # without forcing a human every time.
+                    print(f"[Pipeline]   -> Label store (embedding) CACHE HIT: '{hit[0]}' (relevant={hit[1]}). Returning without GUI.")
                     return hit
                 else:
-                    print(f"[Pipeline]   -> Label store CACHE MISS.")
+                    print(f"[Pipeline]   -> Label store (embedding) CACHE MISS.")
 
-            # Real human labeling needed
+            # --- 3. Real human labeling via GUI (only when A/RED asked or edit mode) ---
             self.stats["user_queries"] = self.stats.get("user_queries", 0) + 1
             print(f"[Pipeline]   -> Requesting HUMAN label via GUI (user_queries now {self.stats['user_queries']})  meta={meta}")
 
-            req = LabelRequest(tile=tile_img or Tile(image=Image.new("RGB", (64, 64)), frame_idx=0, tile_row=0, tile_col=0, bbox=(0,0,0,0)),
-                               embedding=emb, meta=meta)
+            # Ensure the tile object carries identity for the dialog / later saving
+            safe_tile = tile_img
+            if safe_tile is None or not hasattr(safe_tile, 'image'):
+                safe_tile = Tile(image=Image.new("RGB", (64, 64)), frame_idx=int(abs_f) if abs_f >= 0 else 0,
+                                 tile_row=row, tile_col=col, bbox=(0, 0, tw or 64, th or 64),
+                                 video_path=vpath)
+
+            req = LabelRequest(tile=safe_tile, embedding=emb, meta=meta)
             self._current_label_req = req
             try:
                 self.label_request_queue.put(req, timeout=5)
             except queue.Full:
                 self._current_label_req = None
-                # Fallback: treat as irrelevant background if GUI is overwhelmed
                 print("[Pipeline]   -> WARNING: label queue full, falling back to __BACKGROUND__")
                 return "__BACKGROUND__", False
 
             print("[Pipeline]   -> Waiting for GUI response (blocking worker thread)...")
-            result = req.wait(timeout=300)  # 5 minutes max for a single label - generous
+            result = req.wait(timeout=300)
             self._current_label_req = None
             if result is None:
                 print("[Pipeline]   -> TIMEOUT waiting for label, using __TIMEOUT__")
                 return "__TIMEOUT__", False
-            print(f"[Pipeline]   -> Received label from GUI: '{result[0]}' (relevant={result[1]})")
-            return result
+
+            label, rel = result
+            print(f"[Pipeline]   -> Received label from GUI: '{label}' (relevant={rel})")
+
+            # Save the human decision to BOTH stores
+            # a) Exact DB (for perfect recall by identity, stride-independent, editable)
+            if self.tile_db is not None and vpath and abs_f >= 0:
+                try:
+                    bx = meta.get("bbox", (col * tw, row * th, col * tw + tw, row * th + th))
+                    cx, cy = bx[0], bx[1]
+                    self.tile_db.set_annotation(vpath, abs_f, row, col, tw, th, label, rel,
+                                                embedding=emb, crop_x=cx, crop_y=cy)
+                except Exception as e:
+                    print(f"[Pipeline]   WARNING: failed to save to TileAnnotationDB: {e}")
+
+            # b) Embedding similarity (for "looks like" on future novel tiles)
+            if self.label_store is not None:
+                try:
+                    self.label_store.add(emb, label, rel)
+                    print(f"[Pipeline]   -> Also added to embedding similarity cache.")
+                except Exception as e:
+                    print(f"[Pipeline]   -> WARNING: failed to add to label_store: {e}")
+
+            return label, rel
 
         if self.ared_adapter:
             self.ared_adapter.set_label_provider(_gui_label_provider)
+
+        # Make sure the provider closure can see the current tile_db and edit_mode
+        # (already closed over self)
 
     def _run_loop(self):
         """Main worker loop: for each video, for selected frames, tile -> embed -> ARED."""
@@ -330,8 +407,11 @@ class DroneAREDController:
                     # Convert BGR (cv2) -> RGB
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-                    # Tile
-                    tiles = self.tiler.tile_frame(frame_rgb, frame_idx, self._global_tile_counter)
+                    # Tile - attach full identity (video + absolute frame). This is crucial
+                    # so that the exact label DB can recall previous human decisions even when
+                    # frame_stride changes between runs.
+                    tiles = self.tiler.tile_frame(frame_rgb, frame_idx, self._global_tile_counter,
+                                                  video_path=video_path)
                     if not tiles:
                         continue
 
@@ -378,11 +458,18 @@ class DroneAREDController:
 
             for tile, emb in zip(tiles, embs):
                 print(f"[Pipeline->ARED] passing new tile global={tile.global_idx} (frame={tile.frame_idx}, r={tile.tile_row}, c={tile.tile_col}) to A_RED")
-                info = self.ared_adapter.process(emb, tile_image=tile, meta={
+                # Rich identity for the exact TileAnnotationDB (primary) + backward compat for embedding cache
+                meta = {
+                    "video_path": getattr(tile, 'video_path', '') or video_path,
                     "frame": tile.frame_idx,
+                    "abs_frame": tile.frame_idx,   # always the true video frame number
                     "row": tile.tile_row,
                     "col": tile.tile_col,
-                })
+                    "tile_width": tile.width,
+                    "tile_height": tile.height,
+                    "bbox": tile.bbox,
+                }
+                info = self.ared_adapter.process(emb, tile_image=tile, meta=meta)
                 self.stats["tiles_processed"] += 1
 
                 ared_queried = info.get("queried", False)

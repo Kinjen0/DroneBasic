@@ -31,6 +31,7 @@ from .config import PipelineConfig, GUIConfig
 from .pipeline import DroneAREDController, LabelRequest
 from .label_store import PersistentLabelStore
 from .ared_adapter import AREDAdapter
+from .tile_database import TileAnnotationDB, extract_tile_from_video  # exact identity + re-extract helper
 
 
 class LabelingDialog(tk.Toplevel):
@@ -555,6 +556,8 @@ class MainWindow:
 
         self.controller = DroneAREDController(self.config)
         self.label_store: Optional[PersistentLabelStore] = None
+        self.tile_db: Optional[TileAnnotationDB] = None   # NEW: exact (video, frame, tile) labels
+        self.edit_mode: bool = False
         self._stats_job = None
         self._pending_label_request: Optional[LabelRequest] = None
         self.discovered_classes: set = set()  # labels we have assigned in this run (for immediate UI feedback)
@@ -633,7 +636,25 @@ class MainWindow:
         self._add_param_row(param_frame, "DINO model name", "dino_model", self.config.features.model_name, is_str=True)
 
         s = self.ui_scale
-        ttk.Checkbutton(param_frame, text="Use label cache", variable=tk.BooleanVar(value=self.config.label_cache.enabled)).pack(anchor="w", pady=int(2*s))
+        ttk.Checkbutton(param_frame, text="Use label cache (similarity)", variable=tk.BooleanVar(value=self.config.label_cache.enabled)).pack(anchor="w", pady=int(2*s))
+
+        # NEW: Exact tile annotation DB controls
+        ttk.Separator(param_frame, orient="horizontal").pack(fill="x", pady=int(4*s))
+        ttk.Label(param_frame, text="Exact Tile Labels DB (identity by video+frame+pos)").pack(anchor="w")
+        self._add_param_row(param_frame, "Annotation DB path", "tile_ann_db", self.config.tile_annotations.db_path, is_str=True)
+        self.edit_mode_var = tk.BooleanVar(value=self.config.tile_annotations.edit_mode_default)
+        cb = ttk.Checkbutton(param_frame, text="EDIT MODE: force GUI even on known exact tiles (for corrections)",
+                             variable=self.edit_mode_var)
+        cb.pack(anchor="w", pady=int(3*s))
+        # Live update if controller already running
+        def _sync_edit_mode(*_):
+            self.edit_mode = self.edit_mode_var.get()
+            if hasattr(self, "controller"):
+                self.controller.set_edit_mode(self.edit_mode)
+        self.edit_mode_var.trace_add("write", _sync_edit_mode)
+        ttk.Button(param_frame, text="Review / Edit Past Labels...", command=self._open_review_window).pack(fill="x", pady=int(3*s))
+        ttk.Button(param_frame, text="Save Annotation DB Now", command=self._save_tile_annotations).pack(fill="x")
+        ttk.Button(param_frame, text="Load different Annotation DB...", command=self._load_tile_annotations).pack(fill="x")
 
         # Right side: stats + discovered classes
         right = ttk.Frame(body)
@@ -682,6 +703,10 @@ class MainWindow:
             self.config.ared.l_buf_size = int(getattr(self, "_buf_size_var").get())
             self.config.label_cache.auto_label_threshold = float(getattr(self, "_cache_thresh_var").get())
             self.config.features.model_name = getattr(self, "_dino_model_var").get()
+
+            # NEW exact annotation DB
+            self.config.tile_annotations.db_path = getattr(self, "_tile_ann_db_var").get()
+            self.config.tile_annotations.edit_mode_default = self.edit_mode_var.get()
         except Exception as e:
             messagebox.showerror("Params", f"Bad parameter value: {e}")
 
@@ -700,7 +725,7 @@ class MainWindow:
     def _start(self):
         self._read_params_into_config()
 
-        # Prepare label store
+        # Prepare label store (embedding similarity)
         if self.config.label_cache.enabled:
             self.label_store = PersistentLabelStore(
                 db_path=self.config.label_cache.db_path,
@@ -709,6 +734,19 @@ class MainWindow:
             self.controller.set_label_store(self.label_store)
         else:
             self.label_store = None
+
+        # Prepare exact tile annotation DB (NEW - primary for persistent exact labels + editing)
+        if getattr(self.config.tile_annotations, 'enabled', True):
+            ann_path = self.config.tile_annotations.db_path or "drone_tile_annotations.db"
+            self.tile_db = TileAnnotationDB(db_path=ann_path)
+            self.controller.set_tile_database(self.tile_db)
+        else:
+            self.tile_db = None
+            self.controller.set_tile_database(None)
+
+        # Edit mode (force re-label of known exact tiles for corrections)
+        self.edit_mode = self.edit_mode_var.get()
+        self.controller.set_edit_mode(self.edit_mode)
 
         self.controller.update_config(self.config)
         self.controller.start()
@@ -730,6 +768,56 @@ class MainWindow:
             messagebox.showinfo("Label Cache", "Label cache saved.")
         else:
             messagebox.showwarning("Label Cache", "No active label store.")
+
+    def _save_tile_annotations(self):
+        """NEW: force flush of the exact annotation DB (sqlite writes immediately on set, but explicit is nice)."""
+        if self.tile_db:
+            try:
+                self.tile_db.conn.commit()
+                count = len(self.tile_db)
+                messagebox.showinfo("Tile Annotations", f"Annotation DB saved. Total entries: {count}")
+            except Exception as e:
+                messagebox.showerror("Tile Annotations", f"Save failed: {e}")
+        else:
+            messagebox.showwarning("Tile Annotations", "No annotation DB active.")
+
+    def _load_tile_annotations(self):
+        path = filedialog.askopenfilename(title="Load tile annotation DB", filetypes=[("SQLite DB", "*.db"), ("All", "*.*")])
+        if not path:
+            return
+        try:
+            if self.tile_db:
+                try:
+                    self.tile_db.close()
+                except Exception:
+                    pass
+            self.tile_db = TileAnnotationDB(db_path=path)
+            self.controller.set_tile_database(self.tile_db)
+            self.config.tile_annotations.db_path = path
+            messagebox.showinfo("Tile Annotations", f"Loaded DB with {len(self.tile_db)} entries.")
+        except Exception as e:
+            messagebox.showerror("Load", str(e))
+
+    # ------------------------------------------------------------------
+    # NEW: Review / Edit past exact labels (works across runs and stride changes)
+    # ------------------------------------------------------------------
+    def _open_review_window(self):
+        if not self.tile_db:
+            # Try to open/create one from current config
+            try:
+                path = getattr(self.config.tile_annotations, 'db_path', 'drone_tile_annotations.db')
+                self.tile_db = TileAnnotationDB(db_path=path)
+                self.controller.set_tile_database(self.tile_db)
+            except Exception as e:
+                messagebox.showerror("Review", f"Could not open annotation DB: {e}")
+                return
+
+        videos = self.tile_db.list_videos()
+        if not videos:
+            messagebox.showinfo("Review", "No annotations saved yet. Label some tiles while running A/RED (or load a previous DB).")
+            return
+
+        LabelReviewWindow(self.root, self.tile_db, ui_scale=self.ui_scale)
 
     def _load_label_cache(self):
         path = filedialog.askopenfilename(title="Load label cache", filetypes=[("Pickle", "*.pkl")])
@@ -935,3 +1023,251 @@ class MainWindow:
                 self.start_btn.config(state="normal")
             elif status in ("running", "paused"):
                 self.start_btn.config(state="disabled")
+
+
+# =============================================================================
+# LabelReviewWindow - browse + correct previous exact labels (no stored pixels)
+# =============================================================================
+
+class LabelReviewWindow(tk.Toplevel):
+    """
+    Standalone window for reviewing and editing past tile labels stored in the
+    exact TileAnnotationDB.
+
+    - Select video (from those that have annotations)
+    - Browse annotations (list + prev/next)
+    - Re-extracts the tile image live from the original video file (using stored
+      frame + crop position). No images are saved to disk.
+    - Same quick labeling UX: list of classes or create new + relevant checkbox.
+    - "Save Change" writes the (possibly corrected) label back to the DB.
+    """
+
+    def __init__(self, master, tile_db: "TileAnnotationDB", ui_scale: float = 1.6):
+        super().__init__(master)
+        self.tile_db = tile_db
+        self.ui_scale = float(ui_scale) if ui_scale else 1.6
+        self.current_ann: Optional[Dict] = None
+        self.current_img: Optional[Image.Image] = None
+        self._zoom = 1.0
+
+        self.title("Review & Edit Past Tile Labels - Exact DB")
+        base = int(1100 * min(self.ui_scale, 2.0))
+        self.geometry(f"{base}x{int(base*0.72)}")
+        self.minsize(800, 520)
+        self.resizable(True, True)
+
+        self._build()
+        self._load_videos()
+        self.after(80, self._center_initial)
+
+    def _build(self):
+        s = self.ui_scale
+        fs = int(11 * s)
+
+        top = ttk.Frame(self)
+        top.pack(fill="x", padx=int(8*s), pady=int(4*s))
+
+        ttk.Label(top, text="Video:").pack(side="left")
+        self.video_var = tk.StringVar()
+        self.video_combo = ttk.Combobox(top, textvariable=self.video_var, width=60, state="readonly")
+        self.video_combo.pack(side="left", padx=4)
+        self.video_combo.bind("<<ComboboxSelected>>", lambda e: self._load_annotations_for_current_video())
+
+        ttk.Button(top, text="Reload List", command=self._load_videos).pack(side="left", padx=4)
+
+        # Main split: left list of annotations, center image + info, right edit controls
+        main = ttk.Frame(self)
+        main.pack(fill="both", expand=True, padx=int(6*s), pady=int(4*s))
+
+        # Left: list of annotations for the video
+        left = ttk.LabelFrame(main, text="Labeled tiles in this video (click or use arrows)")
+        left.pack(side="left", fill="both", expand=False, padx=(0, int(6*s)))
+
+        self.ann_list = tk.Listbox(left, width=42, height=18, font=("TkDefaultFont", fs))
+        self.ann_list.pack(fill="both", expand=True, side="left")
+        ysb = ttk.Scrollbar(left, orient="vertical", command=self.ann_list.yview)
+        ysb.pack(side="right", fill="y")
+        self.ann_list.configure(yscrollcommand=ysb.set)
+        self.ann_list.bind("<<ListboxSelect>>", self._on_list_select)
+
+        nav = ttk.Frame(left)
+        nav.pack(fill="x")
+        ttk.Button(nav, text="◀ Prev", command=self._prev).pack(side="left", expand=True, fill="x")
+        ttk.Button(nav, text="Next ▶", command=self._next).pack(side="left", expand=True, fill="x")
+
+        # Center: image display
+        center = ttk.LabelFrame(main, text="Tile (re-extracted from source video on demand)")
+        center.pack(side="left", fill="both", expand=True, padx=int(4*s))
+
+        self.canvas = tk.Canvas(center, bg="#222", width=520, height=420)
+        self.canvas.pack(fill="both", expand=True, padx=4, pady=4)
+
+        self.info_var = tk.StringVar(value="Select an annotation from the list on the left.")
+        ttk.Label(center, textvariable=self.info_var, relief="sunken").pack(fill="x", padx=4, pady=2)
+
+        zf = ttk.Frame(center)
+        zf.pack(fill="x")
+        ttk.Button(zf, text="Zoom -", command=lambda: self._zoom_delta(-0.2)).pack(side="left")
+        ttk.Button(zf, text="Zoom +", command=lambda: self._zoom_delta(0.2)).pack(side="left")
+        ttk.Button(zf, text="Fit", command=self._display_image).pack(side="left")
+
+        # Right: editing (re-uses spirit of the main labeling dialog)
+        right = ttk.LabelFrame(main, text="Edit label for this tile")
+        right.pack(side="left", fill="y", padx=(int(4*s), 0))
+
+        ttk.Label(right, text="Current / New label:").pack(anchor="w", padx=4, pady=(4,0))
+        self.label_var = tk.StringVar()
+        self.label_entry = ttk.Entry(right, textvariable=self.label_var, width=28)
+        self.label_entry.pack(fill="x", padx=4)
+
+        self.rel_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(right, text="Relevant (interesting / anomaly)", variable=self.rel_var).pack(anchor="w", padx=4, pady=4)
+
+        ttk.Button(right, text="Save Change to DB", command=self._save_current_edit).pack(fill="x", padx=4, pady=6)
+        ttk.Button(right, text="Mark Background", command=lambda: self._quick_assign("__BACKGROUND__", False)).pack(fill="x", padx=4)
+        ttk.Button(right, text="Delete this annotation", command=self._delete_current).pack(fill="x", padx=4, pady=(2,8))
+
+        ttk.Separator(right, orient="horizontal").pack(fill="x", pady=6)
+        ttk.Label(right, text="Tip: Changes are immediately usable.\nRe-run A/RED (normal mode) to auto-apply.").pack(anchor="w", padx=4)
+
+        self.status_var = tk.StringVar(value="")
+        ttk.Label(right, textvariable=self.status_var, relief="sunken").pack(fill="x", side="bottom", pady=4)
+
+    def _load_videos(self):
+        vids = self.tile_db.list_videos()
+        self.video_combo['values'] = vids
+        if vids:
+            self.video_var.set(vids[0])
+            self._load_annotations_for_current_video()
+
+    def _load_annotations_for_current_video(self):
+        v = self.video_var.get()
+        if not v:
+            return
+        self.annotations = self.tile_db.get_annotations_for_video(v)
+        self.ann_list.delete(0, "end")
+        for i, a in enumerate(self.annotations):
+            rel_mark = " [R]" if a["relevant"] else ""
+            txt = f"f{a['abs_frame']:06d} r{a['tile_row']}c{a['tile_col']}  {a['label']}{rel_mark}"
+            self.ann_list.insert("end", txt)
+        if self.annotations:
+            self.ann_list.selection_set(0)
+            self._show_annotation(0)
+
+    def _on_list_select(self, event=None):
+        sel = self.ann_list.curselection()
+        if sel:
+            self._show_annotation(sel[0])
+
+    def _show_annotation(self, idx: int):
+        if not (0 <= idx < len(getattr(self, 'annotations', []))):
+            return
+        ann = self.annotations[idx]
+        self.current_ann = ann
+
+        # Build bbox from stored crop or fall back to grid calc
+        cx = ann.get("crop_x", ann["tile_col"] * ann["tile_width"])
+        cy = ann.get("crop_y", ann["tile_row"] * ann["tile_height"])
+        tw, th = ann["tile_width"], ann["tile_height"]
+        bbox = (cx, cy, cx + tw, cy + th)
+
+        img = extract_tile_from_video(ann["video_path"], ann["abs_frame"], bbox)
+        self.current_img = img
+
+        self.label_var.set(ann["label"])
+        self.rel_var.set(ann["relevant"])
+
+        name = Path(ann["video_path"]).name
+        self.info_var.set(f"{name}  frame={ann['abs_frame']}  pos=({ann['tile_row']},{ann['tile_col']})  size={tw}x{th}")
+        self._display_image()
+        self.status_var.set("Loaded. Edit above and click Save Change.")
+
+    def _display_image(self):
+        if not self.current_img:
+            self.canvas.delete("all")
+            self.canvas.create_text(200, 100, text="(Could not re-extract tile image from video)", fill="orange")
+            return
+        self.canvas.delete("all")
+        cw = max(100, self.canvas.winfo_width() or 520)
+        ch = max(100, self.canvas.winfo_height() or 380)
+        z = max(0.1, min(6.0, self._zoom))
+
+        orig_w, orig_h = self.current_img.size
+        ratio = min((cw - 10) * z / orig_w, (ch - 10) * z / orig_h)
+        new_w = max(1, int(orig_w * ratio))
+        new_h = max(1, int(orig_h * ratio))
+        disp = self.current_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        self._tkimg = ImageTk.PhotoImage(disp)
+        self.canvas.create_image(cw//2, ch//2, image=self._tkimg, anchor="center")
+
+    def _zoom_delta(self, d: float):
+        self._zoom = max(0.2, min(5.0, self._zoom + d))
+        self._display_image()
+
+    def _prev(self):
+        sel = self.ann_list.curselection()
+        idx = sel[0] - 1 if sel else 0
+        if idx < 0:
+            idx = len(self.annotations) - 1
+        self.ann_list.selection_clear(0, "end")
+        self.ann_list.selection_set(idx)
+        self.ann_list.see(idx)
+        self._show_annotation(idx)
+
+    def _next(self):
+        sel = self.ann_list.curselection()
+        idx = (sel[0] + 1) if sel else 0
+        if idx >= len(self.annotations):
+            idx = 0
+        self.ann_list.selection_clear(0, "end")
+        self.ann_list.selection_set(idx)
+        self.ann_list.see(idx)
+        self._show_annotation(idx)
+
+    def _save_current_edit(self):
+        if not self.current_ann:
+            return
+        ann = self.current_ann
+        new_label = self.label_var.get().strip() or "__UNLABELED__"
+        new_rel = self.rel_var.get()
+
+        try:
+            self.tile_db.set_annotation(
+                ann["video_path"], ann["abs_frame"], ann["tile_row"], ann["tile_col"],
+                ann["tile_width"], ann["tile_height"],
+                new_label, new_rel,
+                embedding=None,  # we don't re-embed here; original emb if present stays
+                crop_x=ann.get("crop_x"), crop_y=ann.get("crop_y")
+            )
+            self.status_var.set(f"Saved: {new_label} (rel={new_rel})")
+            # Refresh list
+            self._load_annotations_for_current_video()
+        except Exception as e:
+            messagebox.showerror("Save", str(e))
+
+    def _quick_assign(self, label: str, rel: bool):
+        self.label_var.set(label)
+        self.rel_var.set(rel)
+        self._save_current_edit()
+
+    def _delete_current(self):
+        if not self.current_ann:
+            return
+        if not messagebox.askyesno("Delete", "Remove this annotation from the DB?"):
+            return
+        ann = self.current_ann
+        try:
+            self.tile_db.delete_annotation(
+                ann["video_path"], ann["abs_frame"], ann["tile_row"], ann["tile_col"],
+                ann["tile_width"], ann["tile_height"]
+            )
+            self.status_var.set("Deleted.")
+            self._load_annotations_for_current_video()
+        except Exception as e:
+            messagebox.showerror("Delete", str(e))
+
+    def _center_initial(self):
+        try:
+            self.update_idletasks()
+        except Exception:
+            pass

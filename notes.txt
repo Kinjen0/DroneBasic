@@ -1,0 +1,2 @@
+Perhaps we need to move away from the idea of "Live footage." As currently, especially with the "warmup" period, 
+the algorithm makes too many queries to go along with a live system.
