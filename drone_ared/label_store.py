@@ -145,3 +145,10 @@ class PersistentLabelStore:
 
     def get_all_labels(self) -> List[str]:
         return sorted(set(self._labels))
+
+    def get_class_relevance(self, label: str) -> Optional[bool]:
+        """Return the relevant flag associated with a previously stored example of this class, if any."""
+        for i, lbl in enumerate(self._labels):
+            if lbl == label:
+                return self._relevances[i]
+        return None

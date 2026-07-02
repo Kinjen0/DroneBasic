@@ -46,7 +46,7 @@ class LabelingDialog(tk.Toplevel):
 
     def __init__(self, master, request: LabelRequest, known_classes: List[str],
                  on_assign: callable, class_counts: Optional[Dict[str, int]] = None,
-                 ui_scale: float = 1.6):
+                 ui_scale: float = 1.6, class_relevance: Optional[Dict[str, bool]] = None):
         super().__init__(master)
         self.title("Review Queried Tile - A/RED Drone  [Persistent - reposition me once!]")
         self.current_req = request
@@ -55,6 +55,7 @@ class LabelingDialog(tk.Toplevel):
         self.known_classes = sorted(set(known_classes))
         self.ui_scale = float(ui_scale) if ui_scale else 1.6
         self._zoom_level = 1.0
+        self.class_relevance: dict[str, bool] = dict(class_relevance or {})  # class -> relevant (set at creation)
 
         # Larger default + fully resizable for high-res displays and comfort during long labeling sessions
         # Scale the dialog size with ui_scale for better defaults on large screens
@@ -377,6 +378,8 @@ class LabelingDialog(tk.Toplevel):
             # Show count only when > 0. (0) was confusing; it meant "seen this many times so far in the store".
             # New or first-seen classes legitimately start at 0 until labeled.
             display = f"{cls}  ({count})" if count > 0 else cls
+            if self.class_relevance.get(cls, False):
+                display += " [relevant]"
             self.class_list.insert("end", display)
             self._filtered_classes.append(cls)
 
@@ -430,7 +433,9 @@ class LabelingDialog(tk.Toplevel):
             # advances when double-clicking whitespace.
             self.new_entry.focus_set()
             return
-        rel = self.relevant_var.get()
+        # For existing classes, use the relevance that was set when the class was created.
+        # The checkbox only affects *new* class creation.
+        rel = self.class_relevance.get(label, False)
         self._assign(label, rel)
 
     def _create_and_assign(self):
@@ -438,13 +443,16 @@ class LabelingDialog(tk.Toplevel):
         if not name:
             messagebox.showwarning("New Class", "Please enter a class name.")
             return
-        rel = self.relevant_var.get()
+        # Checkbox determines relevance *only* for newly created classes.
+        checkbox_rel = self.relevant_var.get()
 
         # Give immediate visual feedback in *this* dialog:
         # add the new class to the list right away so user sees it was accepted.
         if name not in self.known_classes:
             self.known_classes.append(name)
             self.class_counts[name] = self.class_counts.get(name, 0)
+            self.class_relevance[name] = checkbox_rel  # record the relevance decided at creation
+            rel = checkbox_rel
             self._refresh_class_list(self.filter_var.get())
             try:
                 idx = self._filtered_classes.index(name)
@@ -453,6 +461,9 @@ class LabelingDialog(tk.Toplevel):
                 self.class_list.see(idx)
             except ValueError:
                 pass
+        else:
+            # Typing an existing name into "Create" — use the class's established relevance
+            rel = self.class_relevance.get(name, checkbox_rel)
 
         # Clear entry 
         self.new_var.set("")
@@ -460,6 +471,7 @@ class LabelingDialog(tk.Toplevel):
         self._assign(name, rel)
 
     def _assign_as_background(self):
+        self.class_relevance["__BACKGROUND__"] = False
         self._assign("__BACKGROUND__", False)
 
     def _close_window(self):
@@ -467,6 +479,7 @@ class LabelingDialog(tk.Toplevel):
         # Satisfy the pending req so the worker does not hang forever waiting for a label.
         if getattr(self, 'current_req', None):
             print("[GUI Dialog] Window closed without assign - satisfying worker with __BACKGROUND__ to avoid freeze.")
+            self.class_relevance["__BACKGROUND__"] = False
             try:
                 self.current_req.set_result("__BACKGROUND__", False)
             except Exception:
@@ -481,11 +494,13 @@ class LabelingDialog(tk.Toplevel):
         # or the dedicated Create & Assign for new classes.
         label = self._get_selected_class()
         if label is not None:
-            rel = self.relevant_var.get()
+            # For existing classes, use the relevance that was set when the class was created.
+            # The checkbox only affects *new* class creation.
+            rel = self.class_relevance.get(label, False)
             self._assign(label, rel)
         # else: ignore accidental double-clicks on empty list area
 
-    def set_current_request(self, req, known_classes=None, class_counts=None):
+    def set_current_request(self, req, known_classes=None, class_counts=None, class_relevance=None):
         """Update this persistent window for a new A/RED query without destroying/recreating it.
         User can keep the window in a convenient screen position.
         """
@@ -494,6 +509,11 @@ class LabelingDialog(tk.Toplevel):
             self.known_classes = sorted(set(known_classes))
         if class_counts is not None:
             self.class_counts = class_counts or {}
+        if class_relevance is not None:
+            # merge without overwriting ones we just created in this dialog session
+            for k, v in class_relevance.items():
+                if k not in self.class_relevance:
+                    self.class_relevance[k] = v
         self._load_and_show_image()
         filt = self.filter_var.get() if hasattr(self, 'filter_var') else ""
         self._refresh_class_list(filt)
@@ -538,6 +558,7 @@ class MainWindow:
         self._stats_job = None
         self._pending_label_request: Optional[LabelRequest] = None
         self.discovered_classes: set = set()  # labels we have assigned in this run (for immediate UI feedback)
+        self.class_relevance: dict[str, bool] = {}  # class name -> is_relevant (set at creation time)
         self._last_queried_global = -1
 
         self._build_ui()
@@ -585,7 +606,7 @@ class MainWindow:
         self.start_btn.pack(side="left", padx=int(2*s))
         ttk.Button(ctrl, text="Pause", command=self.controller.pause).pack(side="left", padx=int(2*s))
         ttk.Button(ctrl, text="Resume", command=self.controller.resume).pack(side="left", padx=int(2*s))
-        ttk.Button(ctrl, text="Stop", command=self.controller.stop).pack(side="left", padx=int(2*s))
+        ttk.Button(ctrl, text="Stop", command=self._stop).pack(side="left", padx=int(2*s))
 
         # Quick model controls
         ttk.Button(ctrl, text="Save ARED Model", command=self._save_ared_state).pack(side="left", padx=int(8*s))
@@ -695,6 +716,14 @@ class MainWindow:
         self.start_btn.config(state="disabled")
         self.status_var.set("Processing... (use Pause / Stop)")
 
+    def _stop(self):
+        """Stop the worker and re-enable Start so the user can restart without restarting the whole program."""
+        self.controller.stop()
+        self.start_btn.config(state="normal")
+        self.status_var.set("Stopped. You can change parameters/videos and press Start again.")
+        if self.controller.stats:
+            self._update_stats_display(self.controller.stats)
+
     def _save_label_cache(self):
         if self.label_store:
             self.label_store.save()
@@ -721,10 +750,21 @@ class MainWindow:
 
     def _load_ared_state(self):
         path = filedialog.askopenfilename(title="Load ARED model state", filetypes=[("Pickle", "*.pkl")])
-        if path and self.controller.ared_adapter:
-            self.controller.ared_adapter.load_state(path, label_lookup=self._label_lookup_from_store)
-            self._refresh_class_list()
-            messagebox.showinfo("ARED State", "Model state loaded and replayed.")
+        if not path:
+            return
+        # Allow loading even before first Start (create adapter if necessary so we can warm-start)
+        if not self.controller.ared_adapter:
+            self.controller.ared_adapter = AREDAdapter(self.config.ared)
+            if self.label_store:
+                self.controller.ared_adapter.set_label_store(self.label_store)
+        self.controller.ared_adapter.load_state(path, label_lookup=self._label_lookup_from_store)
+        self._refresh_class_list()
+        # reflect the loaded clusters in the live stats
+        if self.controller.ared_adapter:
+            self.controller.stats["ared_clusters"] = self.controller.ared_adapter.num_clusters
+            self.controller.stats["ared_known_labels"] = self.controller.ared_adapter.num_known_labels
+            self._update_stats_display(self.controller.stats)
+        messagebox.showinfo("ARED State", "Model state loaded and replayed.")
 
     def _label_lookup_from_store(self, emb):
         if self.label_store:
@@ -777,12 +817,26 @@ class MainWindow:
 
         classes = sorted(set(classes))
 
+        # Build relevance map (source of truth is our class_relevance; seed from store if possible)
+        class_relevance = dict(getattr(self, 'class_relevance', {}))
+        for lbl in classes:
+            if lbl not in class_relevance:
+                seeded = False
+                if self.label_store:
+                    rel = self.label_store.get_class_relevance(lbl)
+                    if rel is not None:
+                        class_relevance[lbl] = rel
+                        seeded = True
+                if not seeded:
+                    class_relevance[lbl] = False
+
         def _assign_cb(label: str, relevant: bool):
             # This is now purely notification / UI update.
             # The dialog itself calls set_result on the req it holds.
             print(f"[GUI] Label SUBMITTED from dialog: '{label}' (relevant={relevant})")
             self._pending_label_request = None
             self.discovered_classes.add(label)
+            self.class_relevance[label] = relevant  # remember the relevance decided at (or for) this class
             self._refresh_class_list()
             self.status_var.set(f"Last label assigned: {label} (relevant={relevant})")
             print("[GUI] Dialog back to WAITING state for next A/RED query (worker continues processing non-queried tiles in background).")
@@ -798,10 +852,11 @@ class MainWindow:
                 on_assign=_assign_cb,
                 class_counts=counts,
                 ui_scale=getattr(self, 'ui_scale', 1.6),
+                class_relevance=class_relevance,
             )
         else:
             print("[GUI] Updating existing persistent LabelingDialog with new query tile.")
-            self._labeling_win.set_current_request(req, known_classes=classes, class_counts=counts)
+            self._labeling_win.set_current_request(req, known_classes=classes, class_counts=counts, class_relevance=class_relevance)
 
     def _refresh_class_list(self):
         self.class_listbox.delete(0, "end")
@@ -814,9 +869,23 @@ class MainWindow:
         # Include ones we just assigned in the GUI (for immediate visibility on next queries)
         all_labels.update(getattr(self, 'discovered_classes', set()))
 
+        # Ensure we have a relevance entry (seed from store when possible)
+        for lbl in all_labels:
+            if lbl not in self.class_relevance:
+                seeded = False
+                if self.label_store:
+                    rel = self.label_store.get_class_relevance(lbl)
+                    if rel is not None:
+                        self.class_relevance[lbl] = rel
+                        seeded = True
+                if not seeded:
+                    self.class_relevance[lbl] = False
+
         for lbl in sorted(all_labels):
             c = counts.get(lbl, 0)
             display = f"{lbl} ({c})" if c > 0 else lbl
+            if self.class_relevance.get(lbl, False):
+                display += " [R]"
             self.class_listbox.insert("end", display)
 
     # ------------------------------------------------------------------
@@ -858,3 +927,11 @@ class MainWindow:
 
         if stats.get("tiles_processed", 0) % 15 == 0:
             self._refresh_class_list()
+
+        # Re-enable Start after a run ends so user can restart / load new videos without restarting the program
+        status = stats.get("status", "")
+        if hasattr(self, "start_btn"):
+            if status in ("stopped", "finished", "error", "idle"):
+                self.start_btn.config(state="normal")
+            elif status in ("running", "paused"):
+                self.start_btn.config(state="disabled")

@@ -82,7 +82,7 @@ class AREDConfig:
     """
     kappa: float = 1.0          # higher = more queries (more paranoid)
     l_buf_size: int = 2000      # memory bound for labeled points (circular)
-    k_comp_pts: int = 2         # how many nearest to consider (enables neighborhood merge)
+    k_comp_pts: int = 5         # how many nearest to consider (enables neighborhood merge)
     qs_var: int = 1             # 0=diameter, 1=average NN distance (single link style)
     data_aug_var: Tuple[int, Tuple[int, int]] = (0, (0, 0))
     nghbhood_merge: bool = True

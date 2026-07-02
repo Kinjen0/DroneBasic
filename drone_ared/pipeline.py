@@ -98,6 +98,7 @@ class DroneAREDController:
 
         self._worker_thread: Optional[threading.Thread] = None
         self._global_tile_counter = 0
+        self._current_label_req: Optional[LabelRequest] = None
 
         # Callback the GUI can register to receive periodic status updates
         self.on_stats: Optional[Callable[[Dict], None]] = None
@@ -116,8 +117,16 @@ class DroneAREDController:
         self._stop_event.clear()
         self._pause_event.set()
 
-        # (Re)create heavy objects here so GUI can change config between runs
-        self._init_components()
+        # Reset per-run counters for a fresh processing pass (ARED state is kept if present)
+        self._global_tile_counter = 0
+        self.stats["tiles_processed"] = 0
+        self.stats["frames_read"] = 0
+        self.stats["user_queries"] = 0
+        self.stats["cache_hits"] = 0
+
+        # Create components. We pass create_ared=False if we already have one (from Load ARED).
+        create_ared = (self.ared_adapter is None)
+        self._init_components(create_ared=create_ared)
 
         self._worker_thread = threading.Thread(target=self._run_loop, daemon=True, name="ared-worker")
         self._worker_thread.start()
@@ -141,8 +150,30 @@ class DroneAREDController:
     def stop(self, join_timeout: float = 3.0):
         self._stop_event.set()
         self._pause_event.set()  # unblock if paused
+
+        # Unblock any pending label request (worker may be blocked in req.wait() for human label)
+        if getattr(self, "_current_label_req", None):
+            try:
+                self._current_label_req.set_result("__STOPPED__", False)
+            except Exception:
+                pass
+            self._current_label_req = None
+
+        # Drain any still-queued label requests so they don't block future runs
+        while True:
+            try:
+                req = self.label_request_queue.get_nowait()
+                if req:
+                    try:
+                        req.set_result("__STOPPED__", False)
+                    except Exception:
+                        pass
+            except queue.Empty:
+                break
+
         if self._worker_thread:
             self._worker_thread.join(timeout=join_timeout)
+            self._worker_thread = None
         self.stats["status"] = "stopped"
         print("[Controller] Stopped")
 
@@ -161,7 +192,10 @@ class DroneAREDController:
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
-    def _init_components(self):
+    def _init_components(self, create_ared: bool = True):
+        """Initialize (or re-initialize) pipeline components.
+        If create_ared=False, we preserve an existing ared_adapter (e.g. from Load ARED Model).
+        """
         tcfg = self.config.tiling
         self.tiler = GridTiler(
             tile_width=tcfg.tile_width,
@@ -179,11 +213,12 @@ class DroneAREDController:
             batch_size=fcfg.batch_size,
         )
 
-        self.ared_adapter = AREDAdapter(self.config.ared)
-        if self.label_store:
-            self.ared_adapter.set_label_store(self.label_store)
+        if create_ared or self.ared_adapter is None:
+            self.ared_adapter = AREDAdapter(self.config.ared)
+            if self.label_store:
+                self.ared_adapter.set_label_store(self.label_store)
 
-        # Wire the label provider that the adapter will call on queries
+        # (Re)wire provider every time (the closure must see current stores etc.)
         def _gui_label_provider(emb: np.ndarray, tile_img: Any, meta: Dict):
             # This runs in the ARED worker thread.
             # A/RED decides whether a "query" is needed (anomalous or near-relevant cluster).
@@ -207,22 +242,26 @@ class DroneAREDController:
 
             req = LabelRequest(tile=tile_img or Tile(image=Image.new("RGB", (64, 64)), frame_idx=0, tile_row=0, tile_col=0, bbox=(0,0,0,0)),
                                embedding=emb, meta=meta)
+            self._current_label_req = req
             try:
                 self.label_request_queue.put(req, timeout=5)
             except queue.Full:
+                self._current_label_req = None
                 # Fallback: treat as irrelevant background if GUI is overwhelmed
                 print("[Pipeline]   -> WARNING: label queue full, falling back to __BACKGROUND__")
                 return "__BACKGROUND__", False
 
             print("[Pipeline]   -> Waiting for GUI response (blocking worker thread)...")
             result = req.wait(timeout=300)  # 5 minutes max for a single label - generous
+            self._current_label_req = None
             if result is None:
                 print("[Pipeline]   -> TIMEOUT waiting for label, using __TIMEOUT__")
                 return "__TIMEOUT__", False
             print(f"[Pipeline]   -> Received label from GUI: '{result[0]}' (relevant={result[1]})")
             return result
 
-        self.ared_adapter.set_label_provider(_gui_label_provider)
+        if self.ared_adapter:
+            self.ared_adapter.set_label_provider(_gui_label_provider)
 
     def _run_loop(self):
         """Main worker loop: for each video, for selected frames, tile -> embed -> ARED."""

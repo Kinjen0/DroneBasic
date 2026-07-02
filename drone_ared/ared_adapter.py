@@ -42,6 +42,7 @@ from typing import Optional, Tuple, List, Dict, Any, Callable, TYPE_CHECKING
 import numpy as np
 import pickle
 import threading
+import contextlib
 from dataclasses import dataclass, field
 
 if TYPE_CHECKING:
@@ -316,6 +317,19 @@ class AREDAdapter:
                 hook_calls[0] += 1
                 call_num = hook_calls[0]
 
+                # Special case for model load/replay: always honor the exact saved label
+                # from meta, bypassing cache/provider. This ensures faithful reconstruction
+                # of previous clusters.
+                if meta and meta.get("replay"):
+                    label = meta.get("label", f"replay_{_abs_index}")
+                    rel = bool(meta.get("relevant", False))
+                    obtained_label = label
+                    obtained_rel = rel
+                    self.oracle.y[_abs_index] = [label, rel]  # type: ignore
+                    self.discovered_labels.add(label)
+                    print(f"[ARED]   -> REPLAY using saved label '{label}' (relevant={rel})")
+                    return label, rel
+
                 is_peek = (call_num == 1 and self.num_points_processed > 0)
 
                 # 1. Try persistent cache first -- always, for both peek and real queries
@@ -444,18 +458,21 @@ class AREDAdapter:
         We export the *labeled* points that are currently in the live buffer.
         """
         labeled_points = []
-        l_buf = self.ared.l_buf
         try:
-            for i in range(l_buf.data_circular_buffer.count):
-                emb = l_buf.data_circular_buffer.get(i)
-                label = l_buf.label_circular_buffer.get(i)
-                rel = l_buf.relevance_circular_buffer.get(i)
-                if emb is not None:
-                    labeled_points.append({
-                        "emb": np.asarray(emb, dtype=np.float32),
-                        "label": str(label),
-                        "relevant": bool(rel),
-                    })
+            lock = getattr(self, "_lock", None)
+            ctx = lock if lock is not None else contextlib.nullcontext()
+            with ctx:
+                l_buf = self.ared.l_buf
+                for i in range(l_buf.data_circular_buffer.count):
+                    emb = l_buf.data_circular_buffer.get(i)
+                    label = l_buf.label_circular_buffer.get(i)
+                    rel = l_buf.relevance_circular_buffer.get(i)
+                    if emb is not None:
+                        labeled_points.append({
+                            "emb": np.asarray(emb, dtype=np.float32),
+                            "label": str(label),
+                            "relevant": bool(rel),
+                        })
         except Exception as e:
             print(f"[AREDAdapter] Warning during save_state buffer walk: {e}")
 
@@ -482,6 +499,10 @@ class AREDAdapter:
         with open(path, "rb") as f:
             state: AREDState = pickle.load(f)
 
+        # Preserve attachments across re-init
+        old_store = getattr(self, "_label_store", None)
+        old_provider = getattr(self, "_label_provider", None)
+
         # Re-create adapter with (approximately) same hyperparams
         new_cfg = type(self.config)(  # type: ignore
             kappa=state.kappa,
@@ -497,6 +518,14 @@ class AREDAdapter:
 
         # Fresh instance
         self.__init__(new_cfg)  # re-runs construction + patches
+
+        if old_store:
+            self.set_label_store(old_store)
+        # Do not restore provider yet if we want to avoid it during replay;
+        # the "replay" special case in _interactive_answer protects us anyway.
+        # Restore after so that subsequent real processing uses it.
+        if old_provider:
+            self.set_label_provider(old_provider)
 
         # If we have a label store attached, the process() method will use it
         # automatically. We can still feed the old points so clusters are rebuilt.
