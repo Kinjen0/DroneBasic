@@ -91,6 +91,14 @@ class AREDConfig:
     smart_forgetting_var: Tuple[int, float] = (3, 0.01)
     verbose_flags: list = field(default_factory=lambda: [0])
 
+    # Data augmentation for DINO-based runs (our custom implementation).
+    # When a tile is labeled (via query or DB), we rotate the original image,
+    # extract fresh DINO embeddings, and insert them as labeled variants
+    # with the SAME label/relevance. This is separate from the internal
+    # pixel-based DATA_AUG_VAR (which doesn't work on embeddings).
+    data_augmentation_enabled: bool = False
+    augmentation_rotations: list = field(default_factory=lambda: [90, 180, 270])
+
     # These are exposed for GUI control / future tuning
     # Higher buffer + smart forgetting = can handle longer streams
 
@@ -187,6 +195,7 @@ class PipelineConfig:
             features=FeatureConfig(**data.get("features", {})),
             ared=AREDConfig(**data.get("ared", {})),
             label_cache=LabelCacheConfig(**data.get("label_cache", {})),
+            tile_annotations=TileAnnotationConfig(**data.get("tile_annotations", {})),
             model_save=ModelSaveConfig(**data.get("model_save", {})),
             gui=GUIConfig(**data.get("gui", {})),
             video_paths=data.get("video_paths", []),

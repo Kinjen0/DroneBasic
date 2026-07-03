@@ -97,6 +97,7 @@ class DroneAREDController:
         self.ared_adapter: Optional[AREDAdapter] = None
         self.label_store: Optional[PersistentLabelStore] = None
         self.tile_db: Optional["TileAnnotationDB"] = None   # NEW: exact identity annotations
+        self._last_feature_extractor = None  # for restoring after adapter re-init / load
 
         self._worker_thread: Optional[threading.Thread] = None
         self._global_tile_counter = 0
@@ -226,11 +227,14 @@ class DroneAREDController:
             pooling=fcfg.pooling,
             batch_size=fcfg.batch_size,
         )
+        self._last_feature_extractor = self.feature_extractor
 
         if create_ared or self.ared_adapter is None:
             self.ared_adapter = AREDAdapter(self.config.ared)
             if self.label_store:
                 self.ared_adapter.set_label_store(self.label_store)
+            if self.feature_extractor:
+                self.ared_adapter.set_feature_extractor(self.feature_extractor)
 
         # (Re)wire provider every time (the closure must see current stores etc.)
         def _gui_label_provider(emb: np.ndarray, tile_img: Any, meta: Dict):
@@ -336,6 +340,10 @@ class DroneAREDController:
 
         if self.ared_adapter:
             self.ared_adapter.set_label_provider(_gui_label_provider)
+
+            # Forward feature extractor for DINO data augmentation (rotations)
+            if self.feature_extractor:
+                self.ared_adapter.set_feature_extractor(self.feature_extractor)
 
         # Make sure the provider closure can see the current tile_db and edit_mode
         # (already closed over self)

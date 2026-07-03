@@ -48,6 +48,7 @@ from dataclasses import dataclass, field
 if TYPE_CHECKING:
     from .label_store import PersistentLabelStore
     from .config import AREDConfig
+    from .augmentation import DINOAugmenter
 
 # ------------------------------------------------------------------
 # 1. ZERO-EDIT IMPORT SHIM
@@ -205,6 +206,7 @@ class AREDAdapter:
         from .config import AREDConfig  # local to avoid circular at top
 
         self.config = config
+        self._dino_augmenter = None  # lazy, set when we have a feature extractor reference
         self._lock = threading.Lock()
 
         # --- Create large dummy oracle + ARED ---
@@ -276,8 +278,20 @@ class AREDAdapter:
         """Optional: if set, the adapter will first try the store before calling the (GUI) provider."""
         self._label_store = store
 
+    def set_feature_extractor(self, feature_extractor):
+        """Optional: needed for DINO-based data augmentation (rotations)."""
+        self._feature_extractor = feature_extractor
+        if feature_extractor is not None:
+            try:
+                from .augmentation import DINOAugmenter
+                self._dino_augmenter = DINOAugmenter(feature_extractor)
+            except Exception:
+                self._dino_augmenter = None
+
     # Internal reference for type checkers / later wiring
     _label_store: Optional["PersistentLabelStore"] = None
+    _feature_extractor = None
+    _dino_augmenter = None
 
     # ------------------------------------------------------------------
     # Core processing
@@ -433,6 +447,20 @@ class AREDAdapter:
             if was_queried:
                 self.num_queries += 1
 
+            # ------------------------------------------------------------------
+            # Data Augmentation (optional, DINO rotation variants)
+            # After we have a real label for a queried point, generate rotated
+            # versions of the tile image, extract fresh DINO embs, and insert
+            # them as labeled variants (same label + relevance).
+            # This is done here so it only affects points A/RED actually decided
+            # to query.
+            # ------------------------------------------------------------------
+            if was_queried and obtained_label and getattr(self.config, "data_augmentation_enabled", False):
+                try:
+                    self._apply_data_augmentation(emb, tile_image, obtained_label, obtained_rel)
+                except Exception as e:
+                    print(f"[AREDAdapter] Data augmentation failed (non-fatal): {e}")
+
             # Return useful info (expandable)
             info = {
                 "abs_idx": abs_idx,
@@ -502,6 +530,7 @@ class AREDAdapter:
         # Preserve attachments across re-init
         old_store = getattr(self, "_label_store", None)
         old_provider = getattr(self, "_label_provider", None)
+        old_fe = getattr(self, "_feature_extractor", None)
 
         # Re-create adapter with (approximately) same hyperparams
         new_cfg = type(self.config)(  # type: ignore
@@ -514,6 +543,8 @@ class AREDAdapter:
             singleton_merge=getattr(self.config, "singleton_merge", True),
             smart_forgetting_var=getattr(self.config, "smart_forgetting_var", (3, 0.01)),
             verbose_flags=getattr(self.config, "verbose_flags", [0]),
+            data_augmentation_enabled=getattr(self.config, "data_augmentation_enabled", False),
+            augmentation_rotations=getattr(self.config, "augmentation_rotations", [90, 180, 270]),
         )
 
         # Fresh instance
@@ -526,6 +557,9 @@ class AREDAdapter:
         # Restore after so that subsequent real processing uses it.
         if old_provider:
             self.set_label_provider(old_provider)
+
+        if old_fe:
+            self.set_feature_extractor(old_fe)
 
         # If we have a label store attached, the process() method will use it
         # automatically. We can still feed the old points so clusters are rebuilt.
@@ -573,3 +607,68 @@ class AREDAdapter:
             return len(self.ared.subspace_partition.set_of_known_labels)
         except Exception:
             return 0
+
+    # ------------------------------------------------------------------
+    # Data Augmentation support (DINO rotations on labeled queried points)
+    # ------------------------------------------------------------------
+    def _apply_data_augmentation(self, original_emb, tile_image, label: str, relevant: bool):
+        """Generate rotated tile images, extract DINO embeddings, and insert
+        them as labeled variants using the (possibly extended) ARED API.
+        Only called for points that caused a real query.
+        """
+        if tile_image is None:
+            return
+
+        # tile_image may be a Tile dataclass or a raw PIL Image
+        pil_img = getattr(tile_image, "image", tile_image) if tile_image is not None else None
+        if pil_img is None:
+            return
+
+        if not getattr(self, "_dino_augmenter", None) and getattr(self, "_feature_extractor", None):
+            try:
+                from .augmentation import DINOAugmenter
+                self._dino_augmenter = DINOAugmenter(self._feature_extractor)
+            except Exception:
+                return
+
+        augmenter = getattr(self, "_dino_augmenter", None)
+        if augmenter is None:
+            return
+
+        angles = getattr(self.config, "augmentation_rotations", [90, 180, 270])
+        if not angles:
+            return
+
+        try:
+            rot_embs = augmenter.get_rotated_embeddings(pil_img, angles)
+        except Exception as e:
+            print(f"[AREDAdapter] Rotation embedding generation failed: {e}")
+            return
+
+        if not rot_embs:
+            return
+
+        added = 0
+        for remb in rot_embs:
+            try:
+                # Prefer the clean extension if present
+                if hasattr(self.ared, "add_labeled_variant"):
+                    self.ared.add_labeled_variant(remb, label, relevant)
+                else:
+                    # Fallback: use forced-label replay-style path
+                    self.process(
+                        remb,
+                        tile_image=None,
+                        meta={
+                            "augmented": True,
+                            "label": label,
+                            "relevant": relevant,
+                            "replay": True,
+                        },
+                    )
+                added += 1
+            except Exception as e:
+                print(f"[AREDAdapter] Failed to insert augmented variant: {e}")
+
+        if added > 0:
+            print(f"[AREDAdapter] Inserted {added} rotation-augmented embeddings for label '{label}'")

@@ -652,6 +652,11 @@ class MainWindow:
             if hasattr(self, "controller"):
                 self.controller.set_edit_mode(self.edit_mode)
         self.edit_mode_var.trace_add("write", _sync_edit_mode)
+
+        # Data Augmentation (DINO rotations)
+        self.aug_var = tk.BooleanVar(value=getattr(self.config.ared, "data_augmentation_enabled", False))
+        ttk.Checkbutton(param_frame, text="Data Augmentation (rotate labeled tiles 3× + DINO re-embed)",
+                        variable=self.aug_var).pack(anchor="w", pady=int(3*s))
         ttk.Button(param_frame, text="Review / Edit Past Labels...", command=self._open_review_window).pack(fill="x", pady=int(3*s))
         ttk.Button(param_frame, text="Save Annotation DB Now", command=self._save_tile_annotations).pack(fill="x")
         ttk.Button(param_frame, text="Load different Annotation DB...", command=self._load_tile_annotations).pack(fill="x")
@@ -707,6 +712,7 @@ class MainWindow:
             # NEW exact annotation DB
             self.config.tile_annotations.db_path = getattr(self, "_tile_ann_db_var").get()
             self.config.tile_annotations.edit_mode_default = self.edit_mode_var.get()
+            self.config.ared.data_augmentation_enabled = self.aug_var.get()
         except Exception as e:
             messagebox.showerror("Params", f"Bad parameter value: {e}")
 
@@ -747,6 +753,9 @@ class MainWindow:
         # Edit mode (force re-label of known exact tiles for corrections)
         self.edit_mode = self.edit_mode_var.get()
         self.controller.set_edit_mode(self.edit_mode)
+
+        # Data augmentation flag
+        self.config.ared.data_augmentation_enabled = self.aug_var.get()
 
         self.controller.update_config(self.config)
         self.controller.start()
@@ -846,6 +855,9 @@ class MainWindow:
             if self.label_store:
                 self.controller.ared_adapter.set_label_store(self.label_store)
         self.controller.ared_adapter.load_state(path, label_lookup=self._label_lookup_from_store)
+        # Re-apply feature extractor so data augmentation can still work after re-init inside load
+        if hasattr(self.controller, "_last_feature_extractor") and self.controller._last_feature_extractor:
+            self.controller.ared_adapter.set_feature_extractor(self.controller._last_feature_extractor)
         self._refresh_class_list()
         # reflect the loaded clusters in the live stats
         if self.controller.ared_adapter:
