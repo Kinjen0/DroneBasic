@@ -21,7 +21,7 @@ import threading
 import queue
 import time
 from pathlib import Path
-from typing import Optional, List, Callable, Any, Dict
+from typing import Optional, List, Callable, Any, Dict, Tuple
 import numpy as np
 from PIL import Image
 
@@ -37,7 +37,8 @@ from .tiling import GridTiler, Tile
 from .feature_extractor import DINOFeatureExtractor, FeatureExtractor
 from .ared_adapter import AREDAdapter
 from .label_store import PersistentLabelStore
-from .tile_database import TileAnnotationDB  # NEW exact identity DB (optional import for type)
+from .tile_database import TileAnnotationDB  # NEW exact identity DB
+from . import metrics as ared_metrics   # Query Precision / Relevant Recall (see papers)
 
 
 class LabelRequest:
@@ -111,6 +112,10 @@ class DroneAREDController:
         # (Query Precision / Relevant Recall as defined in the A/RED papers).
         self.label_only_mode: bool = False
 
+        # Live collection of tiles that A/RED actually decided to query (stable identities).
+        # Populated during normal runs. Used by metrics.py for QP / RR calculation.
+        self.queried_identities: List[Tuple] = []
+
         # Callback the GUI can register to receive periodic status updates
         self.on_stats: Optional[Callable[[Dict], None]] = None
 
@@ -134,6 +139,7 @@ class DroneAREDController:
         self.stats["frames_read"] = 0
         self.stats["user_queries"] = 0
         self.stats["cache_hits"] = 0
+        self.queried_identities = []
 
         # Create components. We pass create_ared=False if we already have one (from Load ARED).
         create_ared = (self.ared_adapter is None)
@@ -186,6 +192,7 @@ class DroneAREDController:
             self._worker_thread.join(timeout=join_timeout)
             self._worker_thread = None
         self.stats["status"] = "stopped"
+        # Keep queried_identities for post-run metrics; clear only on next start
         print("[Controller] Stopped")
 
     def is_paused(self) -> bool:
@@ -209,6 +216,42 @@ class DroneAREDController:
         """Pure labeling mode: every tile is shown for labeling, no A/RED or DINO involved."""
         self.label_only_mode = bool(enabled)
         print(f"[Controller] Label Only mode = {self.label_only_mode}")
+
+    def get_queried_identities(self) -> List[Tuple]:
+        """Return list of stable tile identities that A/RED actually queried in this run.
+        Used for computing Query Precision and Relevant Recall (see A/RED papers)."""
+        return list(self.queried_identities)
+
+    def compute_metrics_for_video(self, video_path: str) -> Dict[str, Any]:
+        """Compute Query Precision / Relevant Recall using current DB labels + logged queries.
+
+        This implements the evaluation methodology from:
+          - IJSC_2026-1.pdf : "Real-Time Memory-Bounded A/RED"
+          - SPIE_IVSP_2026.pdf : "Shallow vs. Deep Features for A/RED"
+        """
+        if self.tile_db is None:
+            return {"error": "No tile database loaded"}
+
+        anns = self.tile_db.get_annotations_for_video(video_path)
+        if not anns:
+            # Try matching by basename (DB stores resolved paths)
+            base = Path(video_path).name
+            for v in self.tile_db.list_videos():
+                if Path(v).name == base:
+                    anns = self.tile_db.get_annotations_for_video(v)
+                    video_path = v
+                    break
+
+        if not anns:
+            return {"error": f"No annotations for {video_path}"}
+
+        queried = self.get_queried_identities()
+        total = len(anns)
+
+        result = ared_metrics.evaluate_from_annotations_and_queries(anns, queried, total_points=total)
+        result["video"] = video_path
+        result["n_labeled"] = total
+        return result
 
     def update_config(self, new_config: PipelineConfig):
         """Apply new parameters for the *next* start()."""
@@ -504,6 +547,14 @@ class DroneAREDController:
 
                 ared_queried = info.get("queried", False)
                 label = info.get("label")
+
+                if ared_queried:
+                    # Record stable identity for metrics (Query Precision / Relevant Recall).
+                    # See drone_ared/metrics.py and the A/RED papers (IJSC_2026-1, SPIE_IVSP_2026).
+                    qkey = ared_metrics.tile_identity_from_meta(meta, tile)
+                    if qkey:
+                        self.queried_identities.append(qkey)
+
                 # Always log finish of tile processing so we can see forward progress even when A/RED is not querying.
                 # This is key to confirm that "Waiting for next query" in the GUI just means A/RED chose not to ask for a label.
                 print(f"[Pipeline] Finished tile global={tile.global_idx} (frame={tile.frame_idx}, r={tile.tile_row}, c={tile.tile_col}). "

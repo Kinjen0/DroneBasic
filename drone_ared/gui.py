@@ -676,6 +676,25 @@ class MainWindow:
         self.stats_text = tk.Text(stats_frame, height=6, width=int(60 * min(s, 1.5)), state="disabled", font=("TkDefaultFont", int(11*s)))
         self.stats_text.pack(fill="x", padx=4, pady=4)
 
+        # --- Metrics box (Query Precision + Relevant Recall as defined in the A/RED papers) ---
+        # See IJSC_2026-1.pdf and SPIE_IVSP_2026.pdf for exact definitions.
+        metrics_frame = ttk.LabelFrame(right, text="Metrics (Query Precision / Relevant Recall)")
+        metrics_frame.pack(fill="x", pady=(int(6*s), 0))
+
+        self.metrics_text = tk.Text(metrics_frame, height=5, width=int(60 * min(s, 1.5)), state="disabled",
+                                    font=("TkDefaultFont", int(11*s)), bg="#f8f8f8")
+        self.metrics_text.pack(fill="x", padx=4, pady=4)
+        self.metrics_text.insert("1.0", "Click 'Compute from DB (last video)' after a run.\n"
+                                        "QP / RR as defined in IJSC_2026-1.pdf & SPIE_IVSP_2026.pdf")
+        self.metrics_text.config(state="disabled")
+
+        btn_row = ttk.Frame(metrics_frame)
+        btn_row.pack(fill="x", padx=4, pady=2)
+        ttk.Button(btn_row, text="Compute from DB (last video)", command=self._compute_metrics_from_db).pack(side="left")
+        ttk.Button(btn_row, text="Clear", command=self._clear_metrics_display).pack(side="left", padx=4)
+
+        self._last_metrics: Dict[str, Any] = {}
+
         classes_frame = ttk.LabelFrame(right, text="Discovered Classes (from current + cache)")
         classes_frame.pack(fill="both", expand=True, pady=(int(6*s), 0))
 
@@ -803,6 +822,85 @@ class MainWindow:
                 messagebox.showerror("Tile Annotations", f"Save failed: {e}")
         else:
             messagebox.showwarning("Tile Annotations", "No annotation DB active.")
+
+    # ------------------------------------------------------------------
+    # Metrics display (Query Precision + Relevant Recall)
+    # References the exact definitions in IJSC_2026-1.pdf and SPIE_IVSP_2026.pdf
+    # ------------------------------------------------------------------
+    def _compute_metrics_from_db(self, video_name: Optional[str] = None):
+        """Compute and display metrics using the current TileAnnotationDB + any logged A/RED queries."""
+        if not self.controller or not self.tile_db:
+            self._display_metrics_error("Need an active TileAnnotationDB (run Label Only or A/RED with DB enabled).")
+            return
+
+        if video_name is None:
+            # Try last processed video
+            video_name = self.controller.stats.get("current_video", "")
+            if not video_name and self.config.video_paths:
+                video_name = Path(self.config.video_paths[-1]).name
+
+        if not video_name:
+            self._display_metrics_error("No video name available. Select a video or run processing first.")
+            return
+
+        try:
+            result = self.controller.compute_metrics_for_video(video_name)
+            if "error" in result:
+                self._display_metrics_error(result["error"])
+                return
+
+            self._last_metrics = result
+            self._refresh_metrics_display(result)
+        except Exception as e:
+            self._display_metrics_error(str(e))
+
+    def _clear_metrics_display(self):
+        self._last_metrics = {}
+        if hasattr(self, 'metrics_text'):
+            self.metrics_text.config(state="normal")
+            self.metrics_text.delete("1.0", "end")
+            self.metrics_text.insert("1.0", "No metrics computed yet.\nRun A/RED (with DB labels) or use the button.")
+            self.metrics_text.config(state="disabled")
+
+    def _display_metrics_error(self, msg: str):
+        if hasattr(self, 'metrics_text'):
+            self.metrics_text.config(state="normal")
+            self.metrics_text.delete("1.0", "end")
+            self.metrics_text.insert("1.0", f"Error: {msg}")
+            self.metrics_text.config(state="disabled")
+
+    def _refresh_metrics_display(self, result: Dict[str, Any]):
+        if not hasattr(self, 'metrics_text'):
+            return
+        lines = [
+            f"Video: {result.get('video', '?')}",
+            f"Query Precision (QP): {result.get('query_precision', 0):.4f}",
+            f"Relevant Recall (RR): {result.get('relevant_recall', 0):.4f}",
+            f"Queries: {result.get('n_actual_queries', 0)} / {result.get('total_points', 0)}",
+            f"vs Random ≈ {result.get('baseline_random_query_precision_approx', 0):.4f}",
+            result.get('summary', '')
+        ]
+        self.metrics_text.config(state="normal")
+        self.metrics_text.delete("1.0", "end")
+        self.metrics_text.insert("1.0", "\n".join(lines))
+        self.metrics_text.config(state="disabled")
+
+    def _update_metrics_on_finish(self):
+        """Called when a run finishes. Tries to auto-compute using the last video + DB."""
+        if getattr(self.controller, 'label_only_mode', False):
+            # In pure label-only we have no A/RED queries, so just show stats
+            self._refresh_metrics_display({
+                "video": self.controller.stats.get("current_video", "?"),
+                "query_precision": 0.0,
+                "relevant_recall": 0.0,
+                "n_actual_queries": 0,
+                "total_points": self.stats.get("tiles_processed", 0),
+                "summary": "Label Only run — no A/RED queries. Use 'Compute from DB' after labeling."
+            })
+            return
+
+        # Normal A/RED run — try to compute real metrics
+        self._compute_metrics_from_db()
 
     def _load_tile_annotations(self):
         path = filedialog.askopenfilename(title="Load tile annotation DB", filetypes=[("SQLite DB", "*.db"), ("All", "*.*")])
@@ -1049,6 +1147,10 @@ class MainWindow:
                 self.start_btn.config(state="normal")
             elif status in ("running", "paused"):
                 self.start_btn.config(state="disabled")
+
+        # Auto-show metrics box when processing finishes (at end of video)
+        if status in ("finished", "stopped"):
+            self._update_metrics_on_finish()
 
 
 # =============================================================================
