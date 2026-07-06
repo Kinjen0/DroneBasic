@@ -1837,10 +1837,26 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         self.frame_cards: Dict[int, tk.Widget] = {}
         self._card_img_labels: Dict[int, tk.Widget] = {}  # frame -> the Label widget holding the image (for async updates)
 
+        # Virtual card management for smooth loading/unloading + bounded resources.
+        # We use canvas.create_window with explicit positions instead of a huge growing grid.
+        # Only a viewport + small buffer of cards are materialized as live widgets at any time.
+        self._card_windows: Dict[int, int] = {}  # fidx -> canvas window item id
+        self._materialized_frames: set = set()
+        self._virtual_row_height: int = 140  # updated when we know thumb size + text
+        self._virtual_cell_width: int = 200
+        self._viewport_update_pending: Optional[str] = None  # after() id for debounced viewport refresh
+
         # For the per-frame tile explorer
         self.current_frame_tiles: List["Tile"] = []
         self.current_frame_tile_labels: Dict[int, Tuple[str, bool]] = {}  # tile_global_in_frame -> (label, rel)
         self._tile_photo_refs: List[ImageTk.PhotoImage] = []  # keep alive
+
+        # Track known class relevance so we can auto-apply it to tiles (prevents forgetting in long sessions)
+        self.class_relevance: dict[str, bool] = {}
+
+        # Virtual display window size (addressable frames). Actual live Tk widgets + PhotoImages
+        # are limited to the current viewport + small buffer by the virtualization logic.
+        self._displayed_count = 0
 
         self.title("Multi-Frame Label Browser - Adjustable Scroll + Per-Frame Labeling")
         base_w = int(1280 * min(self.ui_scale, 1.8))
@@ -1883,15 +1899,17 @@ class MultiFrameLabelBrowser(tk.Toplevel):
 
         ttk.Label(top, text="  Thumb size:").pack(side="left")
         self.thumb_w_var = tk.IntVar(value=180)
-        ttk.Scale(top, from_=80, to=320, variable=self.thumb_w_var,
-                  orient="horizontal", length=int(100*s),
-                  command=lambda v: self._refresh_frame_strip()).pack(side="left", padx=4)
+        # Debounce thumb size changes — live rebuild during drag causes scroll jumps + flashing
+        self.thumb_scale = ttk.Scale(top, from_=80, to=320, variable=self.thumb_w_var,
+                                      orient="horizontal", length=int(100*s),
+                                      command=self._on_thumb_size_changed)
+        self.thumb_scale.pack(side="left", padx=4)
 
         ttk.Button(top, text="Refresh Strip", command=self._refresh_frame_strip).pack(side="left", padx=8)
 
         self.only_relevant_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(top, text="Only frames with relevant labels", variable=self.only_relevant_var,
-                        command=self._refresh_frame_strip).pack(side="left")
+                        command=self._apply_relevance_filter).pack(side="left")
 
         # Main split: left = scrollable frames strip, right = selected frame details + actions
         main = ttk.Frame(self)
@@ -1901,20 +1919,24 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         left = ttk.LabelFrame(main, text="Frames (click to select) - scroll to see more")
         left.pack(side="left", fill="both", expand=True, padx=(0, int(4*s)))
 
-        # Canvas + scrollbar for the strip/grid
+        # Canvas + scrollbar for the strip/grid - VIRTUALIZED for smooth load/unload + no reflow jumps.
+        # Cards are placed with explicit create_window(x, y) at stable coordinates.
+        # Only viewport + buffer cards are kept as live widgets (unloaded when far off-screen).
         self.strip_canvas = tk.Canvas(left, bg="#1a1a1a", highlightthickness=0)
         vsb = ttk.Scrollbar(left, orient="vertical", command=self.strip_canvas.yview)
         self.strip_canvas.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
         self.strip_canvas.pack(side="left", fill="both", expand=True)
 
-        self.strip_inner = ttk.Frame(self.strip_canvas)
-        self.strip_canvas.create_window((0, 0), window=self.strip_inner, anchor="nw")
-
-        self.strip_inner.bind("<Configure>", self._on_strip_configure)
+        # Virtualized: no giant child frame. Cards are individually placed via create_window(x, y)
+        # at stable precomputed coordinates. scrollregion is managed explicitly in _update_* and refresh.
+        # This eliminates grid reflows, large jumps on fast scroll, and unbounded widget accumulation.
         self.strip_canvas.bind("<MouseWheel>", self._on_strip_mousewheel)
         self.strip_canvas.bind("<Button-4>", self._on_strip_mousewheel)
         self.strip_canvas.bind("<Button-5>", self._on_strip_mousewheel)
+        # Debounced viewport update on scroll/configure (the heart of smooth virtual loading)
+        self.strip_canvas.bind("<Configure>", self._on_canvas_configure)
+        # We drive updates from wheel + scheduled viewport; motion not needed.
 
         # RIGHT: Selected frame + actions + tile explorer launcher
         right = ttk.LabelFrame(main, text="Selected Frame & Label Actions", width=int(420 * min(s, 1.5)))
@@ -1952,11 +1974,19 @@ class MultiFrameLabelBrowser(tk.Toplevel):
                    command=self._edit_selected_tile_from_list).pack(fill="x", padx=4, pady=2)
 
         # Status bar
-        self.browser_status_var = tk.StringVar(value="Load a video with annotations. Use the columns slider to change how many frames are shown side-by-side.")
+        self.browser_status_var = tk.StringVar(value="Load a video. Frames use virtual loading (smooth scroll + fixed-size image slots). Only visible cards consume heavy resources.")
         ttk.Label(self, textvariable=self.browser_status_var, relief="sunken").pack(fill="x", padx=int(6*s), pady=2)
 
     def _on_strip_configure(self, event=None):
-        self.strip_canvas.configure(scrollregion=self.strip_canvas.bbox("all"))
+        # Kept for compatibility; virtual path uses explicit scrollregion.
+        try:
+            self.strip_canvas.configure(scrollregion=self.strip_canvas.bbox("all"))
+        except Exception:
+            pass
+
+    def _on_canvas_configure(self, event=None):
+        # On canvas resize we may need to adjust positions if cols changed, but mainly schedule viewport.
+        self._schedule_viewport_update(80)
 
     def _on_strip_mousewheel(self, event):
         delta = getattr(event, "delta", 0)
@@ -1965,6 +1995,21 @@ class MultiFrameLabelBrowser(tk.Toplevel):
             self.strip_canvas.yview_scroll(1, "units")
         elif num == 4 or delta > 0:
             self.strip_canvas.yview_scroll(-1, "units")
+        # Debounced: prioritize visible + load/unload cards for the new viewport.
+        # Using longer debounce + single scheduled func prevents flicker/jump storms on fast wheel.
+        self._schedule_viewport_update(110)
+        self.after(180, self._start_async_thumb_loading)
+
+    def _schedule_viewport_update(self, delay_ms: int = 90):
+        """Debounce viewport refresh (materialize visible cards + unload far ones).
+        This is the key to flicker-free fast scrolling and bounded resources.
+        """
+        if self._viewport_update_pending is not None:
+            try:
+                self.after_cancel(self._viewport_update_pending)
+            except Exception:
+                pass
+        self._viewport_update_pending = self.after(delay_ms, self._update_visible_cards)
 
     def _load_videos(self):
         vids = self.tile_db.list_videos()
@@ -2045,100 +2090,336 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         else:
             self.sorted_frames = candidate_frames
 
+        # Keep the full strided list (pre-filter) so we can toggle the relevance filter live
+        self._base_sorted_frames = list(self.sorted_frames)
+
         self.frame_thumbs.clear()
         self.selected_frame = None
         self.frame_cards.clear()
+        self._clear_all_materialized_cards()  # ensure no stale canvas windows from previous video
 
+        # The _displayed_count is the addressable range (affects scroll height + what the worker will consider).
+        # Because of virtualization, we can afford a larger addressable window from the start;
+        # only a small viewport+buffer of *actual widgets* are ever created (see _update_visible_cards).
+        self._displayed_count = min(240, len(self.sorted_frames))
+
+        # Seed class relevance from DB so we can auto-apply "relevant" flag for known classes
+        self.class_relevance = {}
+        try:
+            for lbl in self.tile_db.get_all_labels():
+                rel = self.tile_db.get_class_relevance(lbl)
+                if rel is not None:
+                    self.class_relevance[lbl] = rel
+        except Exception:
+            pass
+
+        # Also inherit from main window if available (for consistency with main labeling session)
+        if self.main_window and hasattr(self.main_window, 'class_relevance'):
+            try:
+                self.class_relevance.update(getattr(self.main_window, 'class_relevance', {}))
+            except Exception:
+                pass
+
+        shown = min(self._displayed_count, len(self.sorted_frames))
         self.browser_status_var.set(
             f"Loaded {len(self.sorted_frames)} frames (stride={stride}, total~{total_frames}) from {Path(v).name}. "
-            f"ALL frames per current stride are shown (labeled or not). Thumbs load in background."
+            f"Virtualized: scroll freely. Only ~viewport cards materialized to avoid flicker/crashes."
         )
         self._refresh_frame_strip()
 
         if self.sorted_frames:
             self._select_frame(self.sorted_frames[0])
+            # Ensure at least the top of the list gets materialized promptly
+            self.after(40, self._update_visible_cards)
+
+    def _apply_relevance_filter(self):
+        """Recompute sorted_frames from the base strided list according to the checkbox.
+        Then reset displayed and do a (full) refresh. Keeps thumbs where possible.
+        """
+        base = getattr(self, '_base_sorted_frames', None) or self.sorted_frames
+        if self.only_relevant_var.get():
+            self.sorted_frames = [f for f in base
+                                  if any(a.get("relevant") for a in self.frame_to_anns.get(f, []))]
+        else:
+            self.sorted_frames = list(base)
+
+        # On filter change we can keep the same displayed prefix length (or cap)
+        self._displayed_count = min(getattr(self, '_displayed_count', 80) or 80, len(self.sorted_frames))
+        self._clear_all_materialized_cards()
+        self.frame_cards.clear()
+        self._card_img_labels.clear()
+        # Thumbs are kept (they are independent of relevance)
+        self._refresh_frame_strip()
+        # If current selected is filtered out, pick first
+        if self.selected_frame not in self.sorted_frames and self.sorted_frames:
+            self._select_frame(self.sorted_frames[0])
 
     def _refresh_frame_strip(self):
-        """Rebuild the scrollable grid of frame thumbnails.
-        Number of columns comes from the adjustable slider.
+        """Full layout reset (used for columns, thumb size, filter toggle, initial load).
+        Clears virtual materialized cards and recomputes geometry.
+        Normal scrolling uses the much lighter _update_visible_cards instead.
         """
-        # Detect thumb size change -> force regenerate thumbnails (this was why the slider appeared to do nothing)
+        # Save frac for size/col changes
+        try:
+            scroll_frac = self.strip_canvas.yview()[0]
+        except Exception:
+            scroll_frac = 0.0
+
         current_thumb = max(80, int(self.thumb_w_var.get()))
         if current_thumb != getattr(self, '_last_thumb_w', -1):
             self.frame_thumbs.clear()
             self._last_thumb_w = current_thumb
 
-        for w in self.strip_inner.winfo_children():
-            w.destroy()
-        self.frame_cards.clear()
+        # Full clear of any previous virtual cards + widgets
+        self._clear_all_materialized_cards()
 
         if not self.sorted_frames:
-            ttk.Label(self.strip_inner, text="No frames to display.").pack()
+            # Minimal message directly on canvas
+            try:
+                self.strip_canvas.delete("all_msg")
+            except Exception:
+                pass
+            self.strip_canvas.create_text(20, 20, text="No frames to display.", fill="#888", tags="all_msg", anchor="nw")
             return
 
         cols = max(1, int(self.cols_var.get()))
         thumb_w = current_thumb
+        thumb_h = int(thumb_w * 0.65)
 
-        row = col = 0
+        # Compute stable layout metrics for virtual positioning
+        self._virtual_cell_width = thumb_w + 8
+        text_block_h = int(28 * min(self.ui_scale, 1.6))
+        self._virtual_row_height = thumb_h + 8 + text_block_h   # ph + small pads + info labels
+
+        frames_to_display = self._get_displayed_frames()
+        total_items = len(frames_to_display)
+        num_rows = (total_items + cols - 1) // cols if total_items else 1
+        total_height = max(10, num_rows * self._virtual_row_height + 10)
+        total_width = cols * self._virtual_cell_width + 10
+
+        # Set the canvas scrollregion to the full virtual size (even if we only materialize a slice)
+        self.strip_canvas.configure(scrollregion=(0, 0, total_width, total_height))
+
+        # Clear any stray message
+        try:
+            self.strip_canvas.delete("all_msg")
+        except Exception:
+            pass
+
         self._card_img_labels.clear()
-        for fidx in self.sorted_frames:
-            anns = self.frame_to_anns.get(fidx, [])
-            n_labels = len(anns)
-            n_rel = sum(1 for a in anns if a.get("relevant"))
-            has_rel = n_rel > 0
+        # Note: frame_cards and _card_windows will be populated lazily by _update_visible_cards
 
-            card = ttk.Frame(self.strip_inner, relief="ridge", borderwidth=1)
-            card.grid(row=row, column=col, padx=3, pady=3, sticky="nsew")
+        # Restore scroll (for col/thumb changes)
+        try:
+            self.strip_canvas.yview_moveto(scroll_frac)
+        except Exception:
+            pass
 
-            # Placeholder for thumbnail (will be updated asynchronously)
-            img_lbl = ttk.Label(card, text="[loading...]", width=18, anchor="center")
-            img_lbl.pack(padx=2, pady=2)
-            self._card_img_labels[fidx] = img_lbl
+        # Schedule the virtual viewport population (creates only near-visible cards with reserved blanks)
+        self._schedule_viewport_update(30)
 
-            # Info text
-            rel_mark = " [R]" if has_rel else ""
-            info = f"Frame {fidx}\n{n_labels} labels{rel_mark}"
-            ttk.Label(card, text=info, justify="center", font=("TkDefaultFont", int(9*self.ui_scale))).pack(pady=1)
+        # Kick async for whatever ends up visible
+        self.after(80, self._start_async_thumb_loading)
 
-            # Click handlers on the card and children
-            def make_sel(ff=fidx, c=card):
-                return lambda e: self._select_frame(ff, c)
+        # Re-highlight if needed (will apply when its card is (re)materialized)
+        if self.selected_frame is not None:
+            self.after(120, lambda: self._highlight_card(self.selected_frame))
 
-            for child in (card, *card.winfo_children()):
-                child.bind("<Button-1>", make_sel(ff=fidx, c=card))
-                # Double-click to directly open the tile label editor for this frame (streamlines editing)
-                child.bind("<Double-Button-1>", lambda e, ff=fidx: (self._select_frame(ff), self._open_frame_tile_explorer()))
+    def _clear_all_materialized_cards(self):
+        """Destroy all live card widgets and canvas windows. Used on full resets."""
+        for fidx in list(self._materialized_frames):
+            self._destroy_card(fidx)
+        self.frame_cards.clear()
+        self._card_windows.clear()
+        self._materialized_frames.clear()
+        self._card_img_labels.clear()
 
-            self.frame_cards[fidx] = card
+    def _get_displayed_frames(self):
+        return self.sorted_frames[:getattr(self, '_displayed_count', len(self.sorted_frames))]
 
-            col += 1
-            if col >= cols:
-                col = 0
-                row += 1
+    def _compute_layout_params(self):
+        """Return (cols, thumb_w, thumb_h, cell_w, row_h) for current slider settings."""
+        cols = max(1, int(self.cols_var.get()))
+        thumb_w = max(80, int(self.thumb_w_var.get()))
+        thumb_h = int(thumb_w * 0.65)
+        cell_w = thumb_w + 8
+        text_block_h = int(28 * min(getattr(self, 'ui_scale', 1.6), 1.6))
+        row_h = thumb_h + 8 + text_block_h
+        return cols, thumb_w, thumb_h, cell_w, row_h
 
-        # If we already have thumbs in cache (from previous async or sync), apply them immediately
-        # to the new placeholders. This keeps column changes snappy.
-        for fidx in list(self.sorted_frames):
-            if fidx in self.frame_thumbs:
+    def _create_card_widget(self, fidx: int, thumb_w: int, thumb_h: int):
+        """Create the card ttk.Frame (never gridded). Includes fixed-size blank image slot.
+        The ph reserves the exact pixel size at all times so layout does not shift when the
+        image loads or async updates happen.
+        """
+        anns = self.frame_to_anns.get(fidx, [])
+        n_labels = len(anns)
+        n_rel = sum(1 for a in anns if a.get("relevant"))
+        has_rel = n_rel > 0
+
+        card = ttk.Frame(self.strip_canvas, relief="ridge", borderwidth=1)
+
+        # FIXED SIZE IMAGE SLOT: this is the "equally sized blank spot" requested.
+        # pack_propagate(False) + explicit width/height means it claims its space immediately
+        # and never resizes when we later put a real PhotoImage inside.
+        # While the thumb is not here, this area stays exactly thumb_w x thumb_h, preventing
+        # any layout shift or flicker as images pop in.
+        ph = ttk.Frame(card, width=thumb_w, height=thumb_h)
+        ph.pack_propagate(False)
+        # Start completely blank (no text) so it truly looks like a reserved empty slot.
+        img_lbl = ttk.Label(ph, text="", anchor="center", background="#222")
+        img_lbl.pack(expand=True, fill="both")
+        self._card_img_labels[fidx] = img_lbl
+        ph.pack(padx=2, pady=2)
+
+        # Info label (below the reserved image area)
+        rel_mark = " [R]" if has_rel else ""
+        info = f"Frame {fidx}\n{n_labels} labels{rel_mark}"
+        info_lbl = ttk.Label(card, text=info, justify="center", font=("TkDefaultFont", int(9*self.ui_scale)))
+        info_lbl.pack(pady=1)
+
+        # Store ref so we can update text without full rebuild
+        card._info_label = info_lbl
+
+        # Click handlers
+        def make_sel(ff=fidx, c=card):
+            return lambda e: self._select_frame(ff, c)
+
+        def make_dbl(ff=fidx):
+            return lambda e: (self._select_frame(ff), self._open_frame_tile_explorer())
+
+        # Bind on card and direct children (ph, labels)
+        for child in (card, ph, img_lbl, info_lbl):
+            child.bind("<Button-1>", make_sel(ff=fidx, c=card))
+            child.bind("<Double-Button-1>", make_dbl(ff=fidx))
+
+        self.frame_cards[fidx] = card
+        return card
+
+    def _place_or_update_card(self, fidx: int, x: int, y: int, thumb_w: int, thumb_h: int):
+        """Ensure a card widget exists for fidx and is placed via create_window at (x,y).
+        If already placed, we can optionally move it (rare). Returns the card widget.
+        """
+        if fidx in self._card_windows:
+            # Already live at some position; we could move if needed but positions are stable.
+            return self.frame_cards.get(fidx)
+
+        card = self._create_card_widget(fidx, thumb_w, thumb_h)
+
+        # Reserve the space in the layout from the moment the window is created
+        win_id = self.strip_canvas.create_window(x, y, window=card, anchor="nw")
+        self._card_windows[fidx] = win_id
+        self._materialized_frames.add(fidx)
+
+        # If we have a cached thumb already, apply it right away into the reserved slot
+        if fidx in self.frame_thumbs:
+            try:
                 tkimg = self.frame_thumbs[fidx]
                 img_lbl = self._card_img_labels.get(fidx)
                 if img_lbl and img_lbl.winfo_exists():
-                    try:
-                        img_lbl.configure(image=tkimg, text="")
-                        img_lbl.image = tkimg
-                    except Exception:
-                        pass
+                    img_lbl.configure(image=tkimg, text="")
+                    img_lbl.image = tkimg
+            except Exception:
+                pass
 
-        # Kick off (or resume) async loading for any missing thumbs
-        self.after(10, self._start_async_thumb_loading)
+        return card
 
-        # Update scroll region
-        self.strip_inner.update_idletasks()
-        self.strip_canvas.configure(scrollregion=self.strip_canvas.bbox("all"))
+    def _destroy_card(self, fidx: int):
+        """Unload a single card: delete its canvas window, destroy widget, clean refs.
+        This releases X11 pixmap resources for that frame's image.
+        """
+        win_id = self._card_windows.pop(fidx, None)
+        if win_id is not None:
+            try:
+                self.strip_canvas.delete(win_id)
+            except Exception:
+                pass
+        card = self.frame_cards.pop(fidx, None)
+        if card is not None:
+            try:
+                card.destroy()
+            except Exception:
+                pass
+        self._card_img_labels.pop(fidx, None)
+        self._materialized_frames.discard(fidx)
 
-        # Re-apply highlight if something selected
+    def _update_visible_cards(self):
+        """Core of the smooth loading/unloading system.
+        Computes the current viewport (from yview), materializes only a window of cards
+        around it (plus small buffer), and unloads cards that have scrolled far away.
+        Uses fixed (x, y) placement so there is zero reflow or scroll jumping.
+        The reserved ph inside each card guarantees a blank spot of correct size.
+        """
+        self._viewport_update_pending = None
+        if not self.sorted_frames:
+            return
+
+        cols, thumb_w, thumb_h, cell_w, row_h = self._compute_layout_params()
+        displayed = self._get_displayed_frames()
+        n = len(displayed)
+        if n == 0:
+            return
+
+        # Determine visible row range from scroll fraction
+        try:
+            top_f, bot_f = self.strip_canvas.yview()
+            canvas_h = max(100, self.strip_canvas.winfo_height())
+        except Exception:
+            top_f, bot_f = 0.0, 1.0
+            canvas_h = 400
+
+        first_visible_row = max(0, int(top_f * (n / max(1, cols)) - 1))
+        last_visible_row = int(bot_f * (n / max(1, cols)) + 1)
+
+        # Buffer of extra rows above and below for smooth feel and prefetch
+        buffer_rows = 3
+        start_row = max(0, first_visible_row - buffer_rows)
+        end_row = min( (n + cols - 1) // cols , last_visible_row + buffer_rows )
+
+        # The logical frame indices we want materialized now
+        desired = set()
+        for r in range(start_row, end_row + 1):
+            for c in range(cols):
+                idx = r * cols + c
+                if idx < n:
+                    desired.add(displayed[idx])
+
+        # Unload anything materialized that is no longer desired
+        for fidx in list(self._materialized_frames):
+            if fidx not in desired:
+                self._destroy_card(fidx)
+
+        # Create/place the desired ones at their stable coordinates
+        for idx, fidx in enumerate(displayed):
+            if fidx not in desired:
+                continue
+            r = idx // cols
+            c = idx % cols
+            x = c * cell_w
+            y = r * row_h
+            self._place_or_update_card(fidx, x, y, thumb_w, thumb_h)
+
+        # Make sure scrollregion still covers the full virtual area (in case resize etc.)
+        total_rows = (n + cols - 1) // cols if n else 1
+        total_h = total_rows * row_h + 4
+        total_w = cols * cell_w + 4
+        try:
+            self.strip_canvas.configure(scrollregion=(0, 0, total_w, total_h))
+        except Exception:
+            pass
+
+        # If selected frame is now materialized, make sure it's highlighted
         if self.selected_frame in self.frame_cards:
             self._highlight_card(self.selected_frame)
+
+        # Opportunistic: if the user has scrolled near the end of current displayed,
+        # trigger the extender (non-destructive).
+        try:
+            _, bot = self.strip_canvas.yview()
+            if bot > 0.65:
+                self.after(80, self._check_load_more)
+        except Exception:
+            pass
 
     def _generate_frame_pil(self, frame_idx: int, max_w: int = 180, max_h: int = 110) -> Optional["Image.Image"]:
         """Heavy work: decode + resize. Safe to call from background thread. Returns PIL or None."""
@@ -2173,9 +2454,109 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         self.frame_thumbs[frame_idx] = tkimg
         return tkimg
 
+    def _refresh_annotations_light(self):
+        """Re-fetch annotations after an edit. Updates only the count text on existing cards.
+        Does NOT clear thumbs or destroy/rebuild the strip. This avoids the full reload annoyance.
+        """
+        if not self.current_video:
+            return
+        try:
+            anns = self.tile_db.get_annotations_for_video(self.current_video)
+            self.frame_to_anns = {}
+            for a in anns:
+                f = a["abs_frame"]
+                self.frame_to_anns.setdefault(f, []).append(a)
+            # Update texts on current cards only (thumbs stay loaded)
+            for fidx in list(self.frame_cards.keys()):
+                self._update_card_text_only(fidx)
+            # If the right panel is showing the edited frame, refresh its label list too
+            if getattr(self, 'selected_frame', None) is not None:
+                try:
+                    self._select_frame(self.selected_frame)
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"[MultiFrameBrowser] light refresh error: {e}")
+
+    def _update_card_text_only(self, fidx):
+        card = self.frame_cards.get(fidx)
+        if not card or not card.winfo_exists():
+            return
+        anns = self.frame_to_anns.get(fidx, [])
+        n_labels = len(anns)
+        n_rel = sum(1 for a in anns if a.get("relevant"))
+        has_rel = n_rel > 0
+        rel_mark = " [R]" if has_rel else ""
+        info = f"Frame {fidx}\n{n_labels} labels{rel_mark}"
+        # Preferred: the stored direct ref from creation
+        if hasattr(card, "_info_label") and card._info_label and card._info_label.winfo_exists():
+            try:
+                card._info_label.configure(text=info)
+                return
+            except Exception:
+                pass
+        # Fallback scan (older cards or edge cases)
+        for child in card.winfo_children():
+            try:
+                if isinstance(child, ttk.Label):
+                    txt = child.cget("text") or ""
+                    if "\n" in str(txt):
+                        child.configure(text=info)
+                        break
+            except Exception:
+                pass
+
+    def _get_visible_frame_indices(self):
+        """Return list of frame indices whose cards are currently visible (or near) in the viewport.
+        Used to prioritize async thumb loading for what the user is actually looking at.
+        Works with the virtual canvas positioning (no reliance on strip_inner grid).
+        """
+        visible = []
+        displayed = self._get_displayed_frames()
+        if not displayed:
+            return visible
+        try:
+            top_frac, bot_frac = self.strip_canvas.yview()
+            # Approximate using logical rows
+            cols = max(1, int(self.cols_var.get()))
+            n = len(displayed)
+            total_rows = (n + cols - 1) // cols
+            first_row = max(0, int(top_frac * total_rows) - 1)
+            last_row = min(total_rows, int(bot_frac * total_rows) + 2)
+            for r in range(first_row, last_row):
+                for c in range(cols):
+                    idx = r * cols + c
+                    if idx < n:
+                        visible.append(displayed[idx])
+            if not visible:
+                visible = displayed[: max(8, cols * 2)]
+        except Exception:
+            visible = displayed[:8]
+        return visible
+
+    def _get_prioritized_load_list(self):
+        """Visible frames (in order) first, then the remaining frames.
+        Called frequently by the worker so scrolling immediately affects what gets loaded next.
+        Only considers currently displayed frames (incremental loading to prevent resource exhaustion).
+        """
+        if not self.sorted_frames:
+            return []
+        frames = self._get_displayed_frames()
+        visible = self._get_visible_frame_indices()
+        vset = set(visible)
+        vis_in_order = [f for f in frames if f in vset]
+        rest = [f for f in frames if f not in vset]
+        return vis_in_order + rest
+
     def _start_async_thumb_loading(self):
         """Load frame previews in a background thread so the browser window stays responsive
         for scrolling and editing while thumbs appear progressively.
+
+        Improvements:
+        - Single worker thread (no more parallel "chunk" loading from 0 and from 30 at the same time).
+        - Strictly sequential within the worker.
+        - Dynamically prioritizes frames that are currently scrolled into view.
+        - Re-checks priority after every single thumbnail so panning/scrolling takes effect quickly.
         """
         if not self.sorted_frames or not self.current_video:
             return
@@ -2183,13 +2564,21 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         max_h = int(thumb_w * 0.65)
 
         def worker():
-            for fidx in list(self.sorted_frames):
-                # Skip if we already have a good thumb at current size (or user changed size)
-                if fidx in self.frame_thumbs:
-                    continue
-                pil = self._generate_frame_pil(fidx, thumb_w, max_h)
+            # Keep loading until everything for the current list is done.
+            # Every iteration we ask for the current best order (visible first).
+            while True:
+                prio = self._get_prioritized_load_list()
+                next_f = None
+                for f in prio:
+                    if f not in self.frame_thumbs:
+                        next_f = f
+                        break
+                if next_f is None:
+                    break  # nothing left to load for now
+
+                pil = self._generate_frame_pil(next_f, thumb_w, max_h)
                 if pil is not None:
-                    def schedule(f=fidx, p=pil):
+                    def schedule(f=next_f, p=pil):
                         try:
                             tkimg = ImageTk.PhotoImage(p)
                             self.frame_thumbs[f] = tkimg
@@ -2197,13 +2586,20 @@ class MultiFrameLabelBrowser(tk.Toplevel):
                         except Exception as ex:
                             print(f"[MultiFrameBrowser] async thumb schedule error: {ex}")
                     self.after(0, schedule)
-            # If some frames failed to generate thumbs, at least clear the loading text for them
-            self.after(0, lambda: self._clear_remaining_loading_placeholders())
-            # final status
-            self.after(0, lambda: self.browser_status_var.set(
-                self.browser_status_var.get() + "  (thumbnails loaded)"))
 
+                # tiny sleep: keeps UI fluid + gives scroll events time to update visible set
+                time.sleep(0.008)
+
+            self.after(0, lambda: self._clear_remaining_loading_placeholders())
+            self.after(0, lambda: self.browser_status_var.set(
+                (self.browser_status_var.get() or "") + "  (thumbnails loaded)"))
+
+        # Only ever one loader thread. If one is running it will see the new priority list
+        # on its very next iteration (thanks to _get_prioritized_load_list).
+        if hasattr(self, '_thumb_load_thread') and getattr(self._thumb_load_thread, 'is_alive', lambda: False)():
+            return
         t = threading.Thread(target=worker, daemon=True, name="frame-thumb-loader")
+        self._thumb_load_thread = t
         t.start()
 
     def _update_card_thumb(self, frame_idx: int, tkimg: ImageTk.PhotoImage):
@@ -2220,18 +2616,79 @@ class MultiFrameLabelBrowser(tk.Toplevel):
             self.frame_cards[frame_idx].img_ref = tkimg  # optional extra ref
 
     def _clear_remaining_loading_placeholders(self):
-        """After async pass, turn any remaining 'loading...' into a simple unavailable note."""
+        """After the worker finishes a pass, leave permanent blanks for any that failed.
+        (We keep the slot reserved; a subtle indicator is optional.)
+        """
         for fidx, img_lbl in list(self._card_img_labels.items()):
             if img_lbl and img_lbl.winfo_exists():
                 try:
-                    current = img_lbl.cget("text")
-                    if current and "loading" in str(current).lower():
-                        img_lbl.configure(text="[no thumb]")
+                    # Only touch ones that never received an image
+                    if not getattr(img_lbl, 'image', None):
+                        # keep it as empty reserved area, or set a very faint marker
+                        if not img_lbl.cget("image"):
+                            img_lbl.configure(text="")  # stay as clean blank spot
                 except Exception:
                     pass
 
+    def _check_load_more(self, event=None):
+        """When user scrolls near the bottom, incrementally extend the *virtual* total.
+        Only extends the conceptual list + scrollregion. Actual widgets are created on-demand
+        by _update_visible_cards when they enter the viewport. This is what prevents
+        flicker, large jumps, and eventual resource exhaustion.
+        """
+        if not hasattr(self, '_displayed_count') or not self.sorted_frames:
+            return
+        try:
+            _, bot = self.strip_canvas.yview()
+            if bot > 0.72 and self._displayed_count < len(self.sorted_frames):
+                old = self._displayed_count
+                # Smaller steps feel smoother; still plenty fast
+                self._displayed_count = min(len(self.sorted_frames), self._displayed_count + 80)
+                if self._displayed_count > old:
+                    # Recompute scrollregion for the new total without touching existing cards
+                    cols, thumb_w, thumb_h, cell_w, row_h = self._compute_layout_params()
+                    n = self._displayed_count
+                    total_rows = (n + cols - 1) // cols if n else 1
+                    total_h = total_rows * row_h + 4
+                    total_w = cols * cell_w + 4
+                    try:
+                        cur_region = self.strip_canvas.cget("scrollregion")
+                    except Exception:
+                        cur_region = ""
+                    self.strip_canvas.configure(scrollregion=(0, 0, total_w, total_h))
+                    # Do NOT yview_moveto here — that was a major source of jumps during fast scroll.
+                    # Let the user's scroll position be stable; new content simply appears further down.
+                    # Schedule the viewport manager so any newly visible tail gets cards created.
+                    self._schedule_viewport_update(60)
+                    self.after(140, self._start_async_thumb_loading)
+        except Exception:
+            pass
+
+    def _on_thumb_size_changed(self, val):
+        """Debounced handler for the thumb size slider.
+        Live rebuilds during drag cause scroll snapping, flashing, and layout thrashing.
+        """
+        if hasattr(self, '_thumb_debounce'):
+            try:
+                self.after_cancel(self._thumb_debounce)
+            except Exception:
+                pass
+        self._thumb_debounce = self.after(280, self._refresh_frame_strip)
+
     def _highlight_card(self, frame_idx: Optional[int]):
-        for f, card in self.frame_cards.items():
+        # If the target is in the addressable set but not live yet, try to bring it in.
+        if frame_idx is not None and frame_idx not in self.frame_cards:
+            displayed = self._get_displayed_frames()
+            if frame_idx in displayed:
+                try:
+                    cols, thumb_w, thumb_h, cell_w, row_h = self._compute_layout_params()
+                    idx = displayed.index(frame_idx)
+                    r = idx // cols
+                    c = idx % cols
+                    self._place_or_update_card(frame_idx, c * cell_w, r * row_h, thumb_w, thumb_h)
+                except Exception:
+                    pass
+        for f, card in list(self.frame_cards.items()):
             try:
                 if f == frame_idx:
                     card.configure(relief="solid", borderwidth=3)
@@ -2242,6 +2699,20 @@ class MultiFrameLabelBrowser(tk.Toplevel):
 
     def _select_frame(self, frame_idx: int, card_widget=None):
         self.selected_frame = frame_idx
+        # If the frame is within our virtual displayed set but not currently materialized,
+        # materialize it immediately (and a small neighborhood) so highlight + visual selection works.
+        displayed = self._get_displayed_frames()
+        if frame_idx in displayed and frame_idx not in self.frame_cards:
+            try:
+                cols, thumb_w, thumb_h, cell_w, row_h = self._compute_layout_params()
+                idx = displayed.index(frame_idx)
+                r = idx // cols
+                c = idx % cols
+                x = c * cell_w
+                y = r * row_h
+                self._place_or_update_card(frame_idx, x, y, thumb_w, thumb_h)
+            except Exception:
+                pass
         self._highlight_card(frame_idx)
 
         anns = self.frame_to_anns.get(frame_idx, [])
@@ -2417,9 +2888,14 @@ class MultiFrameLabelBrowser(tk.Toplevel):
             pass
         if not known and self.main_window:
             try:
-                known = self.main_window.discovered_classes or []
+                known = list(getattr(self.main_window, 'discovered_classes', [])) or []
             except:
                 pass
+
+        # Determine suggested relevant flag from known class relevance (auto-apply to prevent errors)
+        suggested_rel = cur_rel
+        if cur_label and cur_label in self.class_relevance:
+            suggested_rel = self.class_relevance[cur_label]
 
         ttk.Label(q, text="Existing classes (double-click or select + Assign):").pack(anchor="w", padx=8)
         lb = tk.Listbox(q, height=6, exportselection=False)
@@ -2433,6 +2909,16 @@ class MultiFrameLabelBrowser(tk.Toplevel):
             except:
                 pass
 
+        # When user selects a class from the list, auto-update the relevant checkbox
+        def _on_class_selected(event=None):
+            try:
+                sel = lb.get(lb.curselection())
+                if sel in self.class_relevance:
+                    rel_var.set(self.class_relevance[sel])
+            except Exception:
+                pass
+        lb.bind("<<ListboxSelect>>", _on_class_selected)
+
         # New class
         newf = ttk.Frame(q)
         newf.pack(fill="x", padx=8, pady=4)
@@ -2440,7 +2926,7 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         new_var = tk.StringVar(value=cur_label or "")
         ttk.Entry(newf, textvariable=new_var).pack(side="left", fill="x", expand=True, padx=4)
 
-        rel_var = tk.BooleanVar(value=cur_rel)
+        rel_var = tk.BooleanVar(value=suggested_rel)
         ttk.Checkbutton(q, text="Relevant (interesting / anomaly)", variable=rel_var).pack(anchor="w", padx=8)
 
         def do_assign():
@@ -2449,6 +2935,13 @@ class MultiFrameLabelBrowser(tk.Toplevel):
                 messagebox.showwarning("Label", "Enter or select a class name.")
                 return
             rel = rel_var.get()
+            # Enforce class-level relevance: if this class is known relevant, the tile must be too.
+            # This prevents the common mistake of forgetting to tick "relevant" on every instance.
+            if name in self.class_relevance and self.class_relevance[name]:
+                rel = True
+            # If the user marked this (new) class as relevant, remember it for future tiles
+            if rel:
+                self.class_relevance[name] = True
             try:
                 cx, cy = tile.bbox[0], tile.bbox[1]
                 self.tile_db.set_annotation(
@@ -2461,8 +2954,8 @@ class MultiFrameLabelBrowser(tk.Toplevel):
                 q.destroy()
                 # Refresh the grid
                 self._populate_frame_tile_grid(parent, grid_container, canvas_ref)
-                # Also refresh main strip counts if needed
-                self._load_annotations_for_video()  # cheap re-group
+                # Light refresh: update counts on strip cards, keep thumbs loaded
+                self._refresh_annotations_light()
             except Exception as e:
                 messagebox.showerror("Save", str(e))
 
@@ -2506,21 +2999,28 @@ class MultiFrameLabelBrowser(tk.Toplevel):
 
         def save():
             try:
+                new_label = lvar.get().strip() or "__UNLABELED__"
+                new_rel = rvar.get()
+                # Enforce known class relevance for this tile
+                if new_label in self.class_relevance and self.class_relevance[new_label]:
+                    new_rel = True
+                if new_rel:
+                    self.class_relevance[new_label] = True
                 self.tile_db.set_annotation(
                     ann["video_path"], ann["abs_frame"], ann["tile_row"], ann["tile_col"],
                     ann["tile_width"], ann["tile_height"],
-                    lvar.get().strip() or "__UNLABELED__", rvar.get(),
+                    new_label, new_rel,
                     crop_x=ann.get("crop_x"), crop_y=ann.get("crop_y")
                 )
                 ed.destroy()
-                self._load_annotations_for_video()  # refresh everything
+                self._refresh_annotations_light()
             except Exception as e:
                 messagebox.showerror("Edit", str(e))
 
         ttk.Button(ed, text="Save Change to DB", command=save).pack(fill="x", padx=8, pady=6)
         ttk.Button(ed, text="Delete this annotation", command=lambda: (self.tile_db.delete_annotation(
             ann["video_path"], ann["abs_frame"], ann["tile_row"], ann["tile_col"],
-            ann["tile_width"], ann["tile_height"]), ed.destroy(), self._load_annotations_for_video())).pack(fill="x", padx=8)
+            ann["tile_width"], ann["tile_height"]), ed.destroy(), self._refresh_annotations_light())).pack(fill="x", padx=8)
 
     def _jump_to_frame_in_main(self):
         """Use the existing controller navigation so the main LabelingDialog will show tiles from this frame."""
