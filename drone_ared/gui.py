@@ -25,13 +25,15 @@ import threading
 import queue
 import time
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 from .config import PipelineConfig, GUIConfig
 from .pipeline import DroneAREDController, LabelRequest
 from .label_store import PersistentLabelStore
 from .ared_adapter import AREDAdapter
 from .tile_database import TileAnnotationDB, extract_tile_from_video  # exact identity + re-extract helper
+# GridTiler is imported lazily inside the browser (to avoid pulling numpy/PIL deps at gui module load
+# if not already present from other paths).
 
 
 class LabelingDialog(tk.Toplevel):
@@ -118,6 +120,9 @@ class LabelingDialog(tk.Toplevel):
         # - Otherwise: Escape = Mark as Background (original behavior)
         if getattr(self, 'allow_skip', False):
             self.bind("<Escape>", lambda e: self._skip_current())
+            # Arrow keys for back/forward in Label Only navigation mode
+            self.bind("<Left>", lambda e: self._nav_prev())
+            self.bind("<Right>", lambda e: self._nav_next())
         else:
             self.bind("<Escape>", lambda e: self._assign_as_background())
 
@@ -247,17 +252,28 @@ class LabelingDialog(tk.Toplevel):
         ttk.Button(bottom, text="Mark as Background / Irrelevant", command=self._assign_as_background).pack(side="left")
 
         # "Skip / Move On" button - only shown in sparse / Label Only efficient mode.
-        # This is the key control for the alternative labeling workflow:
-        # - Click when the tile is not relevant / not worth labeling right now.
-        # - No entry is written to the DB for this tile.
-        # - On next resume (same or later session) the tile will be shown again
-        #   (unless you labeled it in the meantime via A/RED or another pass).
-        # - This lets you focus effort on relevant class instances for good Relevant Recall numbers
-        #   without exhaustively labeling every background tile immediately.
         if getattr(self, 'allow_skip', False):
             ttk.Button(bottom, text="Skip / Move On (no label)", command=self._skip_current).pack(side="left", padx=8)
 
         ttk.Button(bottom, text="Close Window (recreates on next query)", command=self._close_window).pack(side="right")
+
+        # Navigation controls for Label Only mode (back/forward/jump)
+        # Added so the user can move around the video if they miss a tile or want
+        # to jump to a specific frame while doing sparse relevant-only labeling.
+        if getattr(self, 'allow_skip', False):
+            nav = ttk.Frame(self)
+            nav.pack(fill="x", padx=int(8*s), pady=(2, int(4*s)))
+
+            ttk.Button(nav, text="◀ Prev", command=self._nav_prev).pack(side="left")
+            ttk.Button(nav, text="Next ▶", command=self._nav_next).pack(side="left", padx=4)
+
+            ttk.Label(nav, text="Jump frame:").pack(side="left")
+            self.jump_var = tk.StringVar()
+            e = ttk.Entry(nav, textvariable=self.jump_var, width=7)
+            e.pack(side="left")
+            e.bind("<Return>", lambda ev: self._nav_jump())
+            ttk.Button(nav, text="Go", command=self._nav_jump).pack(side="left", padx=2)
+            ttk.Label(nav, text="(Esc=Skip)", foreground="#666").pack(side="left", padx=6)
 
         # Status for the dialog
         self.dialog_status_var = tk.StringVar(value="Choose from list (double-click or button) or type new class + Create & Assign")
@@ -579,6 +595,84 @@ class LabelingDialog(tk.Toplevel):
         # Keep window open and ready for next tile
         self._prepare_for_next(last_label="(skipped)", last_relevant=False)
 
+    # ------------------------------------------------------------------
+    # Navigation handlers (only active in Label Only mode)
+    # Forwarded through MainWindow to the controller.
+    # ------------------------------------------------------------------
+    def _nav_prev(self):
+        """Satisfy current tile req (so worker unblocks), then ask main to signal controller.
+        This only happens for Label Only (allow_skip) requests; A/RED dialogs have no nav UI.
+        """
+        if getattr(self, 'current_req', None):
+            try:
+                self.current_req.set_skip()
+            except Exception:
+                pass
+            self.current_req = None
+        if self.on_assign:
+            try:
+                self.on_assign("__SKIPPED__", False)
+            except Exception:
+                pass
+        self._prepare_for_next(last_label="(prev)", last_relevant=False)
+        try:
+            mw = getattr(self, 'main_window', None)
+            if mw:
+                mw._nav_prev_from_dialog()
+            else:
+                # Fallback (should not be needed)
+                self.master._nav_prev_from_dialog()
+        except Exception:
+            pass
+
+    def _nav_next(self):
+        if getattr(self, 'current_req', None):
+            try:
+                self.current_req.set_skip()
+            except Exception:
+                pass
+            self.current_req = None
+        if self.on_assign:
+            try:
+                self.on_assign("__SKIPPED__", False)
+            except Exception:
+                pass
+        self._prepare_for_next(last_label="(next)", last_relevant=False)
+        try:
+            mw = getattr(self, 'main_window', None)
+            if mw:
+                mw._nav_next_from_dialog()
+            else:
+                self.master._nav_next_from_dialog()
+        except Exception:
+            pass
+
+    def _nav_jump(self):
+        try:
+            val = int(self.jump_var.get() or 0)
+        except Exception:
+            return
+        if getattr(self, 'current_req', None):
+            try:
+                self.current_req.set_skip()
+            except Exception:
+                pass
+            self.current_req = None
+        if self.on_assign:
+            try:
+                self.on_assign("__SKIPPED__", False)
+            except Exception:
+                pass
+        self._prepare_for_next(last_label="(jump)", last_relevant=False)
+        try:
+            mw = getattr(self, 'main_window', None)
+            if mw:
+                mw._nav_jump_from_dialog(val)
+            else:
+                self.master._nav_jump_from_dialog(val)
+        except Exception:
+            pass
+
     def _close_window(self):
         # User explicitly wants to close (will be recreated on next query if needed)
         # Satisfy the pending req so the worker does not hang forever waiting for a label.
@@ -792,6 +886,8 @@ class MainWindow:
         ttk.Checkbutton(param_frame, text="Label Only Mode (no A/RED, no DINO — pure labeling + Skip/Resume)",
                         variable=self.label_only_var).pack(anchor="w", pady=int(3*s))
         ttk.Button(param_frame, text="Review / Edit Past Labels...", command=self._open_review_window).pack(fill="x", pady=int(3*s))
+        ttk.Button(param_frame, text="Multi-Frame Browser (scroll many frames + select to label)", 
+                   command=self._open_multi_frame_browser).pack(fill="x", pady=int(3*s))
         ttk.Button(param_frame, text="Save Annotation DB Now", command=self._save_tile_annotations).pack(fill="x")
         ttk.Button(param_frame, text="Load different Annotation DB...", command=self._load_tile_annotations).pack(fill="x")
 
@@ -956,6 +1052,61 @@ class MainWindow:
     # Metrics display (Query Precision + Relevant Recall)
     # References the exact definitions in IJSC_2026-1.pdf and SPIE_IVSP_2026.pdf
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Navigation proxies called by the LabelingDialog when in Label Only mode.
+    # These forward to the controller's navigation API.
+    # ------------------------------------------------------------------
+    def _nav_prev_from_dialog(self):
+        """Forward nav request. The dialog side is responsible for satisfying
+        the current LabelRequest (via set_skip) so the worker unblocks.
+        We only clear our pending ref defensively and signal the controller.
+        Navigation is ONLY used in label-only mode; A/RED path is unaffected.
+        """
+        if getattr(self, '_pending_label_request', None):
+            try:
+                self._pending_label_request.set_skip()
+            except Exception:
+                pass
+            self._pending_label_request = None
+        # Also clear dialog's view if present
+        if hasattr(self, '_labeling_win') and getattr(self._labeling_win, 'current_req', None):
+            try:
+                self._labeling_win.current_req = None
+            except Exception:
+                pass
+        if self.controller:
+            self.controller.label_only_prev()
+
+    def _nav_next_from_dialog(self):
+        if getattr(self, '_pending_label_request', None):
+            try:
+                self._pending_label_request.set_skip()
+            except Exception:
+                pass
+            self._pending_label_request = None
+        if hasattr(self, '_labeling_win') and getattr(self._labeling_win, 'current_req', None):
+            try:
+                self._labeling_win.current_req = None
+            except Exception:
+                pass
+        if self.controller:
+            self.controller.label_only_next()
+
+    def _nav_jump_from_dialog(self, frame: int):
+        if getattr(self, '_pending_label_request', None):
+            try:
+                self._pending_label_request.set_skip()
+            except Exception:
+                pass
+            self._pending_label_request = None
+        if hasattr(self, '_labeling_win') and getattr(self._labeling_win, 'current_req', None):
+            try:
+                self._labeling_win.current_req = None
+            except Exception:
+                pass
+        if self.controller:
+            self.controller.label_only_jump_to_frame(frame)
+
     def _compute_metrics_from_db(self, video_name: Optional[str] = None):
         """Compute and display metrics using the current TileAnnotationDB + any logged A/RED queries."""
         if not self.controller or not self.tile_db:
@@ -1068,6 +1219,40 @@ class MainWindow:
             return
 
         LabelReviewWindow(self.root, self.tile_db, ui_scale=self.ui_scale)
+
+    def _open_multi_frame_browser(self):
+        """Open the new multi-frame visual browser.
+
+        Shows an adjustable number of frames (via columns + scrolling) as thumbnails.
+        Click to select a frame, then use the actions to explore its tiles and label them.
+        This is intended as a fast visual way to scroll/review labeled content and
+        jump into per-frame labeling, complementary to the sequential Label Only mode.
+        """
+        if not self.tile_db:
+            try:
+                path = getattr(self.config.tile_annotations, 'db_path', 'drone_tile_annotations.db')
+                self.tile_db = TileAnnotationDB(db_path=path)
+                if self.controller:
+                    self.controller.set_tile_database(self.tile_db)
+            except Exception as e:
+                messagebox.showerror("Browser", f"Could not open annotation DB: {e}")
+                return
+
+        # Always allow opening the browser (even with zero annotations) so the user can
+        # browse any video + start labeling frames using the stride. The internal "Browse any video"
+        # button and the video combo (if annotations exist) will work.
+        videos = self.tile_db.list_videos()
+        if not videos:
+            # Informational only; do not block opening.
+            print("[MultiFrameBrowser] Opening with no prior annotations in DB.")
+
+        MultiFrameLabelBrowser(
+            self.root,
+            self.tile_db,
+            ui_scale=self.ui_scale,
+            controller=self.controller,
+            main_window=self
+        )
 
     def _load_label_cache(self):
         path = filedialog.askopenfilename(title="Load label cache", filetypes=[("Pickle", "*.pkl")])
@@ -1247,6 +1432,13 @@ class MainWindow:
                 current_label=cur_label,
                 current_relevant=cur_rel,
             )
+
+        # Attach reference so dialog can call back for Label-Only navigation (Prev/Next/Jump).
+        # We do NOT use .master because the dialog is parented to the raw tk.Tk root.
+        # This keeps label-only nav fully separate from A/RED query flow (which never
+        # enables allow_skip or creates the nav buttons/binds).
+        if hasattr(self, '_labeling_win') and self._labeling_win:
+            self._labeling_win.main_window = self
 
     def _refresh_class_list(self):
         self.class_listbox.delete(0, "end")
@@ -1599,3 +1791,752 @@ class LabelReviewWindow(tk.Toplevel):
             self.update_idletasks()
         except Exception:
             pass
+
+
+# =============================================================================
+# MultiFrameLabelBrowser - NEW visual scrollable multi-frame overview + per-frame labeling
+# =============================================================================
+
+class MultiFrameLabelBrowser(tk.Toplevel):
+    """
+    A new GUI for quickly viewing and scrolling through many frames' labels at once.
+
+    Features requested:
+    - Adjustable number of frames visible "at once" (via columns slider + scrolling).
+    - Scrollable strip/grid of frame thumbnails (whole-frame previews + label counts).
+    - Click to select a frame.
+    - Then jump into "label creation section for that frame":
+        * "Explore Tiles on Frame" opens a grid of ALL tiles on the selected frame
+          (generated live with GridTiler).
+        * Labeled tiles show their current label + relevant marker.
+        * Click any tile → Quick assign dialog (existing classes + new + relevant).
+        * Saves directly to the exact TileAnnotationDB.
+    - Also supports jumping the main Label Only sequential cursor to the frame.
+    - Focused on visual review/scrolling of labels (complements the single-tile
+      LabelingDialog and the list-based LabelReviewWindow).
+
+    This is completely independent of the A/RED processing path.
+    Only uses the TileAnnotationDB + video re-extraction + optional controller for jumps.
+    """
+
+    def __init__(self, master, tile_db: "TileAnnotationDB", ui_scale: float = 1.6,
+                 controller: Optional["DroneAREDController"] = None,
+                 main_window=None):
+        super().__init__(master)
+        self.tile_db = tile_db
+        self.controller = controller
+        self.main_window = main_window
+        self.ui_scale = float(ui_scale) if ui_scale else 1.6
+
+        self.current_video: Optional[str] = None
+        self.frame_to_anns: Dict[int, List[Dict]] = {}
+        self.sorted_frames: List[int] = []
+        self.frame_thumbs: Dict[int, ImageTk.PhotoImage] = {}
+        self._last_thumb_w: int = 180
+        self.selected_frame: Optional[int] = None
+        self.frame_cards: Dict[int, tk.Widget] = {}
+        self._card_img_labels: Dict[int, tk.Widget] = {}  # frame -> the Label widget holding the image (for async updates)
+
+        # For the per-frame tile explorer
+        self.current_frame_tiles: List["Tile"] = []
+        self.current_frame_tile_labels: Dict[int, Tuple[str, bool]] = {}  # tile_global_in_frame -> (label, rel)
+        self._tile_photo_refs: List[ImageTk.PhotoImage] = []  # keep alive
+
+        self.title("Multi-Frame Label Browser - Adjustable Scroll + Per-Frame Labeling")
+        base_w = int(1280 * min(self.ui_scale, 1.8))
+        base_h = int(820 * min(self.ui_scale, 1.8))
+        self.geometry(f"{base_w}x{base_h}")
+        self.minsize(900, 600)
+        self.resizable(True, True)
+
+        self._build_ui()
+        self._load_videos()
+
+    def _build_ui(self):
+        s = self.ui_scale
+        fs = int(11 * s)
+        fsb = int(12 * s)
+
+        # Top controls
+        top = ttk.Frame(self)
+        top.pack(fill="x", padx=int(8*s), pady=int(4*s))
+
+        ttk.Label(top, text="Video:").pack(side="left")
+        self.video_var = tk.StringVar()
+        self.video_combo = ttk.Combobox(top, textvariable=self.video_var, width=55, state="readonly")
+        self.video_combo.pack(side="left", padx=4)
+        self.video_combo.bind("<<ComboboxSelected>>", lambda e: self._load_annotations_for_video())
+
+        ttk.Button(top, text="Reload", command=self._load_videos).pack(side="left", padx=4)
+        ttk.Button(top, text="Browse any video file (unlabeled OK)", command=self._browse_video_file).pack(side="left", padx=4)
+
+        ttk.Separator(top, orient="vertical").pack(side="left", fill="y", padx=8)
+
+        # Adjustable number of frames visible "at once"
+        ttk.Label(top, text="Columns (frames visible):").pack(side="left")
+        self.cols_var = tk.IntVar(value=4)
+        self.cols_scale = ttk.Scale(top, from_=1, to=8, variable=self.cols_var,
+                                    orient="horizontal", length=int(140*s),
+                                    command=lambda v: self._refresh_frame_strip())
+        self.cols_scale.pack(side="left", padx=4)
+        ttk.Label(top, textvariable=self.cols_var, width=2).pack(side="left")
+
+        ttk.Label(top, text="  Thumb size:").pack(side="left")
+        self.thumb_w_var = tk.IntVar(value=180)
+        ttk.Scale(top, from_=80, to=320, variable=self.thumb_w_var,
+                  orient="horizontal", length=int(100*s),
+                  command=lambda v: self._refresh_frame_strip()).pack(side="left", padx=4)
+
+        ttk.Button(top, text="Refresh Strip", command=self._refresh_frame_strip).pack(side="left", padx=8)
+
+        self.only_relevant_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(top, text="Only frames with relevant labels", variable=self.only_relevant_var,
+                        command=self._refresh_frame_strip).pack(side="left")
+
+        # Main split: left = scrollable frames strip, right = selected frame details + actions
+        main = ttk.Frame(self)
+        main.pack(fill="both", expand=True, padx=int(6*s), pady=int(4*s))
+
+        # LEFT: Scrollable frame strip (the key new visual browser)
+        left = ttk.LabelFrame(main, text="Frames (click to select) - scroll to see more")
+        left.pack(side="left", fill="both", expand=True, padx=(0, int(4*s)))
+
+        # Canvas + scrollbar for the strip/grid
+        self.strip_canvas = tk.Canvas(left, bg="#1a1a1a", highlightthickness=0)
+        vsb = ttk.Scrollbar(left, orient="vertical", command=self.strip_canvas.yview)
+        self.strip_canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self.strip_canvas.pack(side="left", fill="both", expand=True)
+
+        self.strip_inner = ttk.Frame(self.strip_canvas)
+        self.strip_canvas.create_window((0, 0), window=self.strip_inner, anchor="nw")
+
+        self.strip_inner.bind("<Configure>", self._on_strip_configure)
+        self.strip_canvas.bind("<MouseWheel>", self._on_strip_mousewheel)
+        self.strip_canvas.bind("<Button-4>", self._on_strip_mousewheel)
+        self.strip_canvas.bind("<Button-5>", self._on_strip_mousewheel)
+
+        # RIGHT: Selected frame + actions + tile explorer launcher
+        right = ttk.LabelFrame(main, text="Selected Frame & Label Actions", width=int(420 * min(s, 1.5)))
+        right.pack(side="right", fill="y")
+        right.pack_propagate(False)
+
+        self.sel_info_var = tk.StringVar(value="No frame selected. Click a thumbnail on the left.")
+        ttk.Label(right, textvariable=self.sel_info_var, wraplength=int(380*s), justify="left").pack(anchor="w", padx=6, pady=4)
+
+        # Quick stats
+        self.sel_stats_var = tk.StringVar(value="")
+        ttk.Label(right, textvariable=self.sel_stats_var, font=("TkDefaultFont", fsb)).pack(anchor="w", padx=6)
+
+        # Action buttons - "go to the label creation section for that frame"
+        btns = ttk.Frame(right)
+        btns.pack(fill="x", padx=6, pady=6)
+
+        ttk.Button(btns, text="Explore & Label Tiles on this Frame",
+                   command=self._open_frame_tile_explorer).pack(fill="x", pady=2)
+        ttk.Button(btns, text="Jump to this frame in Label Only mode (sequential)",
+                   command=self._jump_to_frame_in_main).pack(fill="x", pady=2)
+        ttk.Button(btns, text="Open in Review Window (list view)",
+                   command=self._open_in_review).pack(fill="x", pady=2)
+
+        ttk.Separator(right, orient="horizontal").pack(fill="x", pady=4)
+
+        # Mini list of labels on the selected frame (for quick view)
+        ttk.Label(right, text="Labels on selected frame:").pack(anchor="w", padx=4)
+        self.frame_labels_list = tk.Listbox(right, height=8, font=("TkDefaultFont", fs))
+        self.frame_labels_list.pack(fill="both", expand=False, padx=4, pady=2)
+        # Double-click list entry to edit immediately (streamline)
+        self.frame_labels_list.bind("<Double-Button-1>", lambda e: self._edit_selected_tile_from_list())
+
+        ttk.Button(right, text="Edit selected tile label (from list above)",
+                   command=self._edit_selected_tile_from_list).pack(fill="x", padx=4, pady=2)
+
+        # Status bar
+        self.browser_status_var = tk.StringVar(value="Load a video with annotations. Use the columns slider to change how many frames are shown side-by-side.")
+        ttk.Label(self, textvariable=self.browser_status_var, relief="sunken").pack(fill="x", padx=int(6*s), pady=2)
+
+    def _on_strip_configure(self, event=None):
+        self.strip_canvas.configure(scrollregion=self.strip_canvas.bbox("all"))
+
+    def _on_strip_mousewheel(self, event):
+        delta = getattr(event, "delta", 0)
+        num = getattr(event, "num", 0)
+        if num == 5 or delta < 0:
+            self.strip_canvas.yview_scroll(1, "units")
+        elif num == 4 or delta > 0:
+            self.strip_canvas.yview_scroll(-1, "units")
+
+    def _load_videos(self):
+        vids = self.tile_db.list_videos()
+        self.video_combo['values'] = vids
+        if vids:
+            self.video_var.set(vids[0])
+            self._load_annotations_for_video()
+        else:
+            self.browser_status_var.set("No videos with annotations found in DB. Use 'Browse any video file'.")
+
+    def _browse_video_file(self):
+        """Allow the user to pick any video (even one with no labels yet) so they can see the
+        full stride sequence and start labeling from the browser.
+        """
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(
+            title="Select video to browse/label",
+            filetypes=[("Video files", "*.mp4 *.MP4 *.avi *.mov *.mkv"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+        self.current_video = path
+        self.video_var.set(path)  # show the full path temporarily
+        # Treat as having no annotations initially
+        self.frame_to_anns = {}
+        # Force load which will compute strided frames using video metadata + stride
+        self._load_annotations_for_video()
+
+    def _load_annotations_for_video(self):
+        v = self.video_var.get()
+        if not v:
+            return
+        self.current_video = v
+        anns = self.tile_db.get_annotations_for_video(v)
+        self.frame_to_anns = {}
+        for a in anns:
+            f = a["abs_frame"]
+            if f not in self.frame_to_anns:
+                self.frame_to_anns[f] = []
+            self.frame_to_anns[f].append(a)
+
+        # Determine stride from the *live GUI variable* if possible (so it respects the
+        # "Frame stride (every Nth)" entry even before you press Start), falling back to config.
+        # This fixes the issue where it always used the default of 3.
+        stride = 3
+        try:
+            if self.main_window and hasattr(self.main_window, '_frame_stride_var'):
+                val = self.main_window._frame_stride_var.get()
+                stride = max(1, int(val)) if val.strip() else 3
+            elif self.controller and hasattr(self.controller, 'config') and self.controller.config:
+                stride = max(1, int(self.controller.config.tiling.frame_stride))
+            elif self.main_window and hasattr(self.main_window, 'config') and self.main_window.config:
+                stride = max(1, int(self.main_window.config.tiling.frame_stride))
+        except Exception:
+            stride = 3
+
+        # Get total frames from video so we can show EVERY frame according to stride (not just annotated ones)
+        total_frames = 0
+        try:
+            import cv2
+            cap = cv2.VideoCapture(v)
+            if cap.isOpened():
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            cap.release()
+        except Exception:
+            total_frames = 0
+
+        if total_frames > 0:
+            candidate_frames = list(range(0, total_frames, stride))
+        else:
+            # Fallback to annotated frames only if we can't read the video
+            candidate_frames = sorted(self.frame_to_anns.keys())
+
+        # Apply only-relevant filter on top of the strided list if requested
+        if self.only_relevant_var.get():
+            self.sorted_frames = [f for f in candidate_frames
+                                  if any(a.get("relevant") for a in self.frame_to_anns.get(f, []))]
+        else:
+            self.sorted_frames = candidate_frames
+
+        self.frame_thumbs.clear()
+        self.selected_frame = None
+        self.frame_cards.clear()
+
+        self.browser_status_var.set(
+            f"Loaded {len(self.sorted_frames)} frames (stride={stride}, total~{total_frames}) from {Path(v).name}. "
+            f"ALL frames per current stride are shown (labeled or not). Thumbs load in background."
+        )
+        self._refresh_frame_strip()
+
+        if self.sorted_frames:
+            self._select_frame(self.sorted_frames[0])
+
+    def _refresh_frame_strip(self):
+        """Rebuild the scrollable grid of frame thumbnails.
+        Number of columns comes from the adjustable slider.
+        """
+        # Detect thumb size change -> force regenerate thumbnails (this was why the slider appeared to do nothing)
+        current_thumb = max(80, int(self.thumb_w_var.get()))
+        if current_thumb != getattr(self, '_last_thumb_w', -1):
+            self.frame_thumbs.clear()
+            self._last_thumb_w = current_thumb
+
+        for w in self.strip_inner.winfo_children():
+            w.destroy()
+        self.frame_cards.clear()
+
+        if not self.sorted_frames:
+            ttk.Label(self.strip_inner, text="No frames to display.").pack()
+            return
+
+        cols = max(1, int(self.cols_var.get()))
+        thumb_w = current_thumb
+
+        row = col = 0
+        self._card_img_labels.clear()
+        for fidx in self.sorted_frames:
+            anns = self.frame_to_anns.get(fidx, [])
+            n_labels = len(anns)
+            n_rel = sum(1 for a in anns if a.get("relevant"))
+            has_rel = n_rel > 0
+
+            card = ttk.Frame(self.strip_inner, relief="ridge", borderwidth=1)
+            card.grid(row=row, column=col, padx=3, pady=3, sticky="nsew")
+
+            # Placeholder for thumbnail (will be updated asynchronously)
+            img_lbl = ttk.Label(card, text="[loading...]", width=18, anchor="center")
+            img_lbl.pack(padx=2, pady=2)
+            self._card_img_labels[fidx] = img_lbl
+
+            # Info text
+            rel_mark = " [R]" if has_rel else ""
+            info = f"Frame {fidx}\n{n_labels} labels{rel_mark}"
+            ttk.Label(card, text=info, justify="center", font=("TkDefaultFont", int(9*self.ui_scale))).pack(pady=1)
+
+            # Click handlers on the card and children
+            def make_sel(ff=fidx, c=card):
+                return lambda e: self._select_frame(ff, c)
+
+            for child in (card, *card.winfo_children()):
+                child.bind("<Button-1>", make_sel(ff=fidx, c=card))
+                # Double-click to directly open the tile label editor for this frame (streamlines editing)
+                child.bind("<Double-Button-1>", lambda e, ff=fidx: (self._select_frame(ff), self._open_frame_tile_explorer()))
+
+            self.frame_cards[fidx] = card
+
+            col += 1
+            if col >= cols:
+                col = 0
+                row += 1
+
+        # If we already have thumbs in cache (from previous async or sync), apply them immediately
+        # to the new placeholders. This keeps column changes snappy.
+        for fidx in list(self.sorted_frames):
+            if fidx in self.frame_thumbs:
+                tkimg = self.frame_thumbs[fidx]
+                img_lbl = self._card_img_labels.get(fidx)
+                if img_lbl and img_lbl.winfo_exists():
+                    try:
+                        img_lbl.configure(image=tkimg, text="")
+                        img_lbl.image = tkimg
+                    except Exception:
+                        pass
+
+        # Kick off (or resume) async loading for any missing thumbs
+        self.after(10, self._start_async_thumb_loading)
+
+        # Update scroll region
+        self.strip_inner.update_idletasks()
+        self.strip_canvas.configure(scrollregion=self.strip_canvas.bbox("all"))
+
+        # Re-apply highlight if something selected
+        if self.selected_frame in self.frame_cards:
+            self._highlight_card(self.selected_frame)
+
+    def _generate_frame_pil(self, frame_idx: int, max_w: int = 180, max_h: int = 110) -> Optional["Image.Image"]:
+        """Heavy work: decode + resize. Safe to call from background thread. Returns PIL or None."""
+        if not self.current_video:
+            return None
+        try:
+            import cv2
+            cap = cv2.VideoCapture(self.current_video)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
+            ret, frame = cap.read()
+            cap.release()
+            if not ret or frame is None:
+                return None
+            h, w = frame.shape[:2]
+            scale = min(max_w / max(1, w), max_h / max(1, h), 1.0)
+            nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+            small = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
+            rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+            return Image.fromarray(rgb).convert("RGB")
+        except Exception as e:
+            print(f"[MultiFrameBrowser] PIL generate error for frame {frame_idx}: {e}")
+            return None
+
+    def _get_frame_thumbnail(self, frame_idx: int, max_w: int = 180, max_h: int = 110) -> Optional[ImageTk.PhotoImage]:
+        """Sync path (kept for compatibility). Uses cache or generates on main thread."""
+        if frame_idx in self.frame_thumbs:
+            return self.frame_thumbs[frame_idx]
+        pil = self._generate_frame_pil(frame_idx, max_w, max_h)
+        if pil is None:
+            return None
+        tkimg = ImageTk.PhotoImage(pil)
+        self.frame_thumbs[frame_idx] = tkimg
+        return tkimg
+
+    def _start_async_thumb_loading(self):
+        """Load frame previews in a background thread so the browser window stays responsive
+        for scrolling and editing while thumbs appear progressively.
+        """
+        if not self.sorted_frames or not self.current_video:
+            return
+        thumb_w = max(80, int(self.thumb_w_var.get())) if hasattr(self, 'thumb_w_var') else 180
+        max_h = int(thumb_w * 0.65)
+
+        def worker():
+            for fidx in list(self.sorted_frames):
+                # Skip if we already have a good thumb at current size (or user changed size)
+                if fidx in self.frame_thumbs:
+                    continue
+                pil = self._generate_frame_pil(fidx, thumb_w, max_h)
+                if pil is not None:
+                    def schedule(f=fidx, p=pil):
+                        try:
+                            tkimg = ImageTk.PhotoImage(p)
+                            self.frame_thumbs[f] = tkimg
+                            self.after(0, lambda ff=f, img=tkimg: self._update_card_thumb(ff, img))
+                        except Exception as ex:
+                            print(f"[MultiFrameBrowser] async thumb schedule error: {ex}")
+                    self.after(0, schedule)
+            # If some frames failed to generate thumbs, at least clear the loading text for them
+            self.after(0, lambda: self._clear_remaining_loading_placeholders())
+            # final status
+            self.after(0, lambda: self.browser_status_var.set(
+                self.browser_status_var.get() + "  (thumbnails loaded)"))
+
+        t = threading.Thread(target=worker, daemon=True, name="frame-thumb-loader")
+        t.start()
+
+    def _update_card_thumb(self, frame_idx: int, tkimg: ImageTk.PhotoImage):
+        """Called on main thread to update a specific card's image label (async safe)."""
+        img_lbl = self._card_img_labels.get(frame_idx)
+        if img_lbl and img_lbl.winfo_exists():
+            try:
+                img_lbl.configure(image=tkimg, text="")  # replace placeholder text
+                img_lbl.image = tkimg  # keep ref
+            except Exception:
+                pass
+        # also keep in the card dict for rebuilds
+        if frame_idx in self.frame_cards:
+            self.frame_cards[frame_idx].img_ref = tkimg  # optional extra ref
+
+    def _clear_remaining_loading_placeholders(self):
+        """After async pass, turn any remaining 'loading...' into a simple unavailable note."""
+        for fidx, img_lbl in list(self._card_img_labels.items()):
+            if img_lbl and img_lbl.winfo_exists():
+                try:
+                    current = img_lbl.cget("text")
+                    if current and "loading" in str(current).lower():
+                        img_lbl.configure(text="[no thumb]")
+                except Exception:
+                    pass
+
+    def _highlight_card(self, frame_idx: Optional[int]):
+        for f, card in self.frame_cards.items():
+            try:
+                if f == frame_idx:
+                    card.configure(relief="solid", borderwidth=3)
+                else:
+                    card.configure(relief="ridge", borderwidth=1)
+            except Exception:
+                pass
+
+    def _select_frame(self, frame_idx: int, card_widget=None):
+        self.selected_frame = frame_idx
+        self._highlight_card(frame_idx)
+
+        anns = self.frame_to_anns.get(frame_idx, [])
+        n = len(anns)
+        n_rel = sum(1 for a in anns if a.get("relevant", False))
+
+        self.sel_info_var.set(f"Frame {frame_idx}  |  {n} labeled tiles  |  {n_rel} relevant")
+        self.sel_stats_var.set(f"Video: {Path(self.current_video).name if self.current_video else '?'}")
+
+        # Populate quick labels list
+        self.frame_labels_list.delete(0, "end")
+        self._current_frame_anns_list = anns  # for edit action
+        for a in anns:
+            rel = " [R]" if a.get("relevant") else ""
+            txt = f"r{a['tile_row']}c{a['tile_col']}  {a['label']}{rel}"
+            self.frame_labels_list.insert("end", txt)
+
+        self.browser_status_var.set(f"Selected frame {frame_idx}. Use 'Explore & Label Tiles on this Frame' for the per-frame label creation grid.")
+
+    def _open_frame_tile_explorer(self):
+        """The 'label creation section for that frame'.
+        Decodes the frame, tiles it, shows all tiles (labeled or not) in a grid.
+        Clicking a tile lets you create/edit its label.
+        """
+        if self.selected_frame is None or not self.current_video:
+            messagebox.showinfo("Explorer", "Select a frame first.")
+            return
+
+        explorer = tk.Toplevel(self)
+        explorer.title(f"Tile Label Editor - Frame {self.selected_frame}")
+        explorer.geometry(f"{int(1100*min(self.ui_scale,1.6))}x{int(700*min(self.ui_scale,1.6))}")
+        explorer.resizable(True, True)
+
+        top = ttk.Frame(explorer)
+        top.pack(fill="x", padx=6, pady=4)
+        ttk.Label(top, text=f"Frame {self.selected_frame} — all tiles (click any to label/edit)").pack(side="left")
+
+        # Scrollable grid container
+        canvas = tk.Canvas(explorer, bg="#222")
+        vsb = ttk.Scrollbar(explorer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        tile_container = ttk.Frame(canvas)
+        canvas.create_window((0, 0), window=tile_container, anchor="nw")
+        tile_container.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+
+        # Initial population (after widgets exist)
+        self.after(50, lambda: self._populate_frame_tile_grid(explorer, tile_container, canvas))
+
+        # Refresh button (now tile_container exists)
+        ttk.Button(top, text="Re-tile & Refresh",
+                   command=lambda: self._populate_frame_tile_grid(explorer, tile_container, canvas)).pack(side="right")
+
+    def _populate_frame_tile_grid(self, explorer_win, container, canvas_ref=None):
+        """Decode frame, tile it, show clickable tile cards in the container."""
+        for w in container.winfo_children():
+            w.destroy()
+        self.current_frame_tiles = []
+        self.current_frame_tile_labels = {}
+        self._tile_photo_refs.clear()
+
+        if not self.current_video or self.selected_frame is None:
+            return
+
+        try:
+            import cv2
+            cap = cv2.VideoCapture(self.current_video)
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(self.selected_frame))
+            ret, frame = cap.read()
+            cap.release()
+            if not ret or frame is None:
+                ttk.Label(container, text="Could not decode frame.").pack()
+                return
+
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            # Lazy import to avoid hard dep at module load time
+            try:
+                from .tiling import GridTiler
+            except Exception:
+                from drone_ared.tiling import GridTiler
+
+            # Use controller tiler if available, else sensible default
+            if self.controller and getattr(self.controller, 'tiler', None):
+                tiler = self.controller.tiler
+            else:
+                # Fallback (matches common config)
+                tiler = GridTiler(tile_width=256, tile_height=256)
+
+            tiles = tiler.tile_frame(frame_rgb, self.selected_frame, 0, video_path=self.current_video)
+            self.current_frame_tiles = tiles
+
+            if not tiles:
+                ttk.Label(container, text="No tiles generated for this frame (frame too small?).").pack()
+                return
+
+            # Layout: ~ 5-6 columns
+            cols = 6
+            for idx, tile in enumerate(tiles):
+                # Lookup current label
+                label, rel = None, False
+                try:
+                    hit = self.tile_db.lookup(self.current_video, tile.frame_idx,
+                                              tile.tile_row, tile.tile_col,
+                                              tile.width, tile.height)
+                    if hit:
+                        label, rel = hit
+                except Exception:
+                    pass
+                self.current_frame_tile_labels[idx] = (label, rel)
+
+                # Card
+                card = ttk.Frame(container, relief="groove", borderwidth=1)
+                r, c = divmod(idx, cols)
+                card.grid(row=r, column=c, padx=2, pady=2)
+
+                # Small preview of the tile
+                small = tile.image.copy()
+                small.thumbnail((110, 110), Image.Resampling.LANCZOS)
+                tkimg = ImageTk.PhotoImage(small)
+                self._tile_photo_refs.append(tkimg)  # keep
+
+                img_lbl = ttk.Label(card, image=tkimg)
+                img_lbl.pack()
+
+                status = f"{label or 'unlabeled'}{' [R]' if rel else ''}"
+                ttk.Label(card, text=status, width=14, anchor="center").pack()
+
+                # Click to label
+                def make_edit(t=tile, i=idx):
+                    return lambda e: self._quick_label_tile(explorer_win, t, i, container, canvas_ref)
+
+                for child in (card, img_lbl):
+                    child.bind("<Button-1>", make_edit(t=tile, i=idx))
+
+            if canvas_ref:
+                container.update_idletasks()
+                canvas_ref.configure(scrollregion=canvas_ref.bbox("all"))
+
+        except Exception as e:
+            messagebox.showerror("Tile Explorer", str(e))
+            import traceback
+            traceback.print_exc()
+
+    def _quick_label_tile(self, parent, tile: "Tile", tile_local_idx: int, grid_container, canvas_ref):
+        """Quick label dialog for a specific tile. Saves to DB and refreshes grid."""
+        q = tk.Toplevel(parent)
+        q.title(f"Label Tile r{tile.tile_row}c{tile.tile_col} (f{tile.frame_idx})")
+        q.geometry("520x620")
+
+        s = self.ui_scale
+        # Image
+        big = tile.image.copy()
+        big.thumbnail((380, 380), Image.Resampling.LANCZOS)
+        tkbig = ImageTk.PhotoImage(big)
+        ttk.Label(q, image=tkbig).pack(pady=4)
+        # keep ref on q
+        q._img_ref = tkbig
+
+        # Current
+        cur = self.current_frame_tile_labels.get(tile_local_idx, (None, False))
+        cur_label, cur_rel = cur
+
+        ttk.Label(q, text=f"Current: {cur_label or 'unlabeled'}  (relevant={cur_rel})").pack()
+
+        # Known classes from DB (good for this browser)
+        known = []
+        try:
+            known = self.tile_db.get_all_labels()
+        except Exception:
+            pass
+        if not known and self.main_window:
+            try:
+                known = self.main_window.discovered_classes or []
+            except:
+                pass
+
+        ttk.Label(q, text="Existing classes (double-click or select + Assign):").pack(anchor="w", padx=8)
+        lb = tk.Listbox(q, height=6, exportselection=False)
+        lb.pack(fill="x", padx=8)
+        for k in sorted(set(known)):
+            lb.insert("end", k)
+        if cur_label and cur_label in known:
+            try:
+                idx = sorted(set(known)).index(cur_label)
+                lb.selection_set(idx)
+            except:
+                pass
+
+        # New class
+        newf = ttk.Frame(q)
+        newf.pack(fill="x", padx=8, pady=4)
+        ttk.Label(newf, text="New / Edit class:").pack(side="left")
+        new_var = tk.StringVar(value=cur_label or "")
+        ttk.Entry(newf, textvariable=new_var).pack(side="left", fill="x", expand=True, padx=4)
+
+        rel_var = tk.BooleanVar(value=cur_rel)
+        ttk.Checkbutton(q, text="Relevant (interesting / anomaly)", variable=rel_var).pack(anchor="w", padx=8)
+
+        def do_assign():
+            name = new_var.get().strip() or (lb.get(lb.curselection()[0]) if lb.curselection() else None)
+            if not name:
+                messagebox.showwarning("Label", "Enter or select a class name.")
+                return
+            rel = rel_var.get()
+            try:
+                cx, cy = tile.bbox[0], tile.bbox[1]
+                self.tile_db.set_annotation(
+                    self.current_video, tile.frame_idx,
+                    tile.tile_row, tile.tile_col, tile.width, tile.height,
+                    name, rel, embedding=None, crop_x=cx, crop_y=cy
+                )
+                # Update local
+                self.current_frame_tile_labels[tile_local_idx] = (name, rel)
+                q.destroy()
+                # Refresh the grid
+                self._populate_frame_tile_grid(parent, grid_container, canvas_ref)
+                # Also refresh main strip counts if needed
+                self._load_annotations_for_video()  # cheap re-group
+            except Exception as e:
+                messagebox.showerror("Save", str(e))
+
+        ttk.Button(q, text="Assign / Update Label", command=do_assign).pack(fill="x", padx=8, pady=6)
+        ttk.Button(q, text="Mark Background", command=lambda: (new_var.set("__BACKGROUND__"), rel_var.set(False), do_assign())).pack(fill="x", padx=8)
+        ttk.Button(q, text="Cancel", command=q.destroy).pack(fill="x", padx=8, pady=2)
+
+    def _edit_selected_tile_from_list(self):
+        """Edit from the right-side list of labels on the selected frame."""
+        sel = self.frame_labels_list.curselection()
+        if not sel or self.selected_frame is None:
+            return
+        idx = sel[0]
+        if not hasattr(self, '_current_frame_anns_list') or idx >= len(self._current_frame_anns_list):
+            return
+        ann = self._current_frame_anns_list[idx]
+
+        # Re-extract the tile image for nice preview
+        bbox = (ann.get("crop_x", ann["tile_col"]*ann["tile_width"]),
+                ann.get("crop_y", ann["tile_row"]*ann["tile_height"]),
+                ann.get("crop_x", ann["tile_col"]*ann["tile_width"]) + ann["tile_width"],
+                ann.get("crop_y", ann["tile_row"]*ann["tile_height"]) + ann["tile_height"])
+
+        img = extract_tile_from_video(ann["video_path"], ann["abs_frame"], bbox)
+
+        # Simple editor (reuse spirit of review, but quick)
+        ed = tk.Toplevel(self)
+        ed.title(f"Edit label f{ann['abs_frame']} r{ann['tile_row']}c{ann['tile_col']}")
+        if img:
+            disp = img.copy()
+            disp.thumbnail((320, 320))
+            tkd = ImageTk.PhotoImage(disp)
+            ttk.Label(ed, image=tkd).pack()
+            ed._ref = tkd
+
+        lvar = tk.StringVar(value=ann["label"])
+        ttk.Entry(ed, textvariable=lvar).pack(fill="x", padx=8, pady=4)
+
+        rvar = tk.BooleanVar(value=ann["relevant"])
+        ttk.Checkbutton(ed, text="Relevant", variable=rvar).pack()
+
+        def save():
+            try:
+                self.tile_db.set_annotation(
+                    ann["video_path"], ann["abs_frame"], ann["tile_row"], ann["tile_col"],
+                    ann["tile_width"], ann["tile_height"],
+                    lvar.get().strip() or "__UNLABELED__", rvar.get(),
+                    crop_x=ann.get("crop_x"), crop_y=ann.get("crop_y")
+                )
+                ed.destroy()
+                self._load_annotations_for_video()  # refresh everything
+            except Exception as e:
+                messagebox.showerror("Edit", str(e))
+
+        ttk.Button(ed, text="Save Change to DB", command=save).pack(fill="x", padx=8, pady=6)
+        ttk.Button(ed, text="Delete this annotation", command=lambda: (self.tile_db.delete_annotation(
+            ann["video_path"], ann["abs_frame"], ann["tile_row"], ann["tile_col"],
+            ann["tile_width"], ann["tile_height"]), ed.destroy(), self._load_annotations_for_video())).pack(fill="x", padx=8)
+
+    def _jump_to_frame_in_main(self):
+        """Use the existing controller navigation so the main LabelingDialog will show tiles from this frame."""
+        if self.selected_frame is None:
+            return
+        if not self.controller:
+            messagebox.showinfo("Jump", "No controller available (start Label Only mode from main window).")
+            return
+        try:
+            self.controller.label_only_jump_to_frame(self.selected_frame)
+            self.browser_status_var.set(f"Jumped controller to frame {self.selected_frame}. Use the main labeling window.")
+        except Exception as e:
+            messagebox.showerror("Jump", str(e))
+
+    def _open_in_review(self):
+        """Open the classic list review window for convenience."""
+        if self.current_video and self.tile_db:
+            # The LabelReviewWindow loads its own list; just open it
+            LabelReviewWindow(self, self.tile_db, ui_scale=self.ui_scale)

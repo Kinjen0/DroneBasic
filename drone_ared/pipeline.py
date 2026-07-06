@@ -21,7 +21,7 @@ import threading
 import queue
 import time
 from pathlib import Path
-from typing import Optional, List, Callable, Any, Dict, Tuple
+from typing import Optional, List, Callable, Any, Dict, Tuple  # List still used for other tile lists / annotations
 import numpy as np
 from PIL import Image
 
@@ -132,6 +132,18 @@ class DroneAREDController:
         # Live collection of tiles that A/RED actually decided to query (stable identities).
         # Populated during normal runs. Used by metrics.py for QP / RR calculation.
         self.queried_identities: List[Tuple] = []
+
+        # ------------------------------------------------------------------
+        # Label Only navigation state (back/forward/jump)
+        # These allow the user to move around the video without being stuck
+        # in a strict forward-only stream. This is especially useful in the
+        # sparse/resume labeling workflow.
+        # ------------------------------------------------------------------
+        self._label_only_current_video: Optional[str] = None
+        self._label_only_current_frame: int = 0
+        self._label_only_current_tile_idx: int = 0   # index within the tiles of the current frame
+        self._label_only_navigation_event = threading.Event()  # used to unblock when GUI requests nav
+        self._label_only_nav_command: Optional[Dict] = None    # {'action': 'next'|'prev'|'jump', 'frame': int, ...}
 
         # Callback the GUI can register to receive periodic status updates
         self.on_stats: Optional[Callable[[Dict], None]] = None
@@ -248,6 +260,36 @@ class DroneAREDController:
         if self.tile_db:
             return self.tile_db.get_all_labels()
         return []
+
+    # ------------------------------------------------------------------
+    # Label Only navigation API (back / forward / jump to frame)
+    # Called from the GUI. These update the cursor and signal the worker
+    # loop so the user can move around the video freely.
+    # This is essential when using the sparse "label relevant + skip the rest"
+    # workflow so the user can go back if they miss a tile.
+    # ------------------------------------------------------------------
+    def label_only_next(self):
+        """Request move to the next tile in the labeling sequence."""
+        if not self.label_only_mode:
+            return
+        self._label_only_nav_command = {"action": "next"}
+        self._label_only_navigation_event.set()
+
+    def label_only_prev(self):
+        """Request move to the previous tile."""
+        if not self.label_only_mode:
+            return
+        self._label_only_nav_command = {"action": "prev"}
+        self._label_only_navigation_event.set()
+
+    def label_only_jump_to_frame(self, frame: int):
+        """Jump directly to a specific absolute frame (0-based from start of video).
+        The worker will seek and present the first valid tile on that frame.
+        """
+        if not self.label_only_mode:
+            return
+        self._label_only_nav_command = {"action": "jump", "frame": max(0, int(frame))}
+        self._label_only_navigation_event.set()
 
     def compute_metrics_for_video(self, video_path: str) -> Dict[str, Any]:
         """Compute Query Precision / Relevant Recall using current DB labels + logged queries.
@@ -473,6 +515,16 @@ class DroneAREDController:
             return
 
         print(f"[Pipeline] Starting video: {video_path}")
+
+        if self.label_only_mode:
+            # Delegate entirely to the dedicated label-only processor.
+            # It handles its own video reading, stride, navigation (back/forward/jump),
+            # resume skipping, and labeling. This avoids interference with the
+            # normal A/RED frame-batching loop.
+            self._process_label_only_tiles(video_path)
+            print(f"[Pipeline] Finished label-only for video: {video_path}")
+            return
+
         frame_idx = -1
         frame_stride = max(1, self.config.tiling.frame_stride)
         batch_imgs: List[Image.Image] = []
@@ -509,11 +561,8 @@ class DroneAREDController:
                     if not tiles:
                         continue
 
-                    if self.label_only_mode:
-                        # Pure labeling mode: no DINO, no A/RED.
-                        # Every tile (at stride) is presented for human labeling and saved.
-                        self._process_label_only_tiles(tiles, video_path)
-                        continue
+                    # Note: label_only_mode is handled via early delegation above; this branch
+                    # is only for the normal A/RED + DINO path.
 
                     # Normal A/RED path: Collect for batched feature extraction
                     for t in tiles:
@@ -610,10 +659,24 @@ class DroneAREDController:
             import traceback
             traceback.print_exc()
 
-    def _process_label_only_tiles(self, tiles: List[Tile], video_path: str):
-        """Pure labeling path (no DINO, no A/RED) with resume / sparse support.
+    def _process_label_only_tiles(self, video_path: str):
+        """Pure labeling path (no DINO, no A/RED) with full back/forward/jump navigation.
 
-        This is the "alternative" efficient labeling mode for metrics-focused work.
+        Supports the user request for non-linear navigation in Label Only mode
+        so they can go back if they miss a tile or jump to a specific frame.
+        Combined with Skip + resume logic.
+
+        IMPORTANT FIXES APPLIED:
+        - No longer receives/depends on a caller-provided tiles list (was always [] from delegation).
+        - Cursor advancement now uses the *actual* number of tiles on each frame instead of
+          hardcoded sentinels ( >500 / =999 ). This was the direct cause of:
+            * "frame 1, tile 300" (internal tile_idx grew unbounded while clamping selection)
+            * re-processing the same frame/tile repeatedly (clamped always to last tile)
+            * never advancing frames visibly until hundreds of steps
+        - Auto-skip (resume) of already-labeled tiles is throttled lightly to avoid CPU spin
+          on video re-decode + re-tile for long pre-labeled stretches.
+        - Frame/tile progress is now correct so the LabelingDialog receives sequential distinct
+          tiles and the info bar shows advancing "Frame X | Tile rY cZ".
 
         Key behaviors (designed for large numbers of tiles and Relevant Recall measurement):
         - Checks the exact TileAnnotationDB first.
@@ -637,109 +700,245 @@ class DroneAREDController:
         You can do a fast pass labeling only the relevant ones, then compute metrics
         against A/RED's query decisions.
         """
-        if not tiles:
-            return
         if self.tile_db is None:
-            print("[Pipeline] Label Only mode: No tile_db configured. Labels will not be saved. "
-                  "All tiles will be treated as new.")
+            print("[Pipeline] Label Only mode: No tile_db configured. Labels will not be saved.")
 
-        for tile in tiles:
-            if self._stop_event.is_set():
-                break
+        # Initialize navigation cursor state for this video
+        self._label_only_current_video = video_path
+        self._label_only_current_frame = 0
+        self._label_only_current_tile_idx = 0
+        self._label_only_nav_command = None
+        self._label_only_navigation_event.clear()
+        self._label_only_force_present = False  # when True (after explicit nav), present even labeled tiles (for review)
 
-            # Pause support
-            self._pause_event.wait()
-            if self._stop_event.is_set():
-                break
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            print(f"[Pipeline] Label Only: could not open {video_path} for seeking/navigation")
+            return
 
-            vpath = video_path
-            f = tile.frame_idx
-            r = tile.tile_row
-            c = tile.tile_col
-            tw = tile.width
-            th = tile.height
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 999999)
+        frame_stride = max(1, self.config.tiling.frame_stride)
 
-            # === Resume / sparse logic ===
-            existing = None
-            if self.tile_db is not None:
+        # Probe once to learn how many tiles the GridTiler produces for frames of this video.
+        # This is constant for uniform grid + fixed video resolution (typical case).
+        # We use it for proper modular wrap-around instead of magic numbers.
+        tiles_per_frame = 1
+        try:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, probe = cap.read()
+            if ret and probe is not None:
+                prgb = cv2.cvtColor(probe, cv2.COLOR_BGR2RGB)
+                probe_tiles = self.tiler.tile_frame(prgb, 0, 0, video_path=video_path)
+                if probe_tiles:
+                    tiles_per_frame = len(probe_tiles)
+        except Exception:
+            pass
+        if tiles_per_frame < 1:
+            tiles_per_frame = 1
+
+        # Reset seek head
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+        auto_skip_count = 0
+
+        try:
+            while not self._stop_event.is_set():
+                self._pause_event.wait()
+                if self._stop_event.is_set():
+                    break
+
+                # --- Handle navigation commands from the GUI (Prev/Next/Jump) ---
+                # These are ONLY active for label-only mode (see controller guards + GUI only
+                # wires nav buttons/binds when allow_skip=True which label-only sets in meta).
+                # A/RED runs never set allow_skip and never create these controls.
+                if self._label_only_nav_command is not None:
+                    cmd = self._label_only_nav_command
+                    self._label_only_nav_command = None
+                    self._label_only_navigation_event.clear()
+                    print(f"[Pipeline] Label Only: applying nav command {cmd} (cursor before: f{self._label_only_current_frame} t{self._label_only_current_tile_idx})")
+
+                    if cmd.get("action") == "next":
+                        self._advance_label_only_cursor(1, frame_stride, total_frames, tiles_per_frame)
+                    elif cmd.get("action") == "prev":
+                        self._advance_label_only_cursor(-1, frame_stride, total_frames, tiles_per_frame)
+                    elif cmd.get("action") == "jump":
+                        self._label_only_current_frame = max(0, min(cmd.get("frame", 0), total_frames-1))
+                        self._label_only_current_tile_idx = 0
+
+                    print(f"[Pipeline] Label Only: nav applied, now at f{self._label_only_current_frame} t{self._label_only_current_tile_idx}")
+
+                    # Mark that the *next* tile we land on should be presented even if already
+                    # labeled (so user can review/edit previous tiles via explicit nav).
+                    self._label_only_force_present = True
+
+                    # Unblock any pending label wait so we can reposition immediately
+                    if self._current_label_req is not None:
+                        try:
+                            self._current_label_req.set_skip()
+                        except Exception:
+                            pass
+                        self._current_label_req = None
+
+                    # Small yield so GUI can breathe after a nav jump
+                    time.sleep(0.01)
+
+                # Seek + decode the frame indicated by current cursor
+                cap.set(cv2.CAP_PROP_POS_FRAMES, self._label_only_current_frame)
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    # Reached end or unreadable frame; stop for this video
+                    break
+
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                tiles_on_frame = self.tiler.tile_frame(frame_rgb, self._label_only_current_frame,
+                                                       0, video_path=video_path)
+                if not tiles_on_frame:
+                    # No tiles possible on this frame (very small resolution?); move forward
+                    self._label_only_force_present = False
+                    self._advance_label_only_cursor(1, frame_stride, total_frames, tiles_per_frame)
+                    continue
+
+                N = len(tiles_on_frame)
+
+                # CRITICAL: normalize cursor tile index to the *actual* count for this frame.
+                # This prevents the previous unbounded growth and "always last tile" clamping bug.
+                if self._label_only_current_tile_idx >= N or self._label_only_current_tile_idx < 0:
+                    self._label_only_current_tile_idx = max(0, min(self._label_only_current_tile_idx, N-1))
+
+                t_idx = self._label_only_current_tile_idx
+                tile = tiles_on_frame[t_idx]
+
+                # Resume / already-labeled skip logic (exact DB identity)
+                existing = None
+                if self.tile_db is not None:
+                    try:
+                        existing = self.tile_db.lookup(video_path, tile.frame_idx,
+                                                       tile.tile_row, tile.tile_col,
+                                                       tile.width, tile.height)
+                    except Exception:
+                        existing = None
+
+                # If an explicit navigation (prev/next/jump) just landed us here, force-present
+                # the tile (with prefill if it had a prior label) so the user can review it.
+                # Normal forward auto-resume still skips known tiles (unless edit_mode).
+                force_present = getattr(self, '_label_only_force_present', False)
+                self._label_only_force_present = False
+
+                if existing and not self.edit_mode and not force_present:
+                    # Auto-skip: do not bother user; just advance.
+                    # Throttle to keep CPU/decode reasonable during long resume passes over
+                    # already-labeled content. Without this, tight loop of seek+retile+lookup
+                    # made "labeling mode" unacceptably slow even when skipping.
+                    self.stats["tiles_processed"] = self.stats.get("tiles_processed", 0) + 1
+                    auto_skip_count += 1
+                    self._advance_label_only_cursor(1, frame_stride, total_frames, tiles_per_frame)
+
+                    if auto_skip_count % 20 == 0 and self.on_stats:
+                        self.on_stats(self.stats.copy())
+                    time.sleep(0.002)  # yield; prevents 100% CPU spin on video decode for skips
+                    continue
+
+                # Reset skip counter when we actually present something
+                auto_skip_count = 0
+
+                # Present this tile to the (persistent) labeling dialog
+                req = LabelRequest(tile=tile, embedding=np.zeros(1, dtype=np.float32), meta={
+                    "video_path": video_path,
+                    "frame": tile.frame_idx,
+                    "abs_frame": tile.frame_idx,
+                    "row": tile.tile_row,
+                    "col": tile.tile_col,
+                    "tile_width": tile.width,
+                    "tile_height": tile.height,
+                    "bbox": tile.bbox,
+                    "label_only": True,
+                    "allow_skip": True,
+                    "current_label": existing[0] if existing else None,
+                    "current_relevant": existing[1] if existing else False,
+                })
+                self._current_label_req = req
+
                 try:
-                    existing = self.tile_db.lookup(vpath, f, r, c, tw, th)
-                except Exception:
-                    existing = None
+                    self.label_request_queue.put(req, timeout=5)
+                except queue.Full:
+                    self._current_label_req = None
+                    if self._label_only_nav_command is None:
+                        self._advance_label_only_cursor(1, frame_stride, total_frames, tiles_per_frame)
+                    continue
 
-            if existing and not self.edit_mode:
-                # Already labeled in a previous session (or earlier in this run).
-                # Skip automatically to save effort. This is the core of "resume".
-                print(f"[Pipeline] Label Only: already labeled as '{existing[0]}' (relevant={existing[1]}). Skipping.")
-                self.stats["tiles_processed"] = self.stats.get("tiles_processed", 0) + 1
-                continue
-
-            if existing and self.edit_mode:
-                print(f"[Pipeline] Label Only (EDIT): re-showing already labeled tile '{existing[0]}' for correction.")
-
-            print(f"[Pipeline] Label Only: requesting label/skip for frame={f} r={r} c={c} "
-                  f"({'edit' if self.edit_mode else 'new/resume'})")
-
-            # Build request. We pass "label_only" and "allow_skip" so the GUI knows
-            # to show the Skip button and pre-fill if we have an existing label.
-            req = LabelRequest(tile=tile, embedding=np.zeros(1, dtype=np.float32), meta={
-                "video_path": vpath,
-                "frame": f,
-                "abs_frame": f,
-                "row": r,
-                "col": c,
-                "tile_width": tw,
-                "tile_height": th,
-                "bbox": tile.bbox,
-                "label_only": True,
-                "allow_skip": True,                    # enables Skip button in dialog
-                "current_label": existing[0] if existing else None,
-                "current_relevant": existing[1] if existing else False,
-            })
-            self._current_label_req = req
-            try:
-                self.label_request_queue.put(req, timeout=5)
-            except queue.Full:
+                result = req.wait(timeout=300)
                 self._current_label_req = None
-                print("[Pipeline] Label Only: queue full, skipping tile")
-                continue
 
-            result = req.wait(timeout=300)
-            self._current_label_req = None
+                # If a navigation command arrived while we were waiting for a decision on this tile,
+                # the GUI already did set_skip() + signaled the desired move. We suppress the normal
+                # "skip means +1 forward" here so the nav delta (next/prev/jump) is the only one applied.
+                # This prevents double-advancing on Next or fighting Prev.
+                # The top-of-loop nav handler (or the one below) will have applied the correct cursor change.
+                nav_pending_on_unblock = (self._label_only_nav_command is not None)
 
-            if getattr(req, 'skipped', False) or result is None:
-                # User explicitly chose "Skip / Move On" or timeout.
-                # Do NOT write anything to DB. Tile remains unlabeled for future passes.
-                print(f"[Pipeline] Label Only: skipped (no label written).")
+                if getattr(req, "skipped", False) or result is None:
+                    self.stats["tiles_processed"] = self.stats.get("tiles_processed", 0) + 1
+                    if not nav_pending_on_unblock:
+                        self._advance_label_only_cursor(1, frame_stride, total_frames, tiles_per_frame)
+                    continue
+
+                label, rel = result
+                if not label or label == "__SKIP__":
+                    self.stats["tiles_processed"] = self.stats.get("tiles_processed", 0) + 1
+                    if not nav_pending_on_unblock:
+                        self._advance_label_only_cursor(1, frame_stride, total_frames, tiles_per_frame)
+                    continue
+
+                # Save the (new or corrected) label to the exact DB
+                if self.tile_db is not None:
+                    try:
+                        cx, cy = tile.bbox[0], tile.bbox[1]
+                        self.tile_db.set_annotation(video_path, tile.frame_idx, tile.tile_row,
+                                                    tile.tile_col, tile.width, tile.height,
+                                                    label, rel, embedding=None, crop_x=cx, crop_y=cy)
+                    except Exception as e:
+                        print(f"[Pipeline] Label Only save error: {e}")
+
                 self.stats["tiles_processed"] = self.stats.get("tiles_processed", 0) + 1
-                if self.on_stats and (self.stats["tiles_processed"] % 5 == 0):
+                if self.on_stats and (self.stats["tiles_processed"] % 3 == 0):
                     self.on_stats(self.stats.copy())
-                continue
 
-            label, rel = result
-            if not label or label == "__SKIP__":
-                # Defensive: treat as skip
-                print(f"[Pipeline] Label Only: no label returned, treated as skip.")
-                self.stats["tiles_processed"] = self.stats.get("tiles_processed", 0) + 1
-                continue
+                # Normal forward advance after a user *label assignment* decision.
+                # (Skips go through earlier paths that may suppress when nav is active.)
+                if self._label_only_nav_command is None:
+                    self._advance_label_only_cursor(1, frame_stride, total_frames, tiles_per_frame)
 
-            print(f"[Pipeline] Label Only: labeled as '{label}' (relevant={rel})")
+        finally:
+            cap.release()
 
-            # Save (or overwrite in edit mode) to the exact DB.
-            # This is what enables both resume and accurate metrics.
-            if self.tile_db is not None:
-                try:
-                    cx, cy = tile.bbox[0], tile.bbox[1]
-                    self.tile_db.set_annotation(
-                        vpath, f, r, c, tw, th,
-                        label, rel,
-                        embedding=None,   # pure label-only never stores embeddings here
-                        crop_x=cx,
-                        crop_y=cy,
-                    )
-                except Exception as e:
-                    print(f"[Pipeline] Label Only: failed to save annotation: {e}")
+    def _advance_label_only_cursor(self, delta: int, stride: int, total_frames: int, tiles_per_frame: int = 30):
+        """Internal helper to move the labeling cursor (used by both normal flow and nav commands).
 
-            self.stats["tiles_processed"] = self.stats.get("tiles_processed", 0) + 1
-            if self.on_stats and (self.stats["tiles_processed"] % 5 == 0):
-                self.on_stats(self.stats.copy())
+        FIXED: Now performs proper carry/borrow using the real tiles_per_frame for the video
+        instead of the previous hardcoded >500 / 999 sentinels. This was the root cause of
+        the "re-running same frame", "tile 300", and failure to report/advance frames.
+        """
+        if tiles_per_frame < 1:
+            tiles_per_frame = 1
+
+        self._label_only_current_tile_idx += delta
+
+        # Carry/borrow across frames using the actual tile count (wraps tile_idx correctly)
+        while self._label_only_current_tile_idx < 0:
+            self._label_only_current_frame -= stride
+            self._label_only_current_tile_idx += tiles_per_frame
+
+        while self._label_only_current_tile_idx >= tiles_per_frame:
+            self._label_only_current_frame += stride
+            self._label_only_current_tile_idx -= tiles_per_frame
+
+        # Final safety clamps
+        if self._label_only_current_frame < 0:
+            self._label_only_current_frame = 0
+            self._label_only_current_tile_idx = 0
+        if self._label_only_current_frame >= total_frames:
+            self._label_only_current_frame = max(0, total_frames - 1)
+            self._label_only_current_tile_idx = max(0, tiles_per_frame - 1)
+
+        self._label_only_current_frame = max(0, min(self._label_only_current_frame, total_frames - 1))
+        self._label_only_current_tile_idx = max(0, self._label_only_current_tile_idx)
