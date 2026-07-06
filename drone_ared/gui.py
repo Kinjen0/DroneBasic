@@ -47,16 +47,41 @@ class LabelingDialog(tk.Toplevel):
 
     def __init__(self, master, request: LabelRequest, known_classes: List[str],
                  on_assign: callable, class_counts: Optional[Dict[str, int]] = None,
-                 ui_scale: float = 1.6, class_relevance: Optional[Dict[str, bool]] = None):
+                 ui_scale: float = 1.6, class_relevance: Optional[Dict[str, bool]] = None,
+                 allow_skip: bool = False,
+                 current_label: Optional[str] = None,
+                 current_relevant: bool = False):
+        """High-volume labeling dialog, now enhanced for efficient 'sparse' labeling sessions.
+
+        New parameters for the alternative labeling mode (efficient relevant-focused labeling):
+        - allow_skip: When True (Label Only / sparse mode), shows a prominent "Skip / Move On"
+          button. Clicking it means "do not assign a label to this tile right now".
+          This enables quickly labeling only relevant class instances (e.g. every person)
+          while skipping background tiles to save time on thousands of samples.
+          Skipped tiles stay unlabeled in the DB and will re-appear on resume (unless labeled later).
+        - current_label / current_relevant: When resuming in edit mode on an already-labeled tile,
+          pre-fill so the user sees what was previously chosen and can correct it or skip.
+
+        Skip is deliberately distinct from "Mark as Background":
+        - Background = explicit "__BACKGROUND__", relevant=False (still a label).
+        - Skip = no label written at all for this pass.
+
+        All paths still respect the global edit_mode for forcing re-labeling of known tiles.
+        """
         super().__init__(master)
         self.title("Review Queried Tile - A/RED Drone  [Persistent - reposition me once!]")
         self.current_req = request
-        self.on_assign = on_assign  # notification callback (refresh etc.), we do set_result ourselves
+        self.on_assign = on_assign
         self.class_counts = class_counts or {}
         self.known_classes = sorted(set(known_classes))
         self.ui_scale = float(ui_scale) if ui_scale else 1.6
         self._zoom_level = 1.0
-        self.class_relevance: dict[str, bool] = dict(class_relevance or {})  # class -> relevant (set at creation)
+        self.class_relevance: dict[str, bool] = dict(class_relevance or {})
+
+        # New for sparse/resume labeling mode
+        self.allow_skip = bool(allow_skip)
+        self.current_label = current_label
+        self.current_relevant = bool(current_relevant)
 
         # Larger default + fully resizable for high-res displays and comfort during long labeling sessions
         # Scale the dialog size with ui_scale for better defaults on large screens
@@ -78,10 +103,23 @@ class LabelingDialog(tk.Toplevel):
         self._refresh_class_list()
         self._update_info()
 
+        # If we were given a current label (edit/resume case in sparse label mode),
+        # try to pre-select it and set the relevant checkbox state.
+        if self.current_label:
+            self._apply_current_label_prefill()
+
         # Keyboard bindings for power users labeling many tiles
         self.bind("<Return>", lambda e: self._assign_selected())
-        self.bind("<Escape>", lambda e: self._assign_as_background())
         self.bind("<Control-n>", lambda e: self.new_entry.focus_set())
+
+        # Escape binding:
+        # - In sparse Label Only / resume mode (allow_skip=True): Escape = Skip / Move On
+        #   (makes high-volume relevant-only labeling much faster)
+        # - Otherwise: Escape = Mark as Background (original behavior)
+        if getattr(self, 'allow_skip', False):
+            self.bind("<Escape>", lambda e: self._skip_current())
+        else:
+            self.bind("<Escape>", lambda e: self._assign_as_background())
 
         # Focus the list so double-click / arrows work immediately
         self.after(150, lambda: self.class_list.focus_set())
@@ -207,6 +245,18 @@ class LabelingDialog(tk.Toplevel):
         bottom.pack(fill="x", padx=int(8*s), pady=pady_s)
 
         ttk.Button(bottom, text="Mark as Background / Irrelevant", command=self._assign_as_background).pack(side="left")
+
+        # "Skip / Move On" button - only shown in sparse / Label Only efficient mode.
+        # This is the key control for the alternative labeling workflow:
+        # - Click when the tile is not relevant / not worth labeling right now.
+        # - No entry is written to the DB for this tile.
+        # - On next resume (same or later session) the tile will be shown again
+        #   (unless you labeled it in the meantime via A/RED or another pass).
+        # - This lets you focus effort on relevant class instances for good Relevant Recall numbers
+        #   without exhaustively labeling every background tile immediately.
+        if getattr(self, 'allow_skip', False):
+            ttk.Button(bottom, text="Skip / Move On (no label)", command=self._skip_current).pack(side="left", padx=8)
+
         ttk.Button(bottom, text="Close Window (recreates on next query)", command=self._close_window).pack(side="right")
 
         # Status for the dialog
@@ -366,6 +416,36 @@ class LabelingDialog(tk.Toplevel):
                 f"Global #{gidx}")
         self.info_var.set(text)
 
+    def _apply_current_label_prefill(self):
+        """When resuming in edit mode on an already-labeled tile (sparse label mode),
+        pre-select the previous choice in the list and set the relevant checkbox.
+
+        This is crucial for the "resume" workflow the user requested:
+        - User can see what was labeled before.
+        - Can re-assign a corrected label.
+        - Or click "Skip / Move On" to leave the existing label untouched.
+        """
+        if not getattr(self, 'current_label', None):
+            return
+        try:
+            if self.current_label in self._filtered_classes:
+                idx = self._filtered_classes.index(self.current_label)
+                self.class_list.selection_clear(0, "end")
+                self.class_list.selection_set(idx)
+                self.class_list.see(idx)
+            else:
+                self.new_var.set(self.current_label)
+
+            if hasattr(self, 'relevant_var'):
+                self.relevant_var.set(self.current_relevant)
+
+            self.dialog_status_var.set(
+                f"EDIT: previous '{self.current_label}' (relevant={self.current_relevant}). "
+                "Re-assign or Skip to keep as-is."
+            )
+        except Exception as e:
+            print(f"[GUI Dialog] Could not pre-fill current label: {e}")
+
     # ---------------- Class list management ----------------
     def _refresh_class_list(self, filter_text: str = ""):
         self.class_list.delete(0, "end")
@@ -475,6 +555,30 @@ class LabelingDialog(tk.Toplevel):
         self.class_relevance["__BACKGROUND__"] = False
         self._assign("__BACKGROUND__", False)
 
+    def _skip_current(self):
+        """User explicitly chooses not to label this tile in the current pass.
+
+        - Does not write (or overwrite) anything in the TileAnnotationDB for this tile.
+        - Satisfies the LabelRequest so the worker can continue to the next tile.
+        - On resume the tile will be offered again (unless it gets labeled via A/RED query
+          or a future labeling pass).
+        - In edit mode this means "keep whatever was there before and move on".
+        """
+        print("[GUI Dialog] User chose SKIP / Move On for current tile.")
+        if getattr(self, 'current_req', None):
+            try:
+                self.current_req.set_skip()
+            except Exception:
+                pass
+            self.current_req = None
+        if self.on_assign:
+            try:
+                self.on_assign("__SKIPPED__", False)
+            except Exception:
+                pass
+        # Keep window open and ready for next tile
+        self._prepare_for_next(last_label="(skipped)", last_relevant=False)
+
     def _close_window(self):
         # User explicitly wants to close (will be recreated on next query if needed)
         # Satisfy the pending req so the worker does not hang forever waiting for a label.
@@ -501,11 +605,22 @@ class LabelingDialog(tk.Toplevel):
             self._assign(label, rel)
         # else: ignore accidental double-clicks on empty list area
 
-    def set_current_request(self, req, known_classes=None, class_counts=None, class_relevance=None):
-        """Update this persistent window for a new A/RED query without destroying/recreating it.
-        User can keep the window in a convenient screen position.
+    def set_current_request(self, req, known_classes=None, class_counts=None, class_relevance=None,
+                            allow_skip=None, current_label=None, current_relevant=None):
+        """Update this persistent window for a new tile (A/RED query or Label Only).
+
+        Extended for the alternative efficient labeling mode:
+        - allow_skip, current_label, current_relevant are forwarded so the Skip button
+          and pre-fill logic work when the window is reused.
         """
         self.current_req = req
+        if allow_skip is not None:
+            self.allow_skip = bool(allow_skip)
+        if current_label is not None:
+            self.current_label = current_label
+        if current_relevant is not None:
+            self.current_relevant = bool(current_relevant)
+
         if known_classes is not None:
             self.known_classes = sorted(set(known_classes))
         if class_counts is not None:
@@ -515,13 +630,27 @@ class LabelingDialog(tk.Toplevel):
             for k, v in class_relevance.items():
                 if k not in self.class_relevance:
                     self.class_relevance[k] = v
+
         self._load_and_show_image()
         filt = self.filter_var.get() if hasattr(self, 'filter_var') else ""
         self._refresh_class_list(filt)
         self._update_info()
         # Force immediate refresh of image for the new tile (after layout update)
         self.after(20, lambda: (self.update_idletasks(), self._display_image_on_canvas(), self.after(10, getattr(self, '_center_view', lambda: None))))
-        self.dialog_status_var.set("New A/RED query. Label this tile (select or create), then Assign.")
+
+        if getattr(self, 'allow_skip', False):
+            self.dialog_status_var.set(
+                "Label Only / sparse mode (resume). "
+                "Assign relevant class or press Escape / click 'Skip / Move On' to skip unlabeled tiles. "
+                "Already-labeled tiles are auto-skipped unless Edit Mode is on."
+            )
+        else:
+            self.dialog_status_var.set("New A/RED query. Label this tile (select or create), then Assign.")
+
+        # Re-apply prefill if we are editing a previously labeled tile
+        if getattr(self, 'current_label', None):
+            self._apply_current_label_prefill()
+
         self.lift()
         self.focus_force()
 
@@ -658,9 +787,9 @@ class MainWindow:
         ttk.Checkbutton(param_frame, text="Data Augmentation (rotate labeled tiles 3× + DINO re-embed)",
                         variable=self.aug_var).pack(anchor="w", pady=int(3*s))
 
-        # Label Only mode (for building reference datasets for metrics)
+        # Label Only mode — now with built-in resume/sparse support (the requested alternative)
         self.label_only_var = tk.BooleanVar(value=getattr(self.config.tile_annotations, "label_only_default", False))
-        ttk.Checkbutton(param_frame, text="Label Only Mode (no A/RED, no DINO — pure labeling for metrics)",
+        ttk.Checkbutton(param_frame, text="Label Only Mode (no A/RED, no DINO — pure labeling + Skip/Resume)",
                         variable=self.label_only_var).pack(anchor="w", pady=int(3*s))
         ttk.Button(param_frame, text="Review / Edit Past Labels...", command=self._open_review_window).pack(fill="x", pady=int(3*s))
         ttk.Button(param_frame, text="Save Annotation DB Now", command=self._save_tile_annotations).pack(fill="x")
@@ -1012,6 +1141,12 @@ class MainWindow:
             return
         self._last_queried_global = gidx
 
+        # Extract sparse labeling hints from the request (used by the alternative efficient label mode)
+        meta = getattr(req, 'meta', {}) or {}
+        allow_skip = bool(meta.get("allow_skip", False))
+        cur_label = meta.get("current_label")
+        cur_rel = bool(meta.get("current_relevant", False))
+
         # Gather current known classes from both store and ARED
         classes = []
         counts = {}
@@ -1020,6 +1155,22 @@ class MainWindow:
             counts.update(self.label_store.get_class_counts())
         if self.controller.ared_adapter:
             classes.extend(self.controller.ared_adapter.get_known_labels())
+
+        # Pull from TileAnnotationDB as well.
+        # This ensures that when using the efficient sparse labeling mode
+        # (label only relevant tiles + Skip the rest, resume by skipping already labeled),
+        # the classes are available for clicking in the next LabelingDialog
+        # without the user having to re-create them.
+        if hasattr(self.controller, 'get_labels_from_annotation_db'):
+            try:
+                for lbl in self.controller.get_labels_from_annotation_db():
+                    if lbl not in classes:
+                        classes.append(lbl)
+                    if lbl not in counts:
+                        counts[lbl] = counts.get(lbl, 0)
+            except Exception:
+                pass
+
         # Include GUI-assigned ones immediately (so new classes appear in the very next dialog)
         for lbl in getattr(self, 'discovered_classes', []):
             if lbl not in classes:
@@ -1039,20 +1190,36 @@ class MainWindow:
                     if rel is not None:
                         class_relevance[lbl] = rel
                         seeded = True
+                # Also seed from the exact annotation DB (important for sparse mode
+                # where we labeled relevant classes directly without going through
+                # the embedding label_store).
+                if not seeded and hasattr(self.controller, 'tile_db') and self.controller.tile_db:
+                    try:
+                        rel = self.controller.tile_db.get_class_relevance(lbl)
+                        if rel is not None:
+                            class_relevance[lbl] = rel
+                            seeded = True
+                    except Exception:
+                        pass
                 if not seeded:
                     class_relevance[lbl] = False
 
         def _assign_cb(label: str, relevant: bool):
-            # This is now purely notification / UI update.
-            # The dialog itself calls set_result on the req it holds.
+            # Notification / UI update path.
+            # For normal A/RED queries this records the class.
+            # For label-only sparse mode, if the label is the skip sentinel we just ignore it
+            # (the actual skip decision was already handled via req.skipped in the processor).
+            if label == "__SKIPPED__":
+                print("[GUI] Skip notification received (no class recorded).")
+                self._pending_label_request = None
+                return
             print(f"[GUI] Label SUBMITTED from dialog: '{label}' (relevant={relevant})")
             self._pending_label_request = None
             self.discovered_classes.add(label)
-            self.class_relevance[label] = relevant  # remember the relevance decided at (or for) this class
+            self.class_relevance[label] = relevant
             self._refresh_class_list()
             self.status_var.set(f"Last label assigned: {label} (relevant={relevant})")
             print("[GUI] Dialog back to WAITING state for next A/RED query (worker continues processing non-queried tiles in background).")
-            # After submit, the window is prepared with waiting status; it will only update again on next A/RED query req
 
         # Persistent window: create once, then update for new requests
         if not hasattr(self, '_labeling_win') or not self._labeling_win.winfo_exists():
@@ -1065,10 +1232,21 @@ class MainWindow:
                 class_counts=counts,
                 ui_scale=getattr(self, 'ui_scale', 1.6),
                 class_relevance=class_relevance,
+                allow_skip=allow_skip,
+                current_label=cur_label,
+                current_relevant=cur_rel,
             )
         else:
             print("[GUI] Updating existing persistent LabelingDialog with new query tile.")
-            self._labeling_win.set_current_request(req, known_classes=classes, class_counts=counts, class_relevance=class_relevance)
+            self._labeling_win.set_current_request(
+                req,
+                known_classes=classes,
+                class_counts=counts,
+                class_relevance=class_relevance,
+                allow_skip=allow_skip,
+                current_label=cur_label,
+                current_relevant=cur_rel,
+            )
 
     def _refresh_class_list(self):
         self.class_listbox.delete(0, "end")
@@ -1078,6 +1256,18 @@ class MainWindow:
         all_labels = set(counts.keys())
         if self.controller.ared_adapter:
             all_labels.update(self.controller.ared_adapter.get_known_labels())
+
+        # IMPORTANT for sparse/resume Label Only mode:
+        # Pull labels from the exact TileAnnotationDB so that classes labeled
+        # during an efficient "only label the relevant ones + Skip the rest" pass
+        # immediately appear in the clickable list. Without this, the user would
+        # have to re-type every class name after skipping many tiles.
+        if hasattr(self.controller, 'get_labels_from_annotation_db'):
+            try:
+                all_labels.update(self.controller.get_labels_from_annotation_db())
+            except Exception:
+                pass
+
         # Include ones we just assigned in the GUI (for immediate visibility on next queries)
         all_labels.update(getattr(self, 'discovered_classes', set()))
 
@@ -1090,6 +1280,16 @@ class MainWindow:
                     if rel is not None:
                         self.class_relevance[lbl] = rel
                         seeded = True
+                # Seed from exact DB for sparse mode (so [relevant] tags appear correctly
+                # for classes that were only labeled via the Skip/assign relevant workflow)
+                if not seeded and hasattr(self.controller, 'tile_db') and self.controller.tile_db:
+                    try:
+                        rel = self.controller.tile_db.get_class_relevance(lbl)
+                        if rel is not None:
+                            self.class_relevance[lbl] = rel
+                            seeded = True
+                    except Exception:
+                        pass
                 if not seeded:
                     self.class_relevance[lbl] = False
 
@@ -1137,7 +1337,7 @@ class MainWindow:
         self.stats_text.insert("1.0", text)
         self.stats_text.config(state="disabled")
 
-        if stats.get("tiles_processed", 0) % 15 == 0:
+        if stats.get("tiles_processed", 0) % 5 == 0 or stats.get("status") in ("finished", "stopped"):
             self._refresh_class_list()
 
         # Re-enable Start after a run ends so user can restart / load new videos without restarting the program

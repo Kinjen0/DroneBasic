@@ -201,6 +201,42 @@ class TileAnnotationDB:
         cur.execute("SELECT COUNT(*) FROM annotations")
         return cur.fetchone()[0]
 
+    def get_all_labels(self) -> List[str]:
+        """Return all unique labels that have been assigned in this DB.
+
+        Critical for sparse/resume Label Only mode:
+        When the user quickly labels only the relevant tiles (e.g. every "person")
+        and skips the rest, those class names must still appear in the main GUI's
+        "Discovered Classes" list so they can be clicked instead of re-typed on
+        subsequent tiles.
+        """
+        try:
+            cur = self.conn.cursor()
+            cur.execute("SELECT DISTINCT label FROM annotations ORDER BY label")
+            return [row[0] for row in cur.fetchall()]
+        except Exception:
+            return []
+
+    def get_class_relevance(self, label: str) -> Optional[bool]:
+        """Return the relevant flag for a class if it was previously assigned
+        via this exact annotation DB.
+        Used to show the [relevant] tag in class lists during resume/sparse labeling
+        even when the embedding label_store was not used.
+        """
+        try:
+            cur = self.conn.cursor()
+            cur.execute("""
+                SELECT relevant FROM annotations
+                WHERE label = ?
+                LIMIT 1
+            """, (label,))
+            row = cur.fetchone()
+            if row is not None:
+                return bool(row[0])
+        except Exception:
+            pass
+        return None
+
     def delete_annotation(self, video_path: str, abs_frame: int, tile_row: int, tile_col: int,
                           tile_width: int, tile_height: int) -> bool:
         """Remove a specific annotation (rarely needed)."""

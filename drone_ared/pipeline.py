@@ -42,18 +42,35 @@ from . import metrics as ared_metrics   # Query Precision / Relevant Recall (see
 
 
 class LabelRequest:
-    """Message sent to GUI when ARED needs a human decision."""
-    __slots__ = ("tile", "embedding", "meta", "response_event", "result")
+    """Message sent to GUI when a label is needed (either from A/RED query or Label Only mode).
+
+    Supports:
+    - Normal labeling for A/RED.
+    - "Label Only" / sparse labeling sessions.
+    - Skip / Move On without labeling (for efficient relevant-focused labeling to support metrics).
+    - Edit / resume: pre-filling current label when tile already exists in DB.
+    """
+    __slots__ = ("tile", "embedding", "meta", "response_event", "result", "skipped")
 
     def __init__(self, tile: Tile, embedding: np.ndarray, meta: Dict):
         self.tile = tile
         self.embedding = embedding
-        self.meta = meta
+        self.meta = meta or {}
         self.response_event = threading.Event()
-        self.result: Optional[tuple[str, bool]] = None   # filled by GUI
+        self.result: Optional[tuple[str, bool]] = None   # (label, relevant) or None
+        self.skipped: bool = False   # True if user chose "Skip / Move On" without assigning
 
-    def set_result(self, label: str, relevant: bool):
-        self.result = (label, relevant)
+    def set_result(self, label: Optional[str], relevant: bool = False):
+        """Set a normal label result. label may be None only for internal cases."""
+        self.result = (label, relevant) if label is not None else None
+        self.response_event.set()
+
+    def set_skip(self):
+        """User chose to move on without labeling this tile (saves effort for large sets).
+        The tile remains unlabeled in the DB (unless it already had a label).
+        """
+        self.skipped = True
+        self.result = None
         self.response_event.set()
 
     def wait(self, timeout: Optional[float] = None) -> Optional[tuple[str, bool]]:
@@ -221,6 +238,16 @@ class DroneAREDController:
         """Return list of stable tile identities that A/RED actually queried in this run.
         Used for computing Query Precision and Relevant Recall (see A/RED papers)."""
         return list(self.queried_identities)
+
+    def get_labels_from_annotation_db(self) -> List[str]:
+        """Return unique labels from the exact TileAnnotationDB.
+        This populates the main GUI "Discovered Classes" list with classes
+        that were labeled during sparse/resume Label Only sessions (even if
+        we only labeled the relevant ones and skipped most tiles).
+        """
+        if self.tile_db:
+            return self.tile_db.get_all_labels()
+        return []
 
     def compute_metrics_for_video(self, video_path: str) -> Dict[str, Any]:
         """Compute Query Precision / Relevant Recall using current DB labels + logged queries.
@@ -584,18 +611,37 @@ class DroneAREDController:
             traceback.print_exc()
 
     def _process_label_only_tiles(self, tiles: List[Tile], video_path: str):
-        """Pure labeling path (no DINO, no A/RED).
+        """Pure labeling path (no DINO, no A/RED) with resume / sparse support.
 
-        Every tile is shown to the user via the normal high-volume labeling dialog.
-        Labels are saved immediately to the exact TileAnnotationDB with full identity.
-        This mode is designed to efficiently build reference labeled datasets
-        needed to compute Query Precision and Relevant Recall as defined in the
-        A/RED papers (IJSC_2026, SPIE_IVSP_2026).
+        This is the "alternative" efficient labeling mode for metrics-focused work.
+
+        Key behaviors (designed for large numbers of tiles and Relevant Recall measurement):
+        - Checks the exact TileAnnotationDB first.
+        - If the tile already has a label:
+            - If edit_mode is False: automatically skip (resume support). We do not re-show.
+            - If edit_mode is True: show the dialog pre-filled so user can correct or explicitly skip.
+        - For tiles without a label (or in edit): show dialog.
+        - Dialog provides:
+            - Normal label assignment (including "relevant" flag).
+            - "Skip / Move On" : do not assign anything now. Tile stays unlabeled in DB.
+              This lets you quickly label only the relevant class instances (e.g. every "person")
+              and defer background / normal tiles.
+        - Unlabeled tiles (never assigned or previously skipped) will be shown again on resume
+          unless you labeled them.
+        - All decisions are saved with full identity so metrics (QP/RR) and future A/RED runs
+          can use them perfectly, even across different frame strides.
+        - Integrates with global edit_mode for corrections.
+
+        This directly supports the metric definitions in the papers:
+        Relevant Recall requires knowing (and not missing) instances of relevant classes.
+        You can do a fast pass labeling only the relevant ones, then compute metrics
+        against A/RED's query decisions.
         """
         if not tiles:
             return
         if self.tile_db is None:
-            print("[Pipeline] Label Only mode: No tile_db configured. Labels will not be saved.")
+            print("[Pipeline] Label Only mode: No tile_db configured. Labels will not be saved. "
+                  "All tiles will be treated as new.")
 
         for tile in tiles:
             if self._stop_event.is_set():
@@ -606,19 +652,49 @@ class DroneAREDController:
             if self._stop_event.is_set():
                 break
 
-            print(f"[Pipeline] Label Only: requesting label for frame={tile.frame_idx} r={tile.tile_row} c={tile.tile_col}")
+            vpath = video_path
+            f = tile.frame_idx
+            r = tile.tile_row
+            c = tile.tile_col
+            tw = tile.width
+            th = tile.height
 
-            # Always request a human label (no cache bypass in this mode by default)
+            # === Resume / sparse logic ===
+            existing = None
+            if self.tile_db is not None:
+                try:
+                    existing = self.tile_db.lookup(vpath, f, r, c, tw, th)
+                except Exception:
+                    existing = None
+
+            if existing and not self.edit_mode:
+                # Already labeled in a previous session (or earlier in this run).
+                # Skip automatically to save effort. This is the core of "resume".
+                print(f"[Pipeline] Label Only: already labeled as '{existing[0]}' (relevant={existing[1]}). Skipping.")
+                self.stats["tiles_processed"] = self.stats.get("tiles_processed", 0) + 1
+                continue
+
+            if existing and self.edit_mode:
+                print(f"[Pipeline] Label Only (EDIT): re-showing already labeled tile '{existing[0]}' for correction.")
+
+            print(f"[Pipeline] Label Only: requesting label/skip for frame={f} r={r} c={c} "
+                  f"({'edit' if self.edit_mode else 'new/resume'})")
+
+            # Build request. We pass "label_only" and "allow_skip" so the GUI knows
+            # to show the Skip button and pre-fill if we have an existing label.
             req = LabelRequest(tile=tile, embedding=np.zeros(1, dtype=np.float32), meta={
-                "video_path": video_path,
-                "frame": tile.frame_idx,
-                "abs_frame": tile.frame_idx,
-                "row": tile.tile_row,
-                "col": tile.tile_col,
-                "tile_width": tile.width,
-                "tile_height": tile.height,
+                "video_path": vpath,
+                "frame": f,
+                "abs_frame": f,
+                "row": r,
+                "col": c,
+                "tile_width": tw,
+                "tile_height": th,
                 "bbox": tile.bbox,
                 "label_only": True,
+                "allow_skip": True,                    # enables Skip button in dialog
+                "current_label": existing[0] if existing else None,
+                "current_relevant": existing[1] if existing else False,
             })
             self._current_label_req = req
             try:
@@ -631,27 +707,33 @@ class DroneAREDController:
             result = req.wait(timeout=300)
             self._current_label_req = None
 
-            if result is None:
-                print("[Pipeline] Label Only: timeout on label")
+            if getattr(req, 'skipped', False) or result is None:
+                # User explicitly chose "Skip / Move On" or timeout.
+                # Do NOT write anything to DB. Tile remains unlabeled for future passes.
+                print(f"[Pipeline] Label Only: skipped (no label written).")
+                self.stats["tiles_processed"] = self.stats.get("tiles_processed", 0) + 1
+                if self.on_stats and (self.stats["tiles_processed"] % 5 == 0):
+                    self.on_stats(self.stats.copy())
                 continue
 
             label, rel = result
+            if not label or label == "__SKIP__":
+                # Defensive: treat as skip
+                print(f"[Pipeline] Label Only: no label returned, treated as skip.")
+                self.stats["tiles_processed"] = self.stats.get("tiles_processed", 0) + 1
+                continue
+
             print(f"[Pipeline] Label Only: labeled as '{label}' (relevant={rel})")
 
-            # Save to exact DB (the whole point of this mode)
+            # Save (or overwrite in edit mode) to the exact DB.
+            # This is what enables both resume and accurate metrics.
             if self.tile_db is not None:
                 try:
                     cx, cy = tile.bbox[0], tile.bbox[1]
                     self.tile_db.set_annotation(
-                        video_path,
-                        tile.frame_idx,
-                        tile.tile_row,
-                        tile.tile_col,
-                        tile.width,
-                        tile.height,
-                        label,
-                        rel,
-                        embedding=None,   # no embedding in pure label-only
+                        vpath, f, r, c, tw, th,
+                        label, rel,
+                        embedding=None,   # pure label-only never stores embeddings here
                         crop_x=cx,
                         crop_y=cy,
                     )
