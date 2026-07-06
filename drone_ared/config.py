@@ -126,6 +126,9 @@ class TileAnnotationConfig:
     # so the user can correct mistakes. Normal runs auto-apply saved exact labels.
     edit_mode_default: bool = False
 
+    # New: support for pure labeling sessions (no A/RED, no DINO)
+    label_only_default: bool = False
+
 
 @dataclass
 class ModelSaveConfig:

@@ -657,6 +657,11 @@ class MainWindow:
         self.aug_var = tk.BooleanVar(value=getattr(self.config.ared, "data_augmentation_enabled", False))
         ttk.Checkbutton(param_frame, text="Data Augmentation (rotate labeled tiles 3× + DINO re-embed)",
                         variable=self.aug_var).pack(anchor="w", pady=int(3*s))
+
+        # Label Only mode (for building reference datasets for metrics)
+        self.label_only_var = tk.BooleanVar(value=getattr(self.config.tile_annotations, "label_only_default", False))
+        ttk.Checkbutton(param_frame, text="Label Only Mode (no A/RED, no DINO — pure labeling for metrics)",
+                        variable=self.label_only_var).pack(anchor="w", pady=int(3*s))
         ttk.Button(param_frame, text="Review / Edit Past Labels...", command=self._open_review_window).pack(fill="x", pady=int(3*s))
         ttk.Button(param_frame, text="Save Annotation DB Now", command=self._save_tile_annotations).pack(fill="x")
         ttk.Button(param_frame, text="Load different Annotation DB...", command=self._load_tile_annotations).pack(fill="x")
@@ -713,6 +718,7 @@ class MainWindow:
             self.config.tile_annotations.db_path = getattr(self, "_tile_ann_db_var").get()
             self.config.tile_annotations.edit_mode_default = self.edit_mode_var.get()
             self.config.ared.data_augmentation_enabled = self.aug_var.get()
+            self.config.tile_annotations.label_only_default = self.label_only_var.get()
         except Exception as e:
             messagebox.showerror("Params", f"Bad parameter value: {e}")
 
@@ -757,11 +763,19 @@ class MainWindow:
         # Data augmentation flag
         self.config.ared.data_augmentation_enabled = self.aug_var.get()
 
+        # Label Only mode
+        label_only = self.label_only_var.get()
+        self.controller.set_label_only_mode(label_only)
+
+        # If label only, we can skip heavy DINO loading in the controller (it will check the flag)
         self.controller.update_config(self.config)
         self.controller.start()
 
         self.start_btn.config(state="disabled")
-        self.status_var.set("Processing... (use Pause / Stop)")
+        if getattr(self.controller, 'label_only_mode', False):
+            self.status_var.set("Label Only Mode — labeling every tile (no A/RED). Use Pause/Stop when done.")
+        else:
+            self.status_var.set("Processing... (use Pause / Stop)")
 
     def _stop(self):
         """Stop the worker and re-enable Start so the user can restart without restarting the whole program."""

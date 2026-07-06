@@ -106,6 +106,11 @@ class DroneAREDController:
         # When True, even tiles with previous exact labels will be shown to the user for correction
         self.edit_mode: bool = False
 
+        # "Label Only" mode: pure human labeling (no DINO, no A/RED).
+        # Perfect for building reference labeled datasets needed for performance metrics
+        # (Query Precision / Relevant Recall as defined in the A/RED papers).
+        self.label_only_mode: bool = False
+
         # Callback the GUI can register to receive periodic status updates
         self.on_stats: Optional[Callable[[Dict], None]] = None
 
@@ -200,6 +205,11 @@ class DroneAREDController:
         self.edit_mode = bool(enabled)
         print(f"[Controller] Edit mode = {self.edit_mode}")
 
+    def set_label_only_mode(self, enabled: bool):
+        """Pure labeling mode: every tile is shown for labeling, no A/RED or DINO involved."""
+        self.label_only_mode = bool(enabled)
+        print(f"[Controller] Label Only mode = {self.label_only_mode}")
+
     def update_config(self, new_config: PipelineConfig):
         """Apply new parameters for the *next* start()."""
         self.config = new_config
@@ -219,22 +229,28 @@ class DroneAREDController:
             stride_y=tcfg.stride_y,
         )
 
-        fcfg = self.config.features
-        self.feature_extractor = DINOFeatureExtractor(
-            model_name=fcfg.model_name,
-            device=fcfg.device,
-            normalize=fcfg.normalize,
-            pooling=fcfg.pooling,
-            batch_size=fcfg.batch_size,
-        )
-        self._last_feature_extractor = self.feature_extractor
+        if not self.label_only_mode:
+            fcfg = self.config.features
+            self.feature_extractor = DINOFeatureExtractor(
+                model_name=fcfg.model_name,
+                device=fcfg.device,
+                normalize=fcfg.normalize,
+                pooling=fcfg.pooling,
+                batch_size=fcfg.batch_size,
+            )
+            self._last_feature_extractor = self.feature_extractor
+        else:
+            self.feature_extractor = None
+            self._last_feature_extractor = None
 
-        if create_ared or self.ared_adapter is None:
+        if (create_ared or self.ared_adapter is None) and not self.label_only_mode:
             self.ared_adapter = AREDAdapter(self.config.ared)
             if self.label_store:
                 self.ared_adapter.set_label_store(self.label_store)
             if self.feature_extractor:
                 self.ared_adapter.set_feature_extractor(self.feature_extractor)
+        elif self.label_only_mode:
+            self.ared_adapter = None
 
         # (Re)wire provider every time (the closure must see current stores etc.)
         def _gui_label_provider(emb: np.ndarray, tile_img: Any, meta: Dict):
@@ -423,7 +439,13 @@ class DroneAREDController:
                     if not tiles:
                         continue
 
-                    # Collect for batched feature extraction
+                    if self.label_only_mode:
+                        # Pure labeling mode: no DINO, no A/RED.
+                        # Every tile (at stride) is presented for human labeling and saved.
+                        self._process_label_only_tiles(tiles, video_path)
+                        continue
+
+                    # Normal A/RED path: Collect for batched feature extraction
                     for t in tiles:
                         batch_tiles.append(t)
                         batch_imgs.append(t.image)
@@ -509,3 +531,82 @@ class DroneAREDController:
             print(f"[Pipeline] ERROR in _process_batch: {e}")
             import traceback
             traceback.print_exc()
+
+    def _process_label_only_tiles(self, tiles: List[Tile], video_path: str):
+        """Pure labeling path (no DINO, no A/RED).
+
+        Every tile is shown to the user via the normal high-volume labeling dialog.
+        Labels are saved immediately to the exact TileAnnotationDB with full identity.
+        This mode is designed to efficiently build reference labeled datasets
+        needed to compute Query Precision and Relevant Recall as defined in the
+        A/RED papers (IJSC_2026, SPIE_IVSP_2026).
+        """
+        if not tiles:
+            return
+        if self.tile_db is None:
+            print("[Pipeline] Label Only mode: No tile_db configured. Labels will not be saved.")
+
+        for tile in tiles:
+            if self._stop_event.is_set():
+                break
+
+            # Pause support
+            self._pause_event.wait()
+            if self._stop_event.is_set():
+                break
+
+            print(f"[Pipeline] Label Only: requesting label for frame={tile.frame_idx} r={tile.tile_row} c={tile.tile_col}")
+
+            # Always request a human label (no cache bypass in this mode by default)
+            req = LabelRequest(tile=tile, embedding=np.zeros(1, dtype=np.float32), meta={
+                "video_path": video_path,
+                "frame": tile.frame_idx,
+                "abs_frame": tile.frame_idx,
+                "row": tile.tile_row,
+                "col": tile.tile_col,
+                "tile_width": tile.width,
+                "tile_height": tile.height,
+                "bbox": tile.bbox,
+                "label_only": True,
+            })
+            self._current_label_req = req
+            try:
+                self.label_request_queue.put(req, timeout=5)
+            except queue.Full:
+                self._current_label_req = None
+                print("[Pipeline] Label Only: queue full, skipping tile")
+                continue
+
+            result = req.wait(timeout=300)
+            self._current_label_req = None
+
+            if result is None:
+                print("[Pipeline] Label Only: timeout on label")
+                continue
+
+            label, rel = result
+            print(f"[Pipeline] Label Only: labeled as '{label}' (relevant={rel})")
+
+            # Save to exact DB (the whole point of this mode)
+            if self.tile_db is not None:
+                try:
+                    cx, cy = tile.bbox[0], tile.bbox[1]
+                    self.tile_db.set_annotation(
+                        video_path,
+                        tile.frame_idx,
+                        tile.tile_row,
+                        tile.tile_col,
+                        tile.width,
+                        tile.height,
+                        label,
+                        rel,
+                        embedding=None,   # no embedding in pure label-only
+                        crop_x=cx,
+                        crop_y=cy,
+                    )
+                except Exception as e:
+                    print(f"[Pipeline] Label Only: failed to save annotation: {e}")
+
+            self.stats["tiles_processed"] = self.stats.get("tiles_processed", 0) + 1
+            if self.on_stats and (self.stats["tiles_processed"] % 5 == 0):
+                self.on_stats(self.stats.copy())
