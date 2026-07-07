@@ -903,14 +903,24 @@ class MainWindow:
 
         # --- Metrics box (Query Precision + Relevant Recall as defined in the A/RED papers) ---
         # See IJSC_2026-1.pdf and SPIE_IVSP_2026.pdf for exact definitions.
+        # Scrollable so the full expanded audit is readable.
         metrics_frame = ttk.LabelFrame(right, text="Metrics (Query Precision / Relevant Recall)")
         metrics_frame.pack(fill="x", pady=(int(6*s), 0))
 
-        self.metrics_text = tk.Text(metrics_frame, height=5, width=int(60 * min(s, 1.5)), state="disabled",
-                                    font=("TkDefaultFont", int(11*s)), bg="#f8f8f8")
-        self.metrics_text.pack(fill="x", padx=4, pady=4)
+        # Container + vertical scrollbar for the (potentially very long) detailed audit
+        text_container = ttk.Frame(metrics_frame)
+        text_container.pack(fill="x", padx=4, pady=4)
+
+        self.metrics_text = tk.Text(text_container, height=12, width=int(75 * min(s, 1.5)), state="disabled",
+                                    wrap="word", font=("TkDefaultFont", int(10*s)), bg="#f8f8f8")
+        self.metrics_text.pack(side="left", fill="both", expand=True)
+
+        ysb = ttk.Scrollbar(text_container, orient="vertical", command=self.metrics_text.yview)
+        ysb.pack(side="right", fill="y")
+        self.metrics_text.configure(yscrollcommand=ysb.set)
+
         self.metrics_text.insert("1.0", "Click 'Compute from DB (last video)' after a run.\n"
-                                        "QP / RR as defined in IJSC_2026-1.pdf & SPIE_IVSP_2026.pdf")
+                                        "EXPANDED + SCROLLABLE: every datapoint - total person tiles, person tiles queried, total A/RED queries (caches count as user queries), full work for QP/RR.")
         self.metrics_text.config(state="disabled")
 
         btn_row = ttk.Frame(metrics_frame)
@@ -919,6 +929,7 @@ class MainWindow:
         ttk.Button(btn_row, text="Clear", command=self._clear_metrics_display).pack(side="left", padx=4)
 
         self._last_metrics: Dict[str, Any] = {}
+        self._metrics_auto_updated = False
 
         classes_frame = ttk.LabelFrame(right, text="Discovered Classes (from current + cache)")
         classes_frame.pack(fill="both", expand=True, pady=(int(6*s), 0))
@@ -1020,6 +1031,8 @@ class MainWindow:
             self.status_var.set("Label Only Mode — labeling every tile (no A/RED). Use Pause/Stop when done.")
         else:
             self.status_var.set("Processing... (use Pause / Stop)")
+
+        self._metrics_auto_updated = False
 
     def _stop(self):
         """Stop the worker and re-enable Start so the user can restart without restarting the whole program."""
@@ -1137,45 +1150,109 @@ class MainWindow:
     def _clear_metrics_display(self):
         self._last_metrics = {}
         if hasattr(self, 'metrics_text'):
-            self.metrics_text.config(state="normal")
-            self.metrics_text.delete("1.0", "end")
-            self.metrics_text.insert("1.0", "No metrics computed yet.\nRun A/RED (with DB labels) or use the button.")
-            self.metrics_text.config(state="disabled")
+            self._set_metrics_content("No metrics computed yet.\nRun A/RED (with DB labels) or use the button.")
 
     def _display_metrics_error(self, msg: str):
         if hasattr(self, 'metrics_text'):
-            self.metrics_text.config(state="normal")
-            self.metrics_text.delete("1.0", "end")
-            self.metrics_text.insert("1.0", f"Error: {msg}")
-            self.metrics_text.config(state="disabled")
+            self._set_metrics_content(f"Error: {msg}")
+
+    def _set_metrics_content(self, content: str):
+        """Update metrics Text while preserving current scroll position as best as possible.
+        This stops the view from jumping back to the top on every refresh."""
+        if not hasattr(self, 'metrics_text'):
+            return
+        try:
+            yview = self.metrics_text.yview()
+            top_frac = yview[0] if yview else 0.0
+        except Exception:
+            top_frac = 0.0
+
+        self.metrics_text.config(state="normal")
+        self.metrics_text.delete("1.0", "end")
+        self.metrics_text.insert("1.0", content)
+        self.metrics_text.config(state="disabled")
+
+        try:
+            self.metrics_text.yview_moveto(top_frac)
+        except Exception:
+            pass
 
     def _refresh_metrics_display(self, result: Dict[str, Any]):
         if not hasattr(self, 'metrics_text'):
             return
         lines = [
+            "========== FULL A/RED METRICS AUDIT (EVERY SINGLE DATAPOINT) ==========",
             f"Video: {result.get('video', '?')}",
-            f"Query Precision (QP): {result.get('query_precision', 0):.4f}",
-            f"Relevant Recall (RR): {result.get('relevant_recall', 0):.4f}",
-            f"Queries: {result.get('n_actual_queries', 0)} / {result.get('total_points', 0)}",
-            f"vs Random ≈ {result.get('baseline_random_query_precision_approx', 0):.4f}",
-            result.get('summary', '')
+            f"QP: {result.get('query_precision', 0):.4f}    RR (over relevant only): {result.get('relevant_recall', 0):.4f}",
+            f"Total queries A/RED made (CACHE QUERIES COUNT AS USER QUERIES): {result.get('ared_queries_made', result.get('n_actual_queries', 0))}",
+            f"Total stream tiles seen: {result.get('total_stream_tiles', result.get('total_points', 0))}",
+            f"Total labeled (people-tagged) tiles in DB: {result.get('n_labeled', 0)}",
+            "---------------------------------------------------------------------",
         ]
-        self.metrics_text.config(state="normal")
-        self.metrics_text.delete("1.0", "end")
-        self.metrics_text.insert("1.0", "\n".join(lines))
-        self.metrics_text.config(state="disabled")
+
+        audit = result.get("detailed_breakdown") or result.get("audit", {})
+        if audit:
+            lines.append("1. CORE COUNTS (what you asked for):")
+            lines.append(f"   TOTAL_TILES_ACTUALLY_SENT_TO_ARED          = {audit.get('TOTAL_TILES_ACTUALLY_SENT_TO_ARED_THIS_RUN', '?')}")
+            lines.append(f"   TOTAL_PERSON_TILES (people tiles)          = {audit.get('TOTAL_PERSON_TILES', audit.get('total_person_tiles', '?'))}")
+            lines.append(f"   TOTAL_PERSON_TILES_QUERIED                 = {audit.get('TOTAL_PERSON_TILES_QUERIED', audit.get('total_person_tiles_queried', '?'))}")
+            lines.append(f"   TOTAL_QUERIES_ARED_MADE (incl. all cache)  = {audit.get('TOTAL_QUERIES_ARED_MADE', result.get('ared_queries_made', '?'))}")
+            lines.append(f"   TOTAL_LABELED_TILES_IN_DB                  = {audit.get('TOTAL_LABELED_TILES_IN_DB', result.get('n_labeled', '?'))}")
+            lines.append(f"   TOTAL_RELEVANT_TILES                       = {audit.get('TOTAL_RELEVANT_TILES', '?')}")
+            lines.append(f"   TOTAL_RELEVANT_TILES_QUERIED               = {audit.get('TOTAL_RELEVANT_TILES_QUERIED', '?')}")
+            lines.append("")
+            lines.append("2. PER-CLASS HUMAN TAGGED (from DB annotations):")
+            for lab, cnt in sorted((audit.get("CLASS_COUNTS") or {}).items(), key=lambda x: -x[1]):
+                r = (audit.get("RELEVANT_CLASS_COUNTS") or {}).get(lab, 0)
+                lines.append(f"   {lab}: {cnt} total labeled ({r} relevant)")
+            lines.append("")
+            lines.append("3. FIRST OCCURRENCES (new-class positives part of should):")
+            for lab, fr in sorted((audit.get("FIRST_OCCURRENCE_BY_CLASS") or {}).items(), key=lambda x:x[1]):
+                lines.append(f"   {lab} first seen at frame {fr}")
+            lines.append("")
+            lines.append("4. SHOULD_QUERY GT POSITIVES (paper definition):")
+            lines.append(f"   N_SHOULD_QUERY_TOTAL = {audit.get('N_SHOULD_QUERY_TOTAL', audit.get('should_query_total', '?'))}")
+            lines.append(f"   N_FIRST_OF_CLASS     = {audit.get('N_FIRST_OF_CLASS', '?')}")
+            lines.append(f"   N_RELEVANT_SHOULD    = {audit.get('RELEVANT_SHOULD_POSITIVES', '?')}")
+            lines.append("   (Note: PERSON is treated as a relevant class; only relevant counts are used for core metrics)")
+            lines.append("")
+            lines.append("5. A/RED QUERY OUTCOMES:")
+            lines.append(f"   TP (queried + should) = {result.get('tp', audit.get('TP', '?'))}")
+            lines.append(f"   FP (queried but !should) = {result.get('fp', audit.get('FP', '?'))}")
+            lines.append(f"   FN (should but !queried) = {result.get('fn', audit.get('FN', '?'))}")
+            lines.append("")
+            lines.append("6. EXACT CALCULATIONS (all work shown):")
+            lines.append(f"   QP = TP / (TP + FP)   --> {result.get('query_precision', 0)}")
+            lines.append(f"   RR = TP / (TP + FN)   --> {result.get('relevant_recall', 0)}")
+            lines.append(f"   (Cache-satisfied A/RED decisions are included in the query count above.)")
+            lines.append("")
+            bl = audit.get("RANDOM_BASELINE", {})
+            lines.append("7. RANDOM BASELINE (from papers at same query count):")
+            lines.append(f"   approx QP = relevant_rate = {bl.get('relevant_rate', '?')}")
+
+        if "summary" in result:
+            lines.append("")
+            lines.append(result["summary"])
+        lines.append("======================================================================")
+        lines.append("Data sources: DB annotations (human labels) + A/RED decision log (pipeline.queried_identities + stats['ared_queries']). See metrics.py + SPIE_IVSP_2026 / IJSC_2026-1.")
+
+        content = "\n".join(lines)
+        self._set_metrics_content(content)
 
     def _update_metrics_on_finish(self):
         """Called when a run finishes. Tries to auto-compute using the last video + DB."""
         if getattr(self.controller, 'label_only_mode', False):
             # In pure label-only we have no A/RED queries, so just show stats
+            n_l = self.controller.stats.get("tiles_processed", 0)
             self._refresh_metrics_display({
                 "video": self.controller.stats.get("current_video", "?"),
                 "query_precision": 0.0,
                 "relevant_recall": 0.0,
                 "n_actual_queries": 0,
-                "total_points": self.stats.get("tiles_processed", 0),
-                "summary": "Label Only run — no A/RED queries. Use 'Compute from DB' after labeling."
+                "total_points": n_l,
+                "n_labeled": n_l,
+                "summary": "Label Only run — every tile was presented for human labeling (no A/RED query decisions). All labels are direct people-tagged.",
+                "audit": {"total_annotations_in_db": n_l, "first_of_class_count": "N/A (full labeling)", "relevant_tiles_count": "see DB", "should_query_total": "N/A"}
             })
             return
 
@@ -1520,8 +1597,8 @@ class MainWindow:
         text = (
             f"Status: {stats.get('status', '?')}   Video: {stats.get('current_video', '')}\n"
             f"Frames: {stats.get('frames_read', 0)}   Tiles: {stats.get('tiles_processed', 0)}\n"
-            f"User labels needed: {stats.get('user_queries', 0)}   "
-            f"Cache auto-labels: {stats.get('cache_hits', 0)}\n"
+            f"User labels needed (ARED queries): {stats.get('ared_queries', stats.get('user_queries', 0))}   "
+            f"Cache hits: {stats.get('cache_hits', 0)}   Actual human dialogs this run: {stats.get('user_queries', 0)}\n"
             f"ARED clusters: {stats.get('ared_clusters', '?')}   Known labels: {stats.get('ared_known_labels', '?')}"
         )
         self.stats_text.config(state="normal")
@@ -1540,9 +1617,12 @@ class MainWindow:
             elif status in ("running", "paused"):
                 self.start_btn.config(state="disabled")
 
-        # Auto-show metrics box when processing finishes (at end of video)
-        if status in ("finished", "stopped"):
+        # Auto-show metrics box when processing finishes (at end of video).
+        # Guard so it only happens once; otherwise the repeated poller would
+        # keep calling _refresh which deletes+inserts and jumps the scroll view to top.
+        if status in ("finished", "stopped") and not getattr(self, '_metrics_auto_updated', False):
             self._update_metrics_on_finish()
+            self._metrics_auto_updated = True
 
 
 # =============================================================================

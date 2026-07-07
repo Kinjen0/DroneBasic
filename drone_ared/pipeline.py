@@ -101,8 +101,9 @@ class DroneAREDController:
         self.stats: Dict[str, Any] = {
             "frames_read": 0,
             "tiles_processed": 0,
-            "user_queries": 0,   # times we actually popped the GUI (real human work)
-            "cache_hits": 0,     # auto-labeled from previous sessions / earlier in run
+            "ared_queries": 0,   # A/RED decided a label was needed for this point (the "queries" for QP/RR and user labels needed). Cache may satisfy without GUI.
+            "user_queries": 0,   # times we actually popped the GUI (real human dialog this session)
+            "cache_hits": 0,     # auto-labeled from previous sessions / earlier in run (embedding cache)
             "ared_clusters": 0,
             "ared_known_labels": 0,
             "current_video": "",
@@ -132,6 +133,10 @@ class DroneAREDController:
         # Live collection of tiles that A/RED actually decided to query (stable identities).
         # Populated during normal runs. Used by metrics.py for QP / RR calculation.
         self.queried_identities: List[Tuple] = []
+
+        # All tiles actually sent to / processed by A/RED in this run (for accurate "should" computation
+        # over only the tiles that were actually presented to the algorithm).
+        self.processed_identities: List[Tuple] = []
 
         # ------------------------------------------------------------------
         # Label Only navigation state (back/forward/jump)
@@ -166,9 +171,11 @@ class DroneAREDController:
         self._global_tile_counter = 0
         self.stats["tiles_processed"] = 0
         self.stats["frames_read"] = 0
+        self.stats["ared_queries"] = 0
         self.stats["user_queries"] = 0
         self.stats["cache_hits"] = 0
         self.queried_identities = []
+        self.processed_identities = []
 
         # Create components. We pass create_ared=False if we already have one (from Load ARED).
         create_ared = (self.ared_adapter is None)
@@ -248,8 +255,15 @@ class DroneAREDController:
 
     def get_queried_identities(self) -> List[Tuple]:
         """Return list of stable tile identities that A/RED actually queried in this run.
-        Used for computing Query Precision and Relevant Recall (see A/RED papers)."""
+        Used for computing Query Precision and Relevant Recall (see A/RED papers).
+        Note: cache-satisfied decisions are included (treated as user queries per requirements)."""
         return list(self.queried_identities)
+
+    def get_processed_identities(self) -> List[Tuple]:
+        """Return list of *all* tile identities that were sent to A/RED in this run.
+        Used so that metric 'should_query' positives (firsts + relevant) only count
+        tiles/classes that were actually presented to A/RED (not extra labels from other sessions)."""
+        return list(self.processed_identities)
 
     def get_labels_from_annotation_db(self) -> List[str]:
         """Return unique labels from the exact TileAnnotationDB.
@@ -315,11 +329,26 @@ class DroneAREDController:
             return {"error": f"No annotations for {video_path}"}
 
         queried = self.get_queried_identities()
-        total = len(anns)
+        processed = self.get_processed_identities()
+        labeled_total = len(anns)
 
-        result = ared_metrics.evaluate_from_annotations_and_queries(anns, queried, total_points=total)
+        # Use the number of tiles actually sent to A/RED for this run.
+        # This ensures "should_query" (firsts + relevant) only counts tiles that were
+        # actually presented ("sent") to A/RED, not extraneous labels from other runs/sessions.
+        stream_total = len(processed) if processed else self.stats.get("tiles_processed", labeled_total)
+        ared_query_count = self.stats.get("ared_queries", len(queried))
+
+        result = ared_metrics.evaluate_from_annotations_and_queries(
+            anns, queried, 
+            total_points=stream_total,
+            ared_query_count_override=ared_query_count,
+            processed_keys=processed
+        )
         result["video"] = video_path
-        result["n_labeled"] = total
+        result["n_labeled"] = labeled_total
+        result["total_stream_tiles"] = stream_total
+        result["ared_queries_made"] = ared_query_count
+        result["n_processed_in_run"] = len(processed)
         return result
 
     def update_config(self, new_config: PipelineConfig):
@@ -417,7 +446,7 @@ class DroneAREDController:
 
             # --- 3. Real human labeling via GUI (only when A/RED asked or edit mode) ---
             self.stats["user_queries"] = self.stats.get("user_queries", 0) + 1
-            print(f"[Pipeline]   -> Requesting HUMAN label via GUI (user_queries now {self.stats['user_queries']})  meta={meta}")
+            print(f"[Pipeline]   -> Requesting HUMAN label via GUI (actual human this session now {self.stats['user_queries']}; ared_queries already counted the decision)  meta={meta}")
 
             # Ensure the tile object carries identity for the dialog / later saving
             safe_tile = tile_img
@@ -624,12 +653,20 @@ class DroneAREDController:
                 ared_queried = info.get("queried", False)
                 label = info.get("label")
 
+                # Always record every tile sent to A/RED (for accurate filtering of "should" positives
+                # to only tiles/classes actually presented to A/RED this run).
+                pkey = ared_metrics.tile_identity_from_meta(meta, tile)
+                if pkey:
+                    self.processed_identities.append(pkey)
+                    if ared_queried:
+                        self.queried_identities.append(pkey)
+
                 if ared_queried:
-                    # Record stable identity for metrics (Query Precision / Relevant Recall).
+                    self.stats["ared_queries"] = self.stats.get("ared_queries", 0) + 1
+                    # Record was already done above for queried list.
+                    # "ared_queried" means A/RED's internal decision (Query_Cdn met).
+                    # Cache hits still count fully (as user queries per spec).
                     # See drone_ared/metrics.py and the A/RED papers (IJSC_2026-1, SPIE_IVSP_2026).
-                    qkey = ared_metrics.tile_identity_from_meta(meta, tile)
-                    if qkey:
-                        self.queried_identities.append(qkey)
 
                 # Always log finish of tile processing so we can see forward progress even when A/RED is not querying.
                 # This is key to confirm that "Waiting for next query" in the GUI just means A/RED chose not to ask for a label.
@@ -652,7 +689,8 @@ class DroneAREDController:
                 if (self.stats["tiles_processed"] % 10 == 0) or ared_queried:
                     print(f"[Pipeline] Progress: tiles_processed={self.stats['tiles_processed']}, "
                           f"ared_clusters={self.stats.get('ared_clusters', 0)}, "
-                          f"user_queries={self.stats.get('user_queries', 0)}, "
+                          f"ared_queries (labels needed)={self.stats.get('ared_queries', 0)}, "
+                          f"human_dialogs={self.stats.get('user_queries', 0)}, "
                           f"cache_hits={self.stats.get('cache_hits', 0)}")
         except Exception as e:
             print(f"[Pipeline] ERROR in _process_batch: {e}")

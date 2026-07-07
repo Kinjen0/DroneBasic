@@ -163,6 +163,8 @@ def compute_query_metrics(
         "total_points": total_points,
         "query_rate": round(n_queries / max(1, total_points), 4),
         "relevant_rate": round(relevant_rate, 4),
+        # Raw counts for full audit (see papers + this file for formulas)
+        "tp_fp_fn_detail": f"TP={tp} (should+queried), FP={fp} (queried but !should), FN={fn} (should but !queried)",
     }
 
 
@@ -230,39 +232,171 @@ def evaluate_from_annotations_and_queries(
     annotations: List[Dict[str, Any]],
     actual_queried_keys: List[Tuple],
     total_points: Optional[int] = None,
+    ared_query_count_override: Optional[int] = None,
+    processed_keys: Optional[List[Tuple]] = None,
 ) -> Dict[str, Any]:
     """
-    High-level helper.
+    High-level helper. Produces exhaustive data for the user.
 
     annotations: list from TileAnnotationDB.get_annotations_for_video(...)
-    actual_queried_keys: list of tile keys that were actually queried by A/RED in this run
+    actual_queried_keys: list of tile keys where A/RED decided it needed a label.
+        IMPORTANT: per user instruction, cache-satisfied queries ARE treated as
+        real user queries (they are just answered automatically to save time).
+        The decision to query counts fully.
+    processed_keys: if provided, filter annotations and should-computation to *only*
+        the tiles that were actually sent to A/RED in this run. This ensures we
+        only count relevant (and first) tiles/classes that were actually presented
+        to A/RED (addresses the "only counting relevant classes that are actually sent").
     """
+    if processed_keys:
+        proc_set = set(processed_keys)
+        annotations = [a for a in annotations if make_tile_key(a) in proc_set]
+
     should = compute_should_query_from_annotations(annotations)
 
     # Build a "relevant only" should set for cleaner RR
+    # (per papers: Relevant Recall considers only points from relevant classes)
     relevant_only_should = {}
     for a in annotations:
         key = make_tile_key(a)
-        if should.get(key, False) and a.get("relevant"):
+        is_rel = bool(a.get("relevant", False))
+        if should.get(key, False) and is_rel:
             relevant_only_should[key] = True
 
     metrics = compute_query_metrics(actual_queried_keys, should, total_points)
-    metrics["relevant_recall_strict"] = round(
+    # Per papers: Relevant Recall only considers points from relevant classes.
+    # We report the strict version as the primary relevant_recall.
+    strict_rr = round(
         compute_relevant_recall_only(actual_queried_keys, relevant_only_should), 4
     )
+    metrics["relevant_recall_strict"] = strict_rr
+    metrics["relevant_recall"] = strict_rr  # primary RR is over relevant only
+    # (the broad rr from compute_query_metrics includes first-of-class for non-relevant)
 
-    n_queries = metrics["n_actual_queries"]
+    # Use override if provided (from live stats ared_queries, which counts cache decisions)
+    # Per user: cache queries are user queries and count fully for "total queries A_RED made"
+    original_nq = metrics["n_actual_queries"]
+    n_queries = ared_query_count_override if ared_query_count_override is not None else original_nq
+    if ared_query_count_override is not None:
+        metrics["n_actual_queries"] = n_queries
+
     total = metrics["total_points"]
     rel_rate = metrics["relevant_rate"]
+    # Recompute query_rate using authoritative n_queries (important for display)
+    metrics["query_rate"] = round(n_queries / max(1, total), 4)
 
     baseline = random_baseline_at_budget(n_queries, total, rel_rate)
     metrics.update({f"baseline_{k}": v for k, v in baseline.items()})
+
+    # === EVERY SINGLE DATAPOINT - FULL WORK SHOWN ===
+    # Sources:
+    # 1. annotations: every row in DB for the video (human labels + relevant flags). 
+    #    These are the "people tagged" results.
+    # 2. actual_queried_keys or ared_query_count: the points A/RED's algorithm emitted
+    #    a query for (the "Total number of queries A_RED made"). Cache hits count here.
+    # 3. should computed from final labels using paper rule.
+    # Formulas exactly as SPIE_IVSP_2026 eq.8/9 and IJSC paper.
+
+    # Raw class counts
+    from collections import Counter
+    label_counts = Counter(str(a.get("label","")) for a in annotations)
+    relevant_counts = Counter(str(a.get("label","")) for a in annotations if a.get("relevant"))
+
+    # People (person class) specific
+    total_person_tiles = label_counts.get("person", 0)
+    person_anns = [a for a in annotations if str(a.get("label","")) == "person"]
+
+    # Queried people tiles: keys that A/RED queried AND final label is person
+    actual_set = set(actual_queried_keys)
+    person_queried_keys = []
+    for a in person_anns:
+        k = make_tile_key(a)
+        if k in actual_set:
+            person_queried_keys.append(k)
+    total_person_tiles_queried = len(person_queried_keys)
+
+    # Similarly for all relevant
+    relevant_queried = sum(1 for a in annotations if a.get("relevant") and make_tile_key(a) in actual_set)
+
+    # Firsts computation (exact order used for "should")
+    seen = set()
+    first_of_class = {}
+    for a in sorted(annotations, key=lambda x: (x.get("abs_frame", 0), x.get("tile_row", 0), x.get("tile_col", 0))):
+        lab = str(a.get("label", ""))
+        if lab and lab not in seen:
+            seen.add(lab)
+            first_of_class[lab] = a.get("abs_frame", -1)
+
+    n_first = len(first_of_class)
+    n_rel_should = len(relevant_only_should)
+
+    # Recompute should_query breakdown
+    should_from_first = 0
+    should_from_relevant_only = 0
+    should_from_both = 0
+    for a in annotations:
+        key = make_tile_key(a)
+        if not should.get(key, False): continue
+        is_first = str(a.get("label","")) in first_of_class and first_of_class[str(a.get("label",""))] == a.get("abs_frame", -1)  # rough
+        is_rel = a.get("relevant")
+        if is_first and is_rel:
+            should_from_both += 1
+        elif is_first:
+            should_from_first += 1
+        elif is_rel:
+            should_from_relevant_only += 1
+
+    # Full TP/FP/FN already in metrics, but we document
+    tp = metrics["tp"]
+    fp = metrics["fp"]
+    fn = metrics["fn"]
+
+    # Build giant transparent report
+    n_sent = len(processed_keys) if processed_keys is not None else None
+    metrics["detailed_breakdown"] = {
+        "TOTAL_TILES_ACTUALLY_SENT_TO_ARED_THIS_RUN": n_sent if n_sent is not None else "N/A (no processed_keys; falling back to all DB annotations)",
+        "TOTAL_LABELED_TILES_IN_DB": len(annotations),
+        "TOTAL_PERSON_TILES": total_person_tiles,   # "total number of people tiles"
+        "TOTAL_PERSON_TILES_QUERIED": total_person_tiles_queried,  # "total number of people tiles queried"
+        "TOTAL_RELEVANT_TILES": sum(label_counts[lab] for lab in relevant_counts),
+        "TOTAL_RELEVANT_TILES_QUERIED": relevant_queried,
+        "TOTAL_QUERIES_ARED_MADE": n_queries,   # NOTE: cache queries counted fully as user queries
+        "TOTAL_ACTUAL_QUERIED_KEYS_LOGGED": len(actual_queried_keys),
+        "CACHE_TREATED_AS_USER_QUERY": True,  # per explicit user instruction
+        "UNIQUE_CLASSES": len(label_counts),
+        "CLASS_COUNTS": dict(label_counts),
+        "RELEVANT_CLASS_COUNTS": dict(relevant_counts),
+        "FIRST_OCCURRENCE_BY_CLASS": first_of_class,
+        "N_FIRST_OF_CLASS": n_first,
+        "N_SHOULD_QUERY_TOTAL": metrics["n_should_query"],
+        "SHOULD_BREAKDOWN": {
+            "from_first_only_approx": should_from_first,
+            "from_relevant_only_approx": should_from_relevant_only,
+            "from_both_approx": should_from_both,
+            "note": "Exact should computed per paper rule in compute_should_query_from_annotations. Filtered to only tiles sent in this run if processed_keys provided."
+        },
+        "RELEVANT_SHOULD_POSITIVES": n_rel_should,
+        "TP": tp,
+        "FP": fp,
+        "FN": fn,
+        "TN_NOT_TRACKED": "We only care about query decisions (positives for the query task)",
+        "QUERY_PRECISION_WORK": f"QP = {tp} / ({tp} + {fp}) = {metrics['query_precision']}",
+        "RELEVANT_RECALL_WORK": f"RR (relevant only) = TP / (TP + FN over relevant_should) = {metrics['relevant_recall']}",
+        "RANDOM_BASELINE": baseline,
+        "TOTAL_STREAM_TILES_USED_FOR_RATES": total,
+        "NOTE_ON_TOTAL": "total_points uses # tiles actually sent to A/RED this run (from processed). Only relevant tiles/classes that were sent are counted in should/positives (per the check requested).",
+        "PAPER_REFERENCES": "SPIE_IVSP_2026 Sec.5 eq.8-11; IJSC_2026-1 Alg.1 + evaluation; PerformanceMetricsPlan.md"
+    }
+
+    # Also keep the older audit for compatibility
+    metrics["audit"] = metrics["detailed_breakdown"]  # alias for display
 
     # Summary string for GUI
     metrics["summary"] = (
         f"QP={metrics['query_precision']:.3f}  "
         f"RR={metrics['relevant_recall']:.3f}  "
-        f"Queries={n_queries}/{total} ({metrics['query_rate']*100:.1f}%)  "
+        f"A/RED Queries={n_queries}  "
+        f"Person tiles queried={total_person_tiles_queried}/{total_person_tiles}  "
         f"vs Random≈{baseline['random_query_precision_approx']:.3f}"
     )
     return metrics

@@ -346,6 +346,14 @@ class AREDAdapter:
 
                 is_peek = (call_num == 1 and self.num_points_processed > 0)
 
+                # Mark that A/RED decided this point needs a label query (for "user labels needed"
+                # and for QP/RR). This must be counted EVEN IF the cache or exact DB satisfies it.
+                # The cache is only for performance/testing convenience; the query decision itself
+                # represents work that would be needed from a user in a cold-start or no-cache scenario.
+                if not is_peek:
+                    was_queried = True
+                    print(f"[ARED] A_RED decided to QUERY (call#{call_num}) for abs_idx={_abs_index} (tile meta: {meta}). will count for labels-needed + metrics (cache may still satisfy)")
+
                 # 1. Try persistent cache first -- always, for both peek and real queries
                 if getattr(self, "_label_store", None) is not None:
                     cached = self._label_store.lookup(emb)
@@ -358,13 +366,13 @@ class AREDAdapter:
                         if is_peek:
                             print(f"[ARED]   -> Cache HIT on peek for abs_idx={_abs_index}. Auto (no GUI).")
                         else:
-                            print(f"[ARED]   -> Cache HIT for this query. Auto-labeled as '{label}' (relevant={rel}). No GUI.")
+                            print(f"[ARED]   -> Cache HIT for this QUERY decision. Auto-labeled as '{label}' (relevant={rel}). (still counts as ARED query for labels-needed metric)")
                         return label, rel
                     else:
                         if is_peek:
                             print(f"[ARED]   -> Cache MISS on peek (will use provisional, no GUI).")
                         else:
-                            print(f"[ARED]   -> Cache MISS. Will request label from provider (GUI or fallback).")
+                            print(f"[ARED]   -> Cache MISS for real query. Will request from provider (GUI).")
 
                 if is_peek:
                     # Peek call (internal ARED accounting for non-queried points).
@@ -378,9 +386,8 @@ class AREDAdapter:
                     print(f"[ARED] Peek answer_query (call#{call_num}) for abs_idx={_abs_index} -- provisional (no oracle query to user).")
                     return label, rel
 
-                # This is a real query path (2nd hook call during process, or first_point).
-                was_queried = True
-                print(f"[ARED] A_RED decided to QUERY (sending request to oracle shim) for abs_idx={_abs_index} (tile meta: {meta}) (real decision, call#{call_num})")
+                # Real query path (non-peek) -- provider will be called (or exact DB in pipeline layer)
+                print(f"[ARED] Real QUERY path reached provider for abs_idx={_abs_index}")
 
                 # 2. Fall back to the registered provider (normally the GUI) -- only for real queries
                 if self._label_provider is None:
