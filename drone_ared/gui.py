@@ -31,7 +31,11 @@ from .config import PipelineConfig, GUIConfig
 from .pipeline import DroneAREDController, LabelRequest
 from .label_store import PersistentLabelStore
 from .ared_adapter import AREDAdapter
-from .tile_database import TileAnnotationDB, extract_tile_from_video  # exact identity + re-extract helper
+from .tile_database import TileAnnotationDB, extract_tile_from_video
+from .annotation_manager import AnnotationManager
+from .annotation_domain import TileKey, AnnotationFilter
+from .tile_database import TileAnnotationDB
+from .gui_bulk_dialog import BulkLabelOpsDialog  # modular bulk editing UI
 # GridTiler is imported lazily inside the browser (to avoid pulling numpy/PIL deps at gui module load
 # if not already present from other paths).
 
@@ -780,6 +784,7 @@ class MainWindow:
         self.controller = DroneAREDController(self.config)
         self.label_store: Optional[PersistentLabelStore] = None
         self.tile_db: Optional[TileAnnotationDB] = None   # NEW: exact (video, frame, tile) labels
+        self.annotation_manager: Optional[AnnotationManager] = None  # service layer (refactor in progress)
         self.edit_mode: bool = False
         self._stats_job = None
         self._pending_label_request: Optional[LabelRequest] = None
@@ -888,8 +893,21 @@ class MainWindow:
         ttk.Button(param_frame, text="Review / Edit Past Labels...", command=self._open_review_window).pack(fill="x", pady=int(3*s))
         ttk.Button(param_frame, text="Multi-Frame Browser (scroll many frames + select to label)", 
                    command=self._open_multi_frame_browser).pack(fill="x", pady=int(3*s))
-        ttk.Button(param_frame, text="Save Annotation DB Now", command=self._save_tile_annotations).pack(fill="x")
-        ttk.Button(param_frame, text="Load different Annotation DB...", command=self._load_tile_annotations).pack(fill="x")
+
+        # Expanded DB management (see plan)
+        db_mgmt = ttk.LabelFrame(param_frame, text="DB Management")
+        db_mgmt.pack(fill="x", pady=int(4*s))
+        ttk.Button(db_mgmt, text="Save / Flush DB", command=self._save_tile_annotations).pack(fill="x", pady=1)
+        ttk.Button(db_mgmt, text="Load / Switch DB...", command=self._load_tile_annotations).pack(fill="x", pady=1)
+        ttk.Button(db_mgmt, text="New DB...", command=self._new_tile_annotations).pack(fill="x", pady=1)
+        ttk.Button(db_mgmt, text="Clone Current DB...", command=self._clone_tile_annotations).pack(fill="x", pady=1)
+        ttk.Button(db_mgmt, text="Vacuum (compact)", command=self._vacuum_tile_annotations).pack(fill="x", pady=1)
+        ttk.Button(db_mgmt, text="Bulk Edit / Remove Labels...", command=self._open_bulk_label_ops).pack(fill="x", pady=1)
+
+        # Live DB info
+        self._db_info_var = tk.StringVar(value="No annotation DB")
+        ttk.Label(db_mgmt, textvariable=self._db_info_var, font=("TkDefaultFont", int(9*self.ui_scale)), 
+                  relief="sunken", wraplength=220).pack(fill="x", pady=2)
 
         # Right side: stats + discovered classes
         right = ttk.Frame(body)
@@ -1005,11 +1023,13 @@ class MainWindow:
         # Prepare exact tile annotation DB (NEW - primary for persistent exact labels + editing)
         if getattr(self.config.tile_annotations, 'enabled', True):
             ann_path = self.config.tile_annotations.db_path or "drone_tile_annotations.db"
-            self.tile_db = TileAnnotationDB(db_path=ann_path)
-            self.controller.set_tile_database(self.tile_db)
+            db = TileAnnotationDB(db_path=ann_path)
+            self._set_active_tile_db(db, ann_path)
         else:
             self.tile_db = None
             self.controller.set_tile_database(None)
+            self.annotation_manager = None
+            self.controller.set_annotation_manager(None)
 
         # Edit mode (force re-label of known exact tiles for corrections)
         self.edit_mode = self.edit_mode_var.get()
@@ -1055,6 +1075,7 @@ class MainWindow:
             try:
                 self.tile_db.conn.commit()
                 count = len(self.tile_db)
+                self._refresh_db_info()
                 messagebox.showinfo("Tile Annotations", f"Annotation DB saved. Total entries: {count}")
             except Exception as e:
                 messagebox.showerror("Tile Annotations", f"Save failed: {e}")
@@ -1260,7 +1281,7 @@ class MainWindow:
         self._compute_metrics_from_db()
 
     def _load_tile_annotations(self):
-        path = filedialog.askopenfilename(title="Load tile annotation DB", filetypes=[("SQLite DB", "*.db"), ("All", "*.*")])
+        path = filedialog.askopenfilename(title="Load / Switch tile annotation DB", filetypes=[("SQLite DB", "*.db"), ("All", "*.*")])
         if not path:
             return
         try:
@@ -1269,12 +1290,155 @@ class MainWindow:
                     self.tile_db.close()
                 except Exception:
                     pass
-            self.tile_db = TileAnnotationDB(db_path=path)
-            self.controller.set_tile_database(self.tile_db)
-            self.config.tile_annotations.db_path = path
-            messagebox.showinfo("Tile Annotations", f"Loaded DB with {len(self.tile_db)} entries.")
+            db = TileAnnotationDB(db_path=path)
+            self._set_active_tile_db(db, path)
+            # Warn if current tile size has no data here
+            self._warn_on_tile_size_mismatch(path)
+            messagebox.showinfo("Tile Annotations", f"Switched to DB with {len(self.tile_db)} entries.")
         except Exception as e:
-            messagebox.showerror("Load", str(e))
+            messagebox.showerror("Load/Switch", str(e))
+
+    def _refresh_db_info(self):
+        if not hasattr(self, "_db_info_var"):
+            return
+        if self.tile_db:
+            try:
+                summ = self.tile_db.get_db_summary()
+                sizes = ", ".join(f"{w}x{h}" for w, h in summ.get("tile_sizes", [])) or "—"
+                name = Path(summ["path"]).name
+                self._db_info_var.set(f"{name} | {summ['total_entries']} rows | {summ['num_videos']} vids | sizes: {sizes}")
+            except Exception as e:
+                self._db_info_var.set(f"DB info error: {e}")
+        else:
+            self._db_info_var.set("No annotation DB active")
+
+    def _set_active_tile_db(self, db: "TileAnnotationDB", path: str):
+        """Central helper: wires DB + manager + controller + config + UI state.
+        Simplifies duplication across load/new/clone/start paths.
+        """
+        self.tile_db = db
+        self.controller.set_tile_database(db)
+        self.annotation_manager = AnnotationManager(db)
+        tw = self.config.tiling.tile_width
+        th = self.config.tiling.tile_height
+        self.annotation_manager.set_scope(tile_size=(tw, th))
+        self.controller.set_annotation_manager(self.annotation_manager)
+        self.config.tile_annotations.db_path = path
+        if hasattr(self, "_tile_ann_db_var"):
+            self._tile_ann_db_var.set(path)
+        self._refresh_db_info()
+
+    def _warn_on_tile_size_mismatch(self, db_path: str):
+        """If we have a current tiling size, check if the loaded DB has any annotations at that size."""
+        try:
+            if not self.tile_db:
+                return
+            tw = self.config.tiling.tile_width
+            th = self.config.tiling.tile_height
+            sizes = self.tile_db.get_tile_sizes_for_video("")  # across all videos
+            # get all sizes
+            cur = self.tile_db.conn.cursor()
+            cur.execute("SELECT DISTINCT tile_width, tile_height FROM annotations")
+            all_sizes = [(int(r[0]), int(r[1])) for r in cur.fetchall()]
+            if all_sizes and (tw, th) not in all_sizes:
+                sizes_str = ", ".join(f"{w}x{h}" for w,h in all_sizes[:5])
+                messagebox.showwarning(
+                    "Tile Size Mismatch",
+                    f"Current GUI tile size is {tw}x{th}.\n"
+                    f"This DB contains annotations at other sizes: {sizes_str}{'...' if len(all_sizes)>5 else ''}\n\n"
+                    "Browsers and lookups will be scoped to matching sizes only.\n"
+                    "You can still label at the current size (new entries will be added)."
+                )
+        except Exception:
+            pass
+
+    def _new_tile_annotations(self):
+        """Create a fresh empty DB and switch to it."""
+        from tkinter import filedialog
+        path = filedialog.asksaveasfilename(
+            title="Create New Annotation DB",
+            defaultextension=".db",
+            filetypes=[("SQLite DB", "*.db")],
+            initialfile="drone_tile_annotations_new.db"
+        )
+        if not path:
+            return
+        try:
+            if self.tile_db:
+                try:
+                    self.tile_db.close()
+                except Exception:
+                    pass
+            # Creating by opening will make the tables
+            db = TileAnnotationDB(db_path=path)
+            self._set_active_tile_db(db, path)
+            messagebox.showinfo("New DB", f"Created and switched to new DB: {Path(path).name}")
+        except Exception as e:
+            messagebox.showerror("New DB", str(e))
+
+    def _clone_tile_annotations(self):
+        """Clone the current DB to a new file and switch to the clone."""
+        from tkinter import filedialog
+        if not self.tile_db:
+            messagebox.showwarning("Clone", "No active DB to clone.")
+            return
+        src_path = self.tile_db.db_path
+        default_name = f"{Path(src_path).stem}_clone.db"
+        dest = filedialog.asksaveasfilename(
+            title="Clone DB to...",
+            defaultextension=".db",
+            filetypes=[("SQLite DB", "*.db")],
+            initialfile=default_name
+        )
+        if not dest:
+            return
+        try:
+            if self.tile_db:
+                try:
+                    self.tile_db.close()
+                except Exception:
+                    pass
+            # Use the class helper
+            new_db = TileAnnotationDB.clone(src_path, dest, open_after=True)
+            self._set_active_tile_db(new_db, dest)
+            messagebox.showinfo("Clone", f"Cloned to {Path(dest).name} and switched.\nOriginal is untouched.")
+        except Exception as e:
+            messagebox.showerror("Clone DB", str(e))
+            # Try to reopen original
+            try:
+                self.tile_db = TileAnnotationDB(db_path=src_path)
+                self.controller.set_tile_database(self.tile_db)
+            except Exception:
+                pass
+
+    def _vacuum_tile_annotations(self):
+        if not self.tile_db:
+            messagebox.showwarning("Vacuum", "No active DB.")
+            return
+        if not messagebox.askyesno("Vacuum", "Compact the DB (removes deleted space)? Safe but may take a moment."):
+            return
+        try:
+            self.tile_db.vacuum()
+            self._refresh_db_info()
+            messagebox.showinfo("Vacuum", "DB compacted.")
+        except Exception as e:
+            messagebox.showerror("Vacuum", str(e))
+
+    def _open_bulk_label_ops(self):
+        """Open dialog for mass editing/removing/changing labels with specificity.
+        Uses AnnotationManager + AnnotationFilter for precise control (by video, size, labels, frames, relevance).
+        """
+        if not self.annotation_manager:
+            try:
+                path = getattr(self.config.tile_annotations, 'db_path', 'drone_tile_annotations.db')
+                db = TileAnnotationDB(db_path=path)
+                self._set_active_tile_db(db, path)
+            except Exception as e:
+                messagebox.showerror("Bulk Ops", f"No DB: {e}")
+                return
+
+        BulkLabelOpsDialog(self.root, self.annotation_manager, self.config, ui_scale=self.ui_scale,
+                           on_done=self._refresh_db_info)
 
     # ------------------------------------------------------------------
     # NEW: Review / Edit past exact labels (works across runs and stride changes)
@@ -1284,8 +1448,8 @@ class MainWindow:
             # Try to open/create one from current config
             try:
                 path = getattr(self.config.tile_annotations, 'db_path', 'drone_tile_annotations.db')
-                self.tile_db = TileAnnotationDB(db_path=path)
-                self.controller.set_tile_database(self.tile_db)
+                db = TileAnnotationDB(db_path=path)
+                self._set_active_tile_db(db, path)
             except Exception as e:
                 messagebox.showerror("Review", f"Could not open annotation DB: {e}")
                 return
@@ -1295,7 +1459,8 @@ class MainWindow:
             messagebox.showinfo("Review", "No annotations saved yet. Label some tiles while running A/RED (or load a previous DB).")
             return
 
-        LabelReviewWindow(self.root, self.tile_db, ui_scale=self.ui_scale)
+        LabelReviewWindow(self.root, self.tile_db, ui_scale=self.ui_scale,
+                          annotation_manager=getattr(self, 'annotation_manager', None))
 
     def _open_multi_frame_browser(self):
         """Open the new multi-frame visual browser.
@@ -1308,9 +1473,8 @@ class MainWindow:
         if not self.tile_db:
             try:
                 path = getattr(self.config.tile_annotations, 'db_path', 'drone_tile_annotations.db')
-                self.tile_db = TileAnnotationDB(db_path=path)
-                if self.controller:
-                    self.controller.set_tile_database(self.tile_db)
+                db = TileAnnotationDB(db_path=path)
+                self._set_active_tile_db(db, path)
             except Exception as e:
                 messagebox.showerror("Browser", f"Could not open annotation DB: {e}")
                 return
@@ -1328,7 +1492,8 @@ class MainWindow:
             self.tile_db,
             ui_scale=self.ui_scale,
             controller=self.controller,
-            main_window=self
+            main_window=self,
+            annotation_manager=getattr(self, 'annotation_manager', None)
         )
 
     def _load_label_cache(self):
@@ -1642,9 +1807,11 @@ class LabelReviewWindow(tk.Toplevel):
     - "Save Change" writes the (possibly corrected) label back to the DB.
     """
 
-    def __init__(self, master, tile_db: "TileAnnotationDB", ui_scale: float = 1.6):
+    def __init__(self, master, tile_db: "TileAnnotationDB", ui_scale: float = 1.6,
+                 annotation_manager: Optional["AnnotationManager"] = None):
         super().__init__(master)
         self.tile_db = tile_db
+        self.annotation_manager = annotation_manager or (AnnotationManager(tile_db) if tile_db else None)
         self.ui_scale = float(ui_scale) if ui_scale else 1.6
         self.current_ann: Optional[Dict] = None
         self.current_img: Optional[Image.Image] = None
@@ -1744,11 +1911,25 @@ class LabelReviewWindow(tk.Toplevel):
         v = self.video_var.get()
         if not v:
             return
-        self.annotations = self.tile_db.get_annotations_for_video(v)
+        tw = th = None
+        try:
+            parent = getattr(self, 'master', None)
+            if parent and hasattr(parent, 'config'):
+                tcfg = parent.config.tiling
+                tw, th = tcfg.tile_width, tcfg.tile_height
+        except Exception:
+            pass
+        if self.annotation_manager:
+            self.annotation_manager.set_scope(video_path=v, tile_size=(tw, th) if tw else None)
+            self.annotations = self.annotation_manager.get_annotations(video=v, use_scope=True)
+        else:
+            self.annotations = self.tile_db.get_annotations_for_video(v, tile_width=tw, tile_height=th)
         self.ann_list.delete(0, "end")
         for i, a in enumerate(self.annotations):
             rel_mark = " [R]" if a["relevant"] else ""
-            txt = f"f{a['abs_frame']:06d} r{a['tile_row']}c{a['tile_col']}  {a['label']}{rel_mark}"
+            tw = a.get("tile_width", "?")
+            th = a.get("tile_height", "?")
+            txt = f"f{a['abs_frame']:06d} r{a['tile_row']}c{a['tile_col']} [{tw}x{th}]  {a['label']}{rel_mark}"
             self.ann_list.insert("end", txt)
         if self.annotations:
             self.ann_list.selection_set(0)
@@ -1832,15 +2013,21 @@ class LabelReviewWindow(tk.Toplevel):
         new_rel = self.rel_var.get()
 
         try:
-            self.tile_db.set_annotation(
-                ann["video_path"], ann["abs_frame"], ann["tile_row"], ann["tile_col"],
-                ann["tile_width"], ann["tile_height"],
-                new_label, new_rel,
-                embedding=None,  # we don't re-embed here; original emb if present stays
-                crop_x=ann.get("crop_x"), crop_y=ann.get("crop_y")
-            )
+            if self.annotation_manager:
+                key = TileKey(ann["video_path"], ann["abs_frame"], ann["tile_row"], ann["tile_col"],
+                              ann["tile_width"], ann["tile_height"])
+                self.annotation_manager.db.set_annotation_for_key(key, new_label, new_rel,
+                                                                  embedding=None,
+                                                                  crop_x=ann.get("crop_x"), crop_y=ann.get("crop_y"))
+            else:
+                self.tile_db.set_annotation(
+                    ann["video_path"], ann["abs_frame"], ann["tile_row"], ann["tile_col"],
+                    ann["tile_width"], ann["tile_height"],
+                    new_label, new_rel,
+                    embedding=None,
+                    crop_x=ann.get("crop_x"), crop_y=ann.get("crop_y")
+                )
             self.status_var.set(f"Saved: {new_label} (rel={new_rel})")
-            # Refresh list
             self._load_annotations_for_current_video()
         except Exception as e:
             messagebox.showerror("Save", str(e))
@@ -1857,10 +2044,15 @@ class LabelReviewWindow(tk.Toplevel):
             return
         ann = self.current_ann
         try:
-            self.tile_db.delete_annotation(
-                ann["video_path"], ann["abs_frame"], ann["tile_row"], ann["tile_col"],
-                ann["tile_width"], ann["tile_height"]
-            )
+            if self.annotation_manager:
+                key = TileKey(ann["video_path"], ann["abs_frame"], ann["tile_row"], ann["tile_col"],
+                              ann["tile_width"], ann["tile_height"])
+                self.annotation_manager.db.delete_key(key)
+            else:
+                self.tile_db.delete_annotation(
+                    ann["video_path"], ann["abs_frame"], ann["tile_row"], ann["tile_col"],
+                    ann["tile_width"], ann["tile_height"]
+                )
             self.status_var.set("Deleted.")
             self._load_annotations_for_current_video()
         except Exception as e:
@@ -1872,6 +2064,8 @@ class LabelReviewWindow(tk.Toplevel):
         except Exception:
             pass
 
+
+# Bulk ops dialog extracted to gui_bulk_dialog.py (imported at top)
 
 # =============================================================================
 # MultiFrameLabelBrowser - NEW visual scrollable multi-frame overview + per-frame labeling
@@ -1901,9 +2095,10 @@ class MultiFrameLabelBrowser(tk.Toplevel):
 
     def __init__(self, master, tile_db: "TileAnnotationDB", ui_scale: float = 1.6,
                  controller: Optional["DroneAREDController"] = None,
-                 main_window=None):
+                 main_window=None, annotation_manager: Optional["AnnotationManager"] = None):
         super().__init__(master)
         self.tile_db = tile_db
+        self.annotation_manager = annotation_manager or (AnnotationManager(tile_db) if tile_db else None)
         self.controller = controller
         self.main_window = main_window
         self.ui_scale = float(ui_scale) if ui_scale else 1.6
@@ -2126,7 +2321,21 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         if not v:
             return
         self.current_video = v
-        anns = self.tile_db.get_annotations_for_video(v)
+        # Prefer manager (has scope) for queries; falls back to direct with size filter.
+        tw = th = None
+        try:
+            if self.controller and getattr(self.controller, 'tiler', None):
+                tw, th = self.controller.tiler.tile_w, self.controller.tiler.tile_h
+            elif self.main_window and hasattr(self.main_window, 'config'):
+                tcfg = self.main_window.config.tiling
+                tw, th = tcfg.tile_width, tcfg.tile_height
+        except Exception:
+            pass
+        if self.annotation_manager:
+            self.annotation_manager.set_scope(video_path=v, tile_size=(tw, th) if tw else None)
+            anns = self.annotation_manager.get_annotations(video=v, use_scope=True)
+        else:
+            anns = self.tile_db.get_annotations_for_video(v, tile_width=tw, tile_height=th)
         self.frame_to_anns = {}
         for a in anns:
             f = a["abs_frame"]
@@ -2914,7 +3123,9 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         self._current_frame_anns_list = anns  # for edit action
         for a in anns:
             rel = " [R]" if a.get("relevant") else ""
-            txt = f"r{a['tile_row']}c{a['tile_col']}  {a['label']}{rel}"
+            tw = a.get("tile_width", "?")
+            th = a.get("tile_height", "?")
+            txt = f"r{a['tile_row']}c{a['tile_col']} [{tw}x{th}]  {a['label']}{rel}"
             self.frame_labels_list.insert("end", txt)
 
         self.browser_status_var.set(f"Selected frame {frame_idx}. Use 'Explore & Label Tiles on this Frame' for the per-frame label creation grid.")
@@ -2937,7 +3148,7 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         top.pack(fill="x", padx=6, pady=4)
         ttk.Label(top, text=f"Frame {self.selected_frame} — all tiles (click any to label/edit)").pack(side="left")
 
-        # Scrollable grid container
+        # Scrollable grid container — we make it fill the available width using dynamic columns
         canvas = tk.Canvas(explorer, bg="#222")
         vsb = ttk.Scrollbar(explorer, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=vsb.set)
@@ -2945,8 +3156,17 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         canvas.pack(side="left", fill="both", expand=True)
 
         tile_container = ttk.Frame(canvas)
-        canvas.create_window((0, 0), window=tile_container, anchor="nw")
+        self._tile_explorer_win = canvas.create_window((0, 0), window=tile_container, anchor="nw")
         tile_container.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+
+        # Make the inner content try to use the full canvas width (prevents large black empty region)
+        def _on_explorer_resize(event=None):
+            try:
+                cw = max(200, canvas.winfo_width())
+                canvas.itemconfig(self._tile_explorer_win, width=cw)
+            except Exception:
+                pass
+        canvas.bind("<Configure>", _on_explorer_resize, add="+")
 
         # Initial population (after widgets exist)
         self.after(50, lambda: self._populate_frame_tile_grid(explorer, tile_container, canvas))
@@ -2998,17 +3218,27 @@ class MultiFrameLabelBrowser(tk.Toplevel):
                 ttk.Label(container, text="No tiles generated for this frame (frame too small?).").pack()
                 return
 
-            # Layout: fewer columns + larger thumbs so tiles are easy to see and click
-            cols = 4
+            # Dynamic layout so the grid actually fills the window instead of leaving
+            # large black/empty space on the right. We compute cols from the current
+            # available width (the canvas item was stretched in the Toplevel).
+            try:
+                avail_w = max(400, container.winfo_width() or 900)
+            except Exception:
+                avail_w = 900
+            thumb = 180
+            cols = max(2, (avail_w - 20) // (thumb + 8))
+            # Cap at a reasonable number so individual tiles don't become tiny
+            cols = min(cols, 8)
             for idx, tile in enumerate(tiles):
-                # Lookup current label
+                # Lookup current label (using domain key as part of ongoing refactor)
                 label, rel = None, False
                 try:
-                    hit = self.tile_db.lookup(self.current_video, tile.frame_idx,
-                                              tile.tile_row, tile.tile_col,
-                                              tile.width, tile.height)
-                    if hit:
-                        label, rel = hit
+                    if self.tile_db:
+                        key = TileKey(self.current_video, tile.frame_idx, tile.tile_row, tile.tile_col,
+                                      tile.width, tile.height)
+                        hit = self.tile_db.lookup_key(key)
+                        if hit:
+                            label, rel = hit
                 except Exception:
                     pass
                 self.current_frame_tile_labels[idx] = (label, rel)
@@ -3131,11 +3361,16 @@ class MultiFrameLabelBrowser(tk.Toplevel):
                 self.class_relevance[name] = True
             try:
                 cx, cy = tile.bbox[0], tile.bbox[1]
-                self.tile_db.set_annotation(
-                    self.current_video, tile.frame_idx,
-                    tile.tile_row, tile.tile_col, tile.width, tile.height,
-                    name, rel, embedding=None, crop_x=cx, crop_y=cy
-                )
+                if self.annotation_manager:
+                    key = TileKey(self.current_video, tile.frame_idx, tile.tile_row, tile.tile_col,
+                                  tile.width, tile.height)
+                    self.annotation_manager.db.set_annotation_for_key(key, name, rel, embedding=None, crop_x=cx, crop_y=cy)
+                else:
+                    self.tile_db.set_annotation(
+                        self.current_video, tile.frame_idx,
+                        tile.tile_row, tile.tile_col, tile.width, tile.height,
+                        name, rel, embedding=None, crop_x=cx, crop_y=cy
+                    )
                 # Update local
                 self.current_frame_tile_labels[tile_local_idx] = (name, rel)
                 q.destroy()
@@ -3206,9 +3441,18 @@ class MultiFrameLabelBrowser(tk.Toplevel):
                 messagebox.showerror("Edit", str(e))
 
         ttk.Button(ed, text="Save Change to DB", command=save).pack(fill="x", padx=8, pady=6)
-        ttk.Button(ed, text="Delete this annotation", command=lambda: (self.tile_db.delete_annotation(
-            ann["video_path"], ann["abs_frame"], ann["tile_row"], ann["tile_col"],
-            ann["tile_width"], ann["tile_height"]), ed.destroy(), self._refresh_annotations_light())).pack(fill="x", padx=8)
+        def _do_delete():
+            if self.annotation_manager:
+                key = TileKey(ann["video_path"], ann["abs_frame"], ann["tile_row"], ann["tile_col"],
+                              ann["tile_width"], ann["tile_height"])
+                self.annotation_manager.db.delete_key(key)
+            else:
+                self.tile_db.delete_annotation(
+                    ann["video_path"], ann["abs_frame"], ann["tile_row"], ann["tile_col"],
+                    ann["tile_width"], ann["tile_height"])
+            ed.destroy()
+            self._refresh_annotations_light()
+        ttk.Button(ed, text="Delete this annotation", command=_do_delete).pack(fill="x", padx=8)
 
     def _jump_to_frame_in_main(self):
         """Use the existing controller navigation so the main LabelingDialog will show tiles from this frame."""
@@ -3227,4 +3471,5 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         """Open the classic list review window for convenience."""
         if self.current_video and self.tile_db:
             # The LabelReviewWindow loads its own list; just open it
-            LabelReviewWindow(self, self.tile_db, ui_scale=self.ui_scale)
+            LabelReviewWindow(self, self.tile_db, ui_scale=self.ui_scale,
+                              annotation_manager=getattr(self, 'annotation_manager', None))

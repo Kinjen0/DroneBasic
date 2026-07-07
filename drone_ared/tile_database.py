@@ -31,6 +31,10 @@ from pathlib import Path
 from typing import Optional, Tuple, List, Dict, Any
 import numpy as np
 
+# Re-export domain models for backward compatibility and clean imports.
+# New code should prefer: from drone_ared.annotation_domain import TileKey, ...
+from .annotation_domain import TileKey, AnnotationFilter, TileAnnotation  # noqa: F401
+
 
 class TileAnnotationDB:
     """
@@ -91,10 +95,17 @@ class TileAnnotationDB:
                tile_width: int, tile_height: int) -> Optional[Tuple[str, bool]]:
         """
         Return (label, relevant) for an exact tile identity, or None.
+        (Legacy 6-arg form kept for compatibility during refactor.)
         """
-        if not video_path:
+        key = TileKey(video_path, int(abs_frame), int(tile_row), int(tile_col),
+                      int(tile_width), int(tile_height))
+        return self.lookup_key(key)
+
+    def lookup_key(self, key: TileKey) -> Optional[Tuple[str, bool]]:
+        """Preferred: lookup using a TileKey domain object."""
+        if not key.video_path:
             return None
-        vpath = self._normalize_video_path(video_path)
+        vpath = self._normalize_video_path(key.video_path)
 
         cur = self.conn.cursor()
         cur.execute("""
@@ -102,7 +113,7 @@ class TileAnnotationDB:
             WHERE video_path=? AND abs_frame=? AND tile_row=? AND tile_col=?
                   AND tile_width=? AND tile_height=?
             LIMIT 1
-        """, (vpath, int(abs_frame), int(tile_row), int(tile_col), int(tile_width), int(tile_height)))
+        """, key.to_tuple())
         row = cur.fetchone()
         if row:
             label, rel = row
@@ -115,12 +126,18 @@ class TileAnnotationDB:
                        crop_x: Optional[int] = None, crop_y: Optional[int] = None) -> None:
         """
         Insert or update (upsert) a label for this exact tile.
-        Pass crop_x/crop_y (pixel top-left of the tile inside the frame) when available
-        so that review can re-extract the exact same pixels without guessing stride.
+        Legacy form; new code should prefer set_annotation_for_key.
         """
-        if not video_path or not label:
+        key = TileKey(video_path, int(abs_frame), int(tile_row), int(tile_col), int(tile_width), int(tile_height))
+        self.set_annotation_for_key(key, label, relevant, embedding=embedding, crop_x=crop_x, crop_y=crop_y)
+
+    def set_annotation_for_key(self, key: TileKey, label: str, relevant: bool,
+                               embedding: Optional[np.ndarray] = None,
+                               crop_x: Optional[int] = None, crop_y: Optional[int] = None) -> None:
+        """Preferred form using domain TileKey (improves readability & type safety)."""
+        if not key.video_path or not label:
             return
-        vpath = self._normalize_video_path(video_path)
+        vpath = self._normalize_video_path(key.video_path)
         ts = time.time()
 
         emb_blob = None
@@ -130,8 +147,8 @@ class TileAnnotationDB:
             emb_blob = emb_arr.tobytes()
             emb_dim = int(emb_arr.shape[0])
 
-        cx = crop_x if crop_x is not None else (tile_col * tile_width)
-        cy = crop_y if crop_y is not None else (tile_row * tile_height)
+        cx = crop_x if crop_x is not None else (key.tile_col * key.tile_width)
+        cy = crop_y if crop_y is not None else (key.tile_row * key.tile_height)
 
         cur = self.conn.cursor()
         cur.execute("""
@@ -149,17 +166,30 @@ class TileAnnotationDB:
                 embedding_dim=COALESCE(excluded.embedding_dim, embedding_dim),
                 updated_ts=excluded.updated_ts
         """, (
-            vpath, int(abs_frame), int(tile_row), int(tile_col),
-            int(tile_width), int(tile_height),
+            vpath, int(key.abs_frame), int(key.tile_row), int(key.tile_col),
+            int(key.tile_width), int(key.tile_height),
             int(cx), int(cy),
             str(label), 1 if relevant else 0,
             emb_blob, emb_dim, ts
         ))
         self.conn.commit()
-        print(f"[TileDB] Saved/updated annotation: {Path(vpath).name} f{abs_frame} [{tile_row},{tile_col}] -> '{label}' (rel={relevant})")
+        print(f"[TileDB] Saved/updated annotation: {Path(vpath).name} f{key.abs_frame} [{key.tile_row},{key.tile_col}] -> '{label}' (rel={relevant})")
 
-    def get_annotations_for_video(self, video_path: str, limit: Optional[int] = None) -> List[Dict[str, Any]]:
-        """Return list of annotations for a video (with crop info for re-extraction)."""
+    def get_annotations_for_video(self, video_path: str, limit: Optional[int] = None,
+                                  tile_width: Optional[int] = None,
+                                  tile_height: Optional[int] = None,
+                                  filt: Optional[AnnotationFilter] = None) -> List[Dict[str, Any]]:
+        """Return list of annotations for a video (with crop info for re-extraction).
+
+        Pass tile_width and/or tile_height (or a full AnnotationFilter) to scope results.
+        This is critical for isolation when the user changes tile size in the GUI.
+        """
+        if filt is not None:
+            video_path = video_path or filt.video_path or video_path
+            tile_width = tile_width or filt.tile_width
+            tile_height = tile_height or filt.tile_height
+            # labels filter not applied here for simplicity (list is per video)
+
         vpath = self._normalize_video_path(video_path)
         cur = self.conn.cursor()
         q = """
@@ -167,11 +197,18 @@ class TileAnnotationDB:
                    crop_x, crop_y, label, relevant, updated_ts
             FROM annotations
             WHERE video_path=?
-            ORDER BY abs_frame, tile_row, tile_col
         """
+        params = [vpath]
+        if tile_width is not None:
+            q += " AND tile_width=?"
+            params.append(int(tile_width))
+        if tile_height is not None:
+            q += " AND tile_height=?"
+            params.append(int(tile_height))
+        q += " ORDER BY abs_frame, tile_row, tile_col"
         if limit:
             q += f" LIMIT {int(limit)}"
-        cur.execute(q, (vpath,))
+        cur.execute(q, params)
         rows = cur.fetchall()
         results = []
         for r in rows:
@@ -196,10 +233,111 @@ class TileAnnotationDB:
         cur.execute("SELECT DISTINCT video_path FROM annotations ORDER BY video_path")
         return [row[0] for row in cur.fetchall()]
 
+    def get_tile_sizes_for_video(self, video_path: str) -> List[Tuple[int, int]]:
+        """Return the distinct (width, height) tile resolutions that have annotations for this video.
+        Useful for UI warnings when the current GUI tile size has no data in the loaded DB.
+        """
+        vpath = self._normalize_video_path(video_path)
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT DISTINCT tile_width, tile_height
+            FROM annotations
+            WHERE video_path=?
+            ORDER BY tile_width, tile_height
+        """, (vpath,))
+        return [(int(r[0]), int(r[1])) for r in cur.fetchall()]
+
     def get_annotation_count(self) -> int:
         cur = self.conn.cursor()
         cur.execute("SELECT COUNT(*) FROM annotations")
         return cur.fetchone()[0]
+
+    def get_label_counts(self, filt: Optional[AnnotationFilter] = None,
+                         video_path: Optional[str] = None,
+                         tile_width: Optional[int] = None,
+                         tile_height: Optional[int] = None) -> Dict[str, int]:
+        """Return {label: count} for annotations matching filter.
+        Useful for previewing mass edit/remove operations.
+        """
+        if filt is not None:
+            video_path = video_path or filt.video_path
+            tile_width = tile_width or filt.tile_width
+            tile_height = tile_height or filt.tile_height
+            labels = filt.labels
+            relevant = filt.relevant
+            frame_min = filt.frame_min
+            frame_max = filt.frame_max
+        else:
+            labels = relevant = frame_min = frame_max = None
+
+        cur = self.conn.cursor()
+        where = []
+        params: List[Any] = []
+        if video_path:
+            where.append("video_path=?")
+            params.append(self._normalize_video_path(video_path))
+        if labels:
+            if len(labels) == 1:
+                where.append("label=?")
+                params.append(str(labels[0]))
+            else:
+                placeholders = ",".join("?" for _ in labels)
+                where.append(f"label IN ({placeholders})")
+                params.extend(str(l) for l in labels)
+        if tile_width is not None:
+            where.append("tile_width=?")
+            params.append(int(tile_width))
+        if tile_height is not None:
+            where.append("tile_height=?")
+            params.append(int(tile_height))
+        if relevant is not None:
+            where.append("relevant=?")
+            params.append(1 if relevant else 0)
+        if frame_min is not None:
+            where.append("abs_frame >= ?")
+            params.append(int(frame_min))
+        if frame_max is not None:
+            where.append("abs_frame <= ?")
+            params.append(int(frame_max))
+
+        sql = "SELECT label, COUNT(*) FROM annotations"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " GROUP BY label ORDER BY label"
+        cur.execute(sql, params)
+        return {row[0]: row[1] for row in cur.fetchall()}
+
+    def get_db_summary(self) -> Dict[str, Any]:
+        """Return a dict with useful info for UI: path, total entries, num videos, sizes present, labels, last update."""
+        summary = {
+            "path": str(self.db_path),
+            "total_entries": self.get_annotation_count(),
+            "num_videos": len(self.list_videos()),
+            "tile_sizes": [],  # list of (w,h) across all
+            "labels": self.get_all_labels(),
+            "last_updated": None,
+        }
+        try:
+            cur = self.conn.cursor()
+            cur.execute("SELECT DISTINCT tile_width, tile_height FROM annotations ORDER BY tile_width, tile_height")
+            summary["tile_sizes"] = [(int(r[0]), int(r[1])) for r in cur.fetchall()]
+
+            cur.execute("SELECT MAX(updated_ts) FROM annotations")
+            row = cur.fetchone()
+            if row and row[0]:
+                summary["last_updated"] = row[0]
+        except Exception:
+            pass
+        return summary
+
+    def vacuum(self) -> None:
+        """Compact the DB (removes free space after deletes/bulk ops)."""
+        try:
+            self.conn.execute("VACUUM")
+            self.conn.commit()
+            print("[TileDB] Vacuum completed.")
+        except Exception as e:
+            print(f"[TileDB] Vacuum failed: {e}")
 
     def get_all_labels(self) -> List[str]:
         """Return all unique labels that have been assigned in this DB.
@@ -240,16 +378,154 @@ class TileAnnotationDB:
     def delete_annotation(self, video_path: str, abs_frame: int, tile_row: int, tile_col: int,
                           tile_width: int, tile_height: int) -> bool:
         """Remove a specific annotation (rarely needed)."""
-        vpath = self._normalize_video_path(video_path)
+        key = TileKey(video_path, int(abs_frame), int(tile_row), int(tile_col), int(tile_width), int(tile_height))
+        return self.delete_key(key)
+
+    def delete_key(self, key: TileKey) -> bool:
+        """Delete using domain key (preferred during refactor)."""
+        vpath = self._normalize_video_path(key.video_path)
         cur = self.conn.cursor()
         cur.execute("""
             DELETE FROM annotations
             WHERE video_path=? AND abs_frame=? AND tile_row=? AND tile_col=?
                   AND tile_width=? AND tile_height=?
-        """, (vpath, int(abs_frame), int(tile_row), int(tile_col), int(tile_width), int(tile_height)))
+        """, key.to_tuple())
         deleted = cur.rowcount > 0
         self.conn.commit()
         return deleted
+
+    # ------------------------------------------------------------------
+    # Bulk operations (for mass curation / cleanup of labeling experiments)
+    # ------------------------------------------------------------------
+
+    def delete_by_filter(self, video_path: Optional[str] = None,
+                         label: Optional[str] = None,
+                         tile_width: Optional[int] = None,
+                         tile_height: Optional[int] = None,
+                         relevant: Optional[bool] = None,
+                         filt: Optional[AnnotationFilter] = None) -> int:
+        """Delete annotations matching the supplied filters.
+        Supports single label or list of labels (via AnnotationFilter.labels or legacy).
+        Supports frame ranges via filt.
+        Returns number of rows deleted. Safety: refuses if no criteria.
+        """
+        if filt is not None:
+            video_path = video_path or filt.video_path
+            tile_width = tile_width or filt.tile_width
+            tile_height = tile_height or filt.tile_height
+            relevant = relevant if relevant is not None else filt.relevant
+            if filt.labels and not label:
+                labels = filt.labels
+            else:
+                labels = [label] if label is not None else None
+            frame_min = filt.frame_min
+            frame_max = filt.frame_max
+        else:
+            labels = [label] if label is not None else None
+            frame_min = frame_max = None
+
+        cur = self.conn.cursor()
+        where = []
+        params: List[Any] = []
+        if video_path:
+            where.append("video_path=?")
+            params.append(self._normalize_video_path(video_path))
+        if labels:
+            if len(labels) == 1:
+                where.append("label=?")
+                params.append(str(labels[0]))
+            else:
+                placeholders = ",".join("?" for _ in labels)
+                where.append(f"label IN ({placeholders})")
+                params.extend(str(l) for l in labels)
+        if tile_width is not None:
+            where.append("tile_width=?")
+            params.append(int(tile_width))
+        if tile_height is not None:
+            where.append("tile_height=?")
+            params.append(int(tile_height))
+        if relevant is not None:
+            where.append("relevant=?")
+            params.append(1 if relevant else 0)
+        if frame_min is not None:
+            where.append("abs_frame >= ?")
+            params.append(int(frame_min))
+        if frame_max is not None:
+            where.append("abs_frame <= ?")
+            params.append(int(frame_max))
+
+        if not where:
+            return 0
+
+        sql = "DELETE FROM annotations WHERE " + " AND ".join(where)
+        cur.execute(sql, params)
+        deleted = cur.rowcount
+        self.conn.commit()
+        return deleted
+
+    def reassign_label(self, old_label: str, new_label: str,
+                       video_path: Optional[str] = None,
+                       tile_width: Optional[int] = None,
+                       tile_height: Optional[int] = None,
+                       filt: Optional[AnnotationFilter] = None) -> int:
+        """Mass reassign labels matching criteria to new_label.
+        Supports multiple old labels via filt.labels or single old_label.
+        Supports frame ranges. Returns count updated.
+        """
+        if filt is not None:
+            video_path = video_path or filt.video_path
+            tile_width = tile_width or filt.tile_width
+            tile_height = tile_height or filt.tile_height
+            if filt.labels and not old_label:
+                old_labels = filt.labels
+            else:
+                old_labels = [old_label] if old_label else []
+            frame_min = filt.frame_min
+            frame_max = filt.frame_max
+        else:
+            old_labels = [old_label] if old_label else []
+            frame_min = frame_max = None
+
+        if not old_labels or not new_label or new_label in old_labels:
+            return 0
+
+        cur = self.conn.cursor()
+        set_clause = "label = ?, updated_ts = ?"
+        params: List[Any] = [str(new_label), time.time()]
+
+        where = []
+        if len(old_labels) == 1:
+            where.append("label = ?")
+            params.append(str(old_labels[0]))
+        else:
+            placeholders = ",".join("?" for _ in old_labels)
+            where.append(f"label IN ({placeholders})")
+            params.extend(str(l) for l in old_labels)
+
+        if video_path:
+            where.append("video_path = ?")
+            params.append(self._normalize_video_path(video_path))
+        if tile_width is not None:
+            where.append("tile_width = ?")
+            params.append(int(tile_width))
+        if tile_height is not None:
+            where.append("tile_height = ?")
+            params.append(int(tile_height))
+        if frame_min is not None:
+            where.append("abs_frame >= ?")
+            params.append(int(frame_min))
+        if frame_max is not None:
+            where.append("abs_frame <= ?")
+            params.append(int(frame_max))
+
+        if not where:
+            return 0
+
+        sql = f"UPDATE annotations SET {set_clause} WHERE {' AND '.join(where)}"
+        cur.execute(sql, params)
+        updated = cur.rowcount
+        self.conn.commit()
+        return updated
 
     # ------------------------------------------------------------------
     # Convenience
@@ -278,6 +554,41 @@ class TileAnnotationDB:
 
     def __exit__(self, *args):
         self.close()
+
+    @classmethod
+    def clone(cls, source_path: str | Path, dest_path: str | Path, open_after: bool = True) -> Optional["TileAnnotationDB"]:
+        """Safely clone a DB file to a new location.
+        Closes any implicit, copies the main .db (and attempts sidecar WAL files if present).
+        Returns a new TileAnnotationDB instance open on the clone if open_after=True.
+        """
+        import shutil
+        src = Path(source_path).resolve()
+        dst = Path(dest_path).resolve()
+        dst.parent.mkdir(parents=True, exist_ok=True)
+
+        if not src.exists():
+            raise FileNotFoundError(f"Source DB not found: {src}")
+
+        # Copy main file
+        shutil.copy2(src, dst)
+
+        # Try to copy WAL/SHM sidecars (for WAL mode safety; harmless if missing)
+        for suffix in (".db-wal", ".db-shm"):
+            side = src.with_suffix(suffix) if src.suffix == ".db" else Path(str(src) + suffix)
+            if side.exists():
+                try:
+                    shutil.copy2(side, dst.with_suffix(suffix) if dst.suffix == ".db" else Path(str(dst) + suffix))
+                except Exception:
+                    pass
+
+        if open_after:
+            return cls(db_path=dst)
+        return None
+
+
+# Note: AnnotationManager lives in annotation_manager.py for clean separation.
+# Import directly: from drone_ared.annotation_manager import AnnotationManager
+# tile_database re-exports domain models only for compat.
 
 
 # ------------------------------------------------------------------

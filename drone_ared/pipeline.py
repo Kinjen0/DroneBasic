@@ -37,7 +37,9 @@ from .tiling import GridTiler, Tile
 from .feature_extractor import DINOFeatureExtractor, FeatureExtractor
 from .ared_adapter import AREDAdapter
 from .label_store import PersistentLabelStore
-from .tile_database import TileAnnotationDB  # NEW exact identity DB
+from .tile_database import TileAnnotationDB
+from .annotation_domain import TileKey  # domain model (wiring refactor)
+from .annotation_manager import AnnotationManager
 from . import metrics as ared_metrics   # Query Precision / Relevant Recall (see papers)
 
 
@@ -116,6 +118,7 @@ class DroneAREDController:
         self.ared_adapter: Optional[AREDAdapter] = None
         self.label_store: Optional[PersistentLabelStore] = None
         self.tile_db: Optional["TileAnnotationDB"] = None   # NEW: exact identity annotations
+        self.annotation_manager: Optional["AnnotationManager"] = None  # service layer (full wiring)
         self._last_feature_extractor = None  # for restoring after adapter re-init / load
 
         self._worker_thread: Optional[threading.Thread] = None
@@ -243,6 +246,12 @@ class DroneAREDController:
         """NEW: exact-match annotation store (video + abs_frame + tile pos + resolution)."""
         self.tile_db = db
 
+    def set_annotation_manager(self, manager: Optional["AnnotationManager"]):
+        """Wired service layer for scoped queries, bulk ops, etc."""
+        self.annotation_manager = manager
+        if manager and not self.tile_db:
+            self.tile_db = manager.db  # compat
+
     def set_edit_mode(self, enabled: bool):
         """When enabled, the label provider will show the GUI even for previously labeled exact tiles."""
         self.edit_mode = bool(enabled)
@@ -312,16 +321,22 @@ class DroneAREDController:
           - IJSC_2026-1.pdf : "Real-Time Memory-Bounded A/RED"
           - SPIE_IVSP_2026.pdf : "Shallow vs. Deep Features for A/RED"
         """
-        if self.tile_db is None:
+        if self.annotation_manager:
+            anns = self.annotation_manager.get_annotations(video=video_path, use_scope=False)
+        elif self.tile_db is not None:
+            anns = self.tile_db.get_annotations_for_video(video_path)
+        else:
             return {"error": "No tile database loaded"}
 
-        anns = self.tile_db.get_annotations_for_video(video_path)
-        if not anns:
-            # Try matching by basename (DB stores resolved paths)
+        if not anns and self.tile_db is not None:
+            # Try matching by basename
             base = Path(video_path).name
             for v in self.tile_db.list_videos():
                 if Path(v).name == base:
-                    anns = self.tile_db.get_annotations_for_video(v)
+                    if self.annotation_manager:
+                        anns = self.annotation_manager.get_annotations(video=v, use_scope=False)
+                    else:
+                        anns = self.tile_db.get_annotations_for_video(v)
                     video_path = v
                     break
 
@@ -419,12 +434,12 @@ class DroneAREDController:
             th = meta.get("tile_height", 0) or getattr(tile_img, 'height', 0) if tile_img else 0
 
             if self.tile_db is not None and vpath and abs_f >= 0:
-                exact = self.tile_db.lookup(vpath, abs_f, row, col, tw, th)
+                key = TileKey(vpath, int(abs_f), int(row), int(col), int(tw or 0), int(th or 0))
+                exact = self.tile_db.lookup_key(key)
                 if exact:
                     label, rel = exact
                     if not self.edit_mode:
                         print(f"[Pipeline]   -> EXACT DB HIT for {Path(vpath).name} f{abs_f} [{row},{col}]: '{label}' (relevant={rel}). Auto (no GUI).")
-                        # Still feed embedding store for future similarity if present
                         if self.label_store is not None:
                             try:
                                 self.label_store.add(emb, label, rel)
@@ -480,8 +495,8 @@ class DroneAREDController:
                 try:
                     bx = meta.get("bbox", (col * tw, row * th, col * tw + tw, row * th + th))
                     cx, cy = bx[0], bx[1]
-                    self.tile_db.set_annotation(vpath, abs_f, row, col, tw, th, label, rel,
-                                                embedding=emb, crop_x=cx, crop_y=cy)
+                    key = TileKey(vpath, int(abs_f), int(row), int(col), int(tw or 0), int(th or 0))
+                    self.tile_db.set_annotation_for_key(key, label, rel, embedding=emb, crop_x=cx, crop_y=cy)
                 except Exception as e:
                     print(f"[Pipeline]   WARNING: failed to save to TileAnnotationDB: {e}")
 
@@ -850,9 +865,9 @@ class DroneAREDController:
                 existing = None
                 if self.tile_db is not None:
                     try:
-                        existing = self.tile_db.lookup(video_path, tile.frame_idx,
-                                                       tile.tile_row, tile.tile_col,
-                                                       tile.width, tile.height)
+                        key = TileKey(video_path, tile.frame_idx, tile.tile_row, tile.tile_col,
+                                      tile.width, tile.height)
+                        existing = self.tile_db.lookup_key(key)
                     except Exception:
                         existing = None
 
@@ -931,9 +946,9 @@ class DroneAREDController:
                 if self.tile_db is not None:
                     try:
                         cx, cy = tile.bbox[0], tile.bbox[1]
-                        self.tile_db.set_annotation(video_path, tile.frame_idx, tile.tile_row,
-                                                    tile.tile_col, tile.width, tile.height,
-                                                    label, rel, embedding=None, crop_x=cx, crop_y=cy)
+                        key = TileKey(video_path, tile.frame_idx, tile.tile_row, tile.tile_col,
+                                      tile.width, tile.height)
+                        self.tile_db.set_annotation_for_key(key, label, rel, embedding=None, crop_x=cx, crop_y=cy)
                     except Exception as e:
                         print(f"[Pipeline] Label Only save error: {e}")
 
