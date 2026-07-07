@@ -1937,6 +1937,9 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         # Virtual display window size (addressable frames). Actual live Tk widgets + PhotoImages
         # are limited to the current viewport + small buffer by the virtualization logic.
         self._displayed_count = 0
+        self._last_materialized_thumb = 180
+        self._last_thumb_w = 180
+        self._last_cols = 4
 
         self.title("Multi-Frame Label Browser - Adjustable Scroll + Per-Frame Labeling")
         base_w = int(1280 * min(self.ui_scale, 1.8))
@@ -1973,7 +1976,7 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         self.cols_var = tk.IntVar(value=4)
         self.cols_scale = ttk.Scale(top, from_=1, to=8, variable=self.cols_var,
                                     orient="horizontal", length=int(140*s),
-                                    command=lambda v: self._refresh_frame_strip())
+                                    command=self._on_cols_changed)
         self.cols_scale.pack(side="left", padx=4)
         ttk.Label(top, textvariable=self.cols_var, width=2).pack(side="left")
 
@@ -2019,7 +2022,7 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         # We drive updates from wheel + scheduled viewport; motion not needed.
 
         # RIGHT: Selected frame + actions + tile explorer launcher
-        right = ttk.LabelFrame(main, text="Selected Frame & Label Actions", width=int(420 * min(s, 1.5)))
+        right = ttk.LabelFrame(main, text="Selected Frame & Label Actions", width=int(480 * min(s, 1.5)))
         right.pack(side="right", fill="y")
         right.pack_propagate(False)
 
@@ -2045,7 +2048,7 @@ class MultiFrameLabelBrowser(tk.Toplevel):
 
         # Mini list of labels on the selected frame (for quick view)
         ttk.Label(right, text="Labels on selected frame:").pack(anchor="w", padx=4)
-        self.frame_labels_list = tk.Listbox(right, height=8, font=("TkDefaultFont", fs))
+        self.frame_labels_list = tk.Listbox(right, height=12, font=("TkDefaultFont", fs))
         self.frame_labels_list.pack(fill="both", expand=False, padx=4, pady=2)
         # Double-click list entry to edit immediately (streamline)
         self.frame_labels_list.bind("<Double-Button-1>", lambda e: self._edit_selected_tile_from_list())
@@ -2245,10 +2248,10 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         except Exception:
             scroll_frac = 0.0
 
-        current_thumb = max(80, int(self.thumb_w_var.get()))
+        current_thumb = self._get_effective_thumb_w()
         if current_thumb != getattr(self, '_last_thumb_w', -1):
             self.frame_thumbs.clear()
-            self._last_thumb_w = current_thumb
+        self._last_thumb_w = current_thumb  # always track latest effective for next comparison
 
         # Full clear of any previous virtual cards + widgets
         self._clear_all_materialized_cards()
@@ -2289,17 +2292,20 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         self._card_img_labels.clear()
         # Note: frame_cards and _card_windows will be populated lazily by _update_visible_cards
 
-        # Restore scroll (for col/thumb changes)
+        # Restore scroll (for col/thumb changes). Force Tk to commit the new scrollregion
+        # and sizes so the subsequent viewport update sees correct yview() + winfo.
         try:
+            self.strip_canvas.update_idletasks()
             self.strip_canvas.yview_moveto(scroll_frac)
+            self.strip_canvas.update_idletasks()
         except Exception:
             pass
 
         # Schedule the virtual viewport population (creates only near-visible cards with reserved blanks)
-        self._schedule_viewport_update(30)
+        self._schedule_viewport_update(25)
 
         # Kick async for whatever ends up visible
-        self.after(80, self._start_async_thumb_loading)
+        self.after(70, self._start_async_thumb_loading)
 
         # Re-highlight if needed (will apply when its card is (re)materialized)
         if self.selected_frame is not None:
@@ -2317,10 +2323,39 @@ class MultiFrameLabelBrowser(tk.Toplevel):
     def _get_displayed_frames(self):
         return self.sorted_frames[:getattr(self, '_displayed_count', len(self.sorted_frames))]
 
-    def _compute_layout_params(self):
-        """Return (cols, thumb_w, thumb_h, cell_w, row_h) for current slider settings."""
+    def _get_effective_thumb_w(self):
+        """Thumb width that incorporates current container width so frames scale up
+        when the browser window or frame strip section is resized larger.
+        The 'Thumb size' slider provides the base; extra horizontal space is
+        distributed to grow the actual thumbnail frames.
+        """
+        slider = max(80, int(self.thumb_w_var.get()))
+        try:
+            cw = self.strip_canvas.winfo_width()
+        except Exception:
+            cw = 0
         cols = max(1, int(self.cols_var.get()))
-        thumb_w = max(80, int(self.thumb_w_var.get()))
+        if cw > 120:
+            needed = slider * cols + 16
+            extra = cw - needed
+            if extra > 20:
+                add = extra // cols
+                eff = slider + add
+                max_fit = (cw - 16) // cols - 4
+                eff = min(eff, max(80, max_fit))
+                return max(80, min(520, eff))
+            # Canvas wide enough to naturally fit larger than slider
+            max_fit = (cw - 16) // cols - 4
+            if max_fit > slider:
+                return max(80, min(520, max_fit))
+        return slider
+
+    def _compute_layout_params(self):
+        """Return (cols, thumb_w, thumb_h, cell_w, row_h) for current slider settings.
+        Now uses effective thumb that grows with container width.
+        """
+        cols = max(1, int(self.cols_var.get()))
+        thumb_w = self._get_effective_thumb_w()
         thumb_h = int(thumb_w * 0.65)
         cell_w = thumb_w + 8
         text_block_h = int(28 * min(getattr(self, 'ui_scale', 1.6), 1.6))
@@ -2378,10 +2413,19 @@ class MultiFrameLabelBrowser(tk.Toplevel):
 
     def _place_or_update_card(self, fidx: int, x: int, y: int, thumb_w: int, thumb_h: int):
         """Ensure a card widget exists for fidx and is placed via create_window at (x,y).
-        If already placed, we can optionally move it (rare). Returns the card widget.
+        If already placed, try to move if its coords are stale (e.g. after cols change
+        without full clear). Also, never apply a cached PhotoImage if its pixel size
+        does not match the current thumb target — that would leave the "frame" small
+        inside a resized box.
         """
         if fidx in self._card_windows:
-            # Already live at some position; we could move if needed but positions are stable.
+            try:
+                win_id = self._card_windows[fidx]
+                coords = self.strip_canvas.coords(win_id)
+                if coords and (abs(coords[0] - x) > 2 or abs(coords[1] - y) > 2):
+                    self.strip_canvas.coords(win_id, x, y)
+            except Exception:
+                pass
             return self.frame_cards.get(fidx)
 
         card = self._create_card_widget(fidx, thumb_w, thumb_h)
@@ -2391,14 +2435,34 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         self._card_windows[fidx] = win_id
         self._materialized_frames.add(fidx)
 
-        # If we have a cached thumb already, apply it right away into the reserved slot
+        # If we have a cached thumb, ONLY apply if the image resolution roughly matches
+        # the slot we just created. Mismatched size (old cached after cols/thumb change)
+        # is the main cause of "boxes resize but the actual frame image stays small/old".
+        # Pop it so the async loader (which always uses live _get_effective) will regen.
+        applied = False
         if fidx in self.frame_thumbs:
             try:
                 tkimg = self.frame_thumbs[fidx]
+                if abs(getattr(tkimg, 'width', lambda: 0)() - thumb_w) <= 6:
+                    img_lbl = self._card_img_labels.get(fidx)
+                    if img_lbl and img_lbl.winfo_exists():
+                        img_lbl.configure(image=tkimg, text="")
+                        img_lbl.image = tkimg
+                        applied = True
+                else:
+                    # wrong size for this card's ph — drop so it gets regenerated at correct res
+                    self.frame_thumbs.pop(fidx, None)
+            except Exception:
+                pass
+
+        if not applied:
+            # Ensure the img_lbl is clean blank for the exact new size (in case previous content)
+            try:
                 img_lbl = self._card_img_labels.get(fidx)
                 if img_lbl and img_lbl.winfo_exists():
-                    img_lbl.configure(image=tkimg, text="")
-                    img_lbl.image = tkimg
+                    img_lbl.configure(image="", text="")
+                    if hasattr(img_lbl, 'image'):
+                        del img_lbl.image
             except Exception:
                 pass
 
@@ -2440,21 +2504,39 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         if n == 0:
             return
 
-        # Determine visible row range from scroll fraction
+        # Detect layout changes (cols or effective thumb/row size). If so, drop ALL
+        # currently materialized so they are recreated with correct ph dimensions,
+        # correct (x,y) positions for the *new* cols, and we can force correct-res thumbs.
+        # This prevents stale cards (old sizes or old column positions) from lingering
+        # and also ensures desired cards are always freshly placed after a cols change.
+        old_tw = getattr(self, '_last_materialized_thumb', 0)
+        old_c = getattr(self, '_last_cols', cols)
+        layout_changed = (abs(thumb_w - old_tw) > 5) or (old_c != cols)
+        if layout_changed and self._materialized_frames:
+            for fidx in list(self._materialized_frames):
+                self.frame_thumbs.pop(fidx, None)  # force fresh gen at the size used for new cards
+                self._destroy_card(fidx)
+            self.after(50, self._start_async_thumb_loading)
+        self._last_materialized_thumb = thumb_w
+        self._last_cols = cols
+
+        # Determine visible row range from scroll fraction using accurate total_rows
+        # (pixel y / row_h would also work since our coords are r * row_h).
+        # This fixes cases where previous n/cols float math + changing row_h left
+        # viewport with no desired cards → black empty canvas.
         try:
             top_f, bot_f = self.strip_canvas.yview()
-            canvas_h = max(100, self.strip_canvas.winfo_height())
         except Exception:
             top_f, bot_f = 0.0, 1.0
-            canvas_h = 400
 
-        first_visible_row = max(0, int(top_f * (n / max(1, cols)) - 1))
-        last_visible_row = int(bot_f * (n / max(1, cols)) + 1)
+        total_rows = (n + cols - 1) // cols if n else 1
+        first_visible_row = max(0, int(top_f * total_rows) - 2)
+        last_visible_row = int(bot_f * total_rows) + 2
 
-        # Buffer of extra rows above and below for smooth feel and prefetch
-        buffer_rows = 3
+        # Larger buffer helps ensure cards appear promptly on scroll / after layout change
+        buffer_rows = 5
         start_row = max(0, first_visible_row - buffer_rows)
-        end_row = min( (n + cols - 1) // cols , last_visible_row + buffer_rows )
+        end_row = min(total_rows, last_visible_row + buffer_rows)
 
         # The logical frame indices we want materialized now
         desired = set()
@@ -2463,6 +2545,17 @@ class MultiFrameLabelBrowser(tk.Toplevel):
                 idx = r * cols + c
                 if idx < n:
                     desired.add(displayed[idx])
+
+        # Safety: if desired came out empty for the current view (can happen transiently
+        # after layout/scroll frac changes), force at least the first couple rows of the
+        # current view so the user never sees pure black.
+        if not desired and n > 0:
+            top_row = max(0, int(top_f * total_rows))
+            for rr in range(top_row, min(total_rows, top_row + 3)):
+                for c in range(cols):
+                    idx = rr * cols + c
+                    if idx < n:
+                        desired.add(displayed[idx])
 
         # Unload anything materialized that is no longer desired
         for fidx in list(self._materialized_frames):
@@ -2496,8 +2589,8 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         # trigger the extender (non-destructive).
         try:
             _, bot = self.strip_canvas.yview()
-            if bot > 0.65:
-                self.after(80, self._check_load_more)
+            if bot > 0.60:
+                self.after(50, self._check_load_more)
         except Exception:
             pass
 
@@ -2640,8 +2733,6 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         """
         if not self.sorted_frames or not self.current_video:
             return
-        thumb_w = max(80, int(self.thumb_w_var.get())) if hasattr(self, 'thumb_w_var') else 180
-        max_h = int(thumb_w * 0.65)
 
         def worker():
             # Keep loading until everything for the current list is done.
@@ -2656,7 +2747,11 @@ class MultiFrameLabelBrowser(tk.Toplevel):
                 if next_f is None:
                     break  # nothing left to load for now
 
-                pil = self._generate_frame_pil(next_f, thumb_w, max_h)
+                # Snapshot current effective size on every item (layout/cols can change
+                # while a long worker is running; closed-over value would be stale).
+                cur_tw = self._get_effective_thumb_w()
+                cur_mh = int(cur_tw * 0.65)
+                pil = self._generate_frame_pil(next_f, cur_tw, cur_mh)
                 if pil is not None:
                     def schedule(f=next_f, p=pil):
                         try:
@@ -2720,7 +2815,7 @@ class MultiFrameLabelBrowser(tk.Toplevel):
             return
         try:
             _, bot = self.strip_canvas.yview()
-            if bot > 0.72 and self._displayed_count < len(self.sorted_frames):
+            if bot > 0.55 and self._displayed_count < len(self.sorted_frames):
                 old = self._displayed_count
                 # Smaller steps feel smoother; still plenty fast
                 self._displayed_count = min(len(self.sorted_frames), self._displayed_count + 80)
@@ -2754,6 +2849,18 @@ class MultiFrameLabelBrowser(tk.Toplevel):
             except Exception:
                 pass
         self._thumb_debounce = self.after(280, self._refresh_frame_strip)
+
+    def _on_cols_changed(self, val):
+        """Debounced handler for the columns slider.
+        Live full refreshes on every tick during drag destroy cards constantly and
+        can leave the viewport without materialized frames (black areas) until settle.
+        """
+        if hasattr(self, '_cols_debounce'):
+            try:
+                self.after_cancel(self._cols_debounce)
+            except Exception:
+                pass
+        self._cols_debounce = self.after(220, self._refresh_frame_strip)
 
     def _highlight_card(self, frame_idx: Optional[int]):
         # If the target is in the addressable set but not live yet, try to bring it in.
@@ -2823,7 +2930,7 @@ class MultiFrameLabelBrowser(tk.Toplevel):
 
         explorer = tk.Toplevel(self)
         explorer.title(f"Tile Label Editor - Frame {self.selected_frame}")
-        explorer.geometry(f"{int(1100*min(self.ui_scale,1.6))}x{int(700*min(self.ui_scale,1.6))}")
+        explorer.geometry(f"{int(1280*min(self.ui_scale,1.6))}x{int(820*min(self.ui_scale,1.6))}")
         explorer.resizable(True, True)
 
         top = ttk.Frame(explorer)
@@ -2891,8 +2998,8 @@ class MultiFrameLabelBrowser(tk.Toplevel):
                 ttk.Label(container, text="No tiles generated for this frame (frame too small?).").pack()
                 return
 
-            # Layout: ~ 5-6 columns
-            cols = 6
+            # Layout: fewer columns + larger thumbs so tiles are easy to see and click
+            cols = 4
             for idx, tile in enumerate(tiles):
                 # Lookup current label
                 label, rel = None, False
@@ -2909,11 +3016,11 @@ class MultiFrameLabelBrowser(tk.Toplevel):
                 # Card
                 card = ttk.Frame(container, relief="groove", borderwidth=1)
                 r, c = divmod(idx, cols)
-                card.grid(row=r, column=c, padx=2, pady=2)
+                card.grid(row=r, column=c, padx=3, pady=3)
 
-                # Small preview of the tile
+                # Larger preview of the tile
                 small = tile.image.copy()
-                small.thumbnail((110, 110), Image.Resampling.LANCZOS)
+                small.thumbnail((180, 180), Image.Resampling.LANCZOS)
                 tkimg = ImageTk.PhotoImage(small)
                 self._tile_photo_refs.append(tkimg)  # keep
 
@@ -2921,7 +3028,7 @@ class MultiFrameLabelBrowser(tk.Toplevel):
                 img_lbl.pack()
 
                 status = f"{label or 'unlabeled'}{' [R]' if rel else ''}"
-                ttk.Label(card, text=status, width=14, anchor="center").pack()
+                ttk.Label(card, text=status, width=18, anchor="center").pack()
 
                 # Click to label
                 def make_edit(t=tile, i=idx):
@@ -2943,12 +3050,12 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         """Quick label dialog for a specific tile. Saves to DB and refreshes grid."""
         q = tk.Toplevel(parent)
         q.title(f"Label Tile r{tile.tile_row}c{tile.tile_col} (f{tile.frame_idx})")
-        q.geometry("520x620")
+        q.geometry("680x780")
 
         s = self.ui_scale
         # Image
         big = tile.image.copy()
-        big.thumbnail((380, 380), Image.Resampling.LANCZOS)
+        big.thumbnail((420, 420), Image.Resampling.LANCZOS)
         tkbig = ImageTk.PhotoImage(big)
         ttk.Label(q, image=tkbig).pack(pady=4)
         # keep ref on q
@@ -2978,7 +3085,7 @@ class MultiFrameLabelBrowser(tk.Toplevel):
             suggested_rel = self.class_relevance[cur_label]
 
         ttk.Label(q, text="Existing classes (double-click or select + Assign):").pack(anchor="w", padx=8)
-        lb = tk.Listbox(q, height=6, exportselection=False)
+        lb = tk.Listbox(q, height=10, exportselection=False)
         lb.pack(fill="x", padx=8)
         for k in sorted(set(known)):
             lb.insert("end", k)
@@ -3064,6 +3171,7 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         # Simple editor (reuse spirit of review, but quick)
         ed = tk.Toplevel(self)
         ed.title(f"Edit label f{ann['abs_frame']} r{ann['tile_row']}c{ann['tile_col']}")
+        ed.geometry("520x620")
         if img:
             disp = img.copy()
             disp.thumbnail((320, 320))
