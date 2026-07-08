@@ -922,7 +922,7 @@ class MainWindow:
         # --- Metrics box (Query Precision + Relevant Recall as defined in the A/RED papers) ---
         # See IJSC_2026-1.pdf and SPIE_IVSP_2026.pdf for exact definitions.
         # Scrollable so the full expanded audit is readable.
-        metrics_frame = ttk.LabelFrame(right, text="Metrics (Query Precision / Relevant Recall)")
+        metrics_frame = ttk.LabelFrame(right, text="Metrics (Query Precision / Relevant Recall - RR includes first appearances)")
         metrics_frame.pack(fill="x", pady=(int(6*s), 0))
 
         # Container + vertical scrollbar for the (potentially very long) detailed audit
@@ -938,7 +938,7 @@ class MainWindow:
         self.metrics_text.configure(yscrollcommand=ysb.set)
 
         self.metrics_text.insert("1.0", "Click 'Compute from DB (last video)' after a run.\n"
-                                        "EXPANDED + SCROLLABLE: every datapoint - total person tiles, person tiles queried, total A/RED queries (caches count as user queries), full work for QP/RR.")
+                                        "EXPANDED + SCROLLABLE: every datapoint - total person tiles, person tiles queried, total A/RED queries (caches count as user queries), full work for QP/RR (RR includes first appearances of classes per paper positives def).")
         self.metrics_text.config(state="disabled")
 
         btn_row = ttk.Frame(metrics_frame)
@@ -1204,7 +1204,7 @@ class MainWindow:
         lines = [
             "========== FULL A/RED METRICS AUDIT (EVERY SINGLE DATAPOINT) ==========",
             f"Video: {result.get('video', '?')}",
-            f"QP: {result.get('query_precision', 0):.4f}    RR (over relevant only): {result.get('relevant_recall', 0):.4f}",
+            f"QP: {result.get('query_precision', 0):.4f}    RR (incl. first appearances of classes): {result.get('relevant_recall', 0):.4f}",
             f"Total queries A/RED made (CACHE QUERIES COUNT AS USER QUERIES): {result.get('ared_queries_made', result.get('n_actual_queries', 0))}",
             f"Total stream tiles seen: {result.get('total_stream_tiles', result.get('total_points', 0))}",
             f"Total labeled (people-tagged) tiles in DB: {result.get('n_labeled', 0)}",
@@ -1234,17 +1234,24 @@ class MainWindow:
             lines.append("4. SHOULD_QUERY GT POSITIVES (paper definition):")
             lines.append(f"   N_SHOULD_QUERY_TOTAL = {audit.get('N_SHOULD_QUERY_TOTAL', audit.get('should_query_total', '?'))}")
             lines.append(f"   N_FIRST_OF_CLASS     = {audit.get('N_FIRST_OF_CLASS', '?')}")
-            lines.append(f"   N_RELEVANT_SHOULD    = {audit.get('RELEVANT_SHOULD_POSITIVES', '?')}")
-            lines.append("   (Note: PERSON is treated as a relevant class; only relevant counts are used for core metrics)")
+            lines.append(f"   N_RELEVANT_CLASS_SAMPLES = {audit.get('RELEVANT_CLASS_SAMPLES', audit.get('RELEVANT_POSITIVES_FOR_RR', '?'))}")
+            lines.append("   (Note: RR uses ALL positives per paper: first appearances of any class + samples from relevant classes. See section 6.)")
             lines.append("")
-            lines.append("5. A/RED QUERY OUTCOMES:")
-            lines.append(f"   TP (queried + should) = {result.get('tp', audit.get('TP', '?'))}")
-            lines.append(f"   FP (queried but !should) = {result.get('fp', audit.get('FP', '?'))}")
-            lines.append(f"   FN (should but !queried) = {result.get('fn', audit.get('FN', '?'))}")
+            lines.append("5. A/RED QUERY OUTCOMES (broad positives for QP and RR):")
+            lines.append(f"   TP (queried a positive) = {result.get('tp', audit.get('TP', '?'))}")
+            lines.append(f"   FP (queried but not a positive) = {result.get('fp', audit.get('FP', '?'))}")
+            lines.append(f"   FN (positive but not queried) = {result.get('fn', audit.get('FN', '?'))}")
+            lines.append("   Note: positives = (first sample of any class) OR (any sample of a relevant-designated class)")
             lines.append("")
-            lines.append("6. EXACT CALCULATIONS (all work shown):")
+            lines.append("   (For reference: relevant-class samples only)")
+            lines.append(f"   relevant class samples = {audit.get('RELEVANT_CLASS_SAMPLES', result.get('n_relevant_positives', '?'))}")
+            lines.append(f"   relevant TP (queried among them) = {result.get('relevant_tp', audit.get('RELEVANT_TP', '?'))}")
+            lines.append(f"   relevant FN = {result.get('relevant_fn', audit.get('RELEVANT_FN', '?'))}")
+            lines.append("")
+            lines.append("6. EXACT CALCULATIONS (formulas + numbers from papers):")
             lines.append(f"   QP = TP / (TP + FP)   --> {result.get('query_precision', 0)}")
             lines.append(f"   RR = TP / (TP + FN)   --> {result.get('relevant_recall', 0)}")
+            lines.append(f"   (RR includes first appearances of classes + relevant samples)")
             lines.append(f"   (Cache-satisfied A/RED decisions are included in the query count above.)")
             lines.append("")
             bl = audit.get("RANDOM_BASELINE", {})
@@ -2136,6 +2143,7 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         self._last_thumb_w = 180
         self._last_cols = 4
 
+        # Window setup (this must always run)
         self.title("Multi-Frame Label Browser - Adjustable Scroll + Per-Frame Labeling")
         base_w = int(1280 * min(self.ui_scale, 1.8))
         base_h = int(820 * min(self.ui_scale, 1.8))
@@ -2145,6 +2153,76 @@ class MultiFrameLabelBrowser(tk.Toplevel):
 
         self._build_ui()
         self._load_videos()
+
+    def _get_live_tile_size(self):
+        """Return (tw, th) preferring live GUI entry boxes (the typed values in MainWindow),
+        then .config on main_window, then controller/tiler/config. This is what makes
+        the multi-frame browser respect what the user typed without pressing Start.
+        """
+        tw = th = None
+        source = "default"
+        try:
+            # 1) Live typed boxes in the main control window (highest priority)
+            if self.main_window is not None:
+                if hasattr(self.main_window, '_tile_w_var'):
+                    try:
+                        val = str(self.main_window._tile_w_var.get()).strip()
+                        if val:
+                            tw = int(val)
+                            source = "live_var_w"
+                    except Exception:
+                        pass
+                if hasattr(self.main_window, '_tile_h_var'):
+                    try:
+                        val = str(self.main_window._tile_h_var.get()).strip()
+                        if val:
+                            th = int(val)
+                            source = "live_var_h" if source == "live_var_w" else "live_var"
+                    except Exception:
+                        pass
+
+            # 2) Main window's config (what was last applied on Start, or initial)
+            if (tw is None or th is None) and self.main_window is not None and hasattr(self.main_window, 'config'):
+                try:
+                    tcfg = self.main_window.config.tiling
+                    tw = tw or getattr(tcfg, 'tile_width', None)
+                    th = th or getattr(tcfg, 'tile_height', None)
+                    if tw and th and source == "default":
+                        source = "main_config"
+                except Exception:
+                    pass
+
+            # 3) Live controller tiler (if one is active and sizes match intent)
+            if (tw is None or th is None) and self.controller and getattr(self.controller, 'tiler', None):
+                try:
+                    tw = tw or getattr(self.controller.tiler, 'tile_w', None)
+                    th = th or getattr(self.controller.tiler, 'tile_h', None)
+                    if tw and th and source == "default":
+                        source = "controller_tiler"
+                except Exception:
+                    pass
+
+            # 4) Controller config
+            if (tw is None or th is None) and self.controller and hasattr(self.controller, 'config'):
+                try:
+                    tcfg = self.controller.config.tiling
+                    tw = tw or getattr(tcfg, 'tile_width', None)
+                    th = th or getattr(tcfg, 'tile_height', None)
+                    if tw and th and source == "default":
+                        source = "controller_config"
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        if not tw or not th:
+            tw = th = 256
+            source = "hard_default_256"
+        try:
+            print(f"[MultiFrameBrowser] live tile size -> {tw}x{th} (source={source})")
+        except Exception:
+            pass
+        return int(tw), int(th)
 
     def _build_ui(self):
         s = self.ui_scale
@@ -2321,16 +2399,16 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         if not v:
             return
         self.current_video = v
-        # Prefer manager (has scope) for queries; falls back to direct with size filter.
-        tw = th = None
+
+        # Always go through the helper so we read the live entry boxes the user just typed.
+        tw, th = self._get_live_tile_size()
+
+        # Debug so user can see what size the browser actually decided to use
         try:
-            if self.controller and getattr(self.controller, 'tiler', None):
-                tw, th = self.controller.tiler.tile_w, self.controller.tiler.tile_h
-            elif self.main_window and hasattr(self.main_window, 'config'):
-                tcfg = self.main_window.config.tiling
-                tw, th = tcfg.tile_width, tcfg.tile_height
+            print(f"[MultiFrameBrowser] Using tile size for annotations: {tw}x{th} (from live boxes if present)")
         except Exception:
             pass
+
         if self.annotation_manager:
             self.annotation_manager.set_scope(video_path=v, tile_size=(tw, th) if tw else None)
             anns = self.annotation_manager.get_annotations(video=v, use_scope=True)
@@ -2843,7 +2921,9 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         if not self.current_video:
             return
         try:
-            anns = self.tile_db.get_annotations_for_video(self.current_video)
+            # Scope using the shared live-value helper (reads the boxes the user typed)
+            tw, th = self._get_live_tile_size()
+            anns = self.tile_db.get_annotations_for_video(self.current_video, tile_width=tw, tile_height=th)
             self.frame_to_anns = {}
             for a in anns:
                 f = a["abs_frame"]
@@ -3204,12 +3284,37 @@ class MultiFrameLabelBrowser(tk.Toplevel):
             except Exception:
                 from drone_ared.tiling import GridTiler
 
-            # Use controller tiler if available, else sensible default
+            # Use the shared helper so the tile explorer also sees the live entry boxes.
+            tw, th = self._get_live_tile_size()
+            sx = sy = None
+            try:
+                if self.main_window and hasattr(self.main_window, 'config'):
+                    tcfg = self.main_window.config.tiling
+                    sx = getattr(tcfg, 'stride_x', None)
+                    sy = getattr(tcfg, 'stride_y', None)
+            except Exception:
+                pass
+
+            # Debug so user can see what size the browser actually decided to use
+            try:
+                print(f"[MultiFrameBrowser] Using tile size for explorer: {tw}x{th}")
+            except Exception:
+                pass
+
+            # Prefer a live controller tiler only if its size matches the live values (otherwise
+            # create fresh so we respect live param changes without restart).
+            tiler = None
             if self.controller and getattr(self.controller, 'tiler', None):
-                tiler = self.controller.tiler
-            else:
-                # Fallback (matches common config)
-                tiler = GridTiler(tile_width=256, tile_height=256)
+                ct = self.controller.tiler
+                if getattr(ct, 'tile_w', None) == tw and getattr(ct, 'tile_h', None) == th:
+                    tiler = ct
+            if tiler is None:
+                tiler = GridTiler(tile_width=tw, tile_height=th, stride_x=sx, stride_y=sy)
+
+            try:
+                print(f"[MultiFrameBrowser] Tiling frame {self.selected_frame} at {tw}x{th}")
+            except Exception:
+                pass
 
             tiles = tiler.tile_frame(frame_rgb, self.selected_frame, 0, video_path=self.current_video)
             self.current_frame_tiles = tiles

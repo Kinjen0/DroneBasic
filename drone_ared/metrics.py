@@ -6,18 +6,19 @@ Implements the exact metrics used in the A/RED papers:
 - Relevant Recall (RR)
 - Random baseline at matched query budget
 
-Definitions (directly from SPIE_IVSP_2026 and IJSC_2026-1):
+Definitions (directly from SPIE_IVSP_2026 Sec.5 and IJSC_2026-1):
 
 A/RED is evaluated as a *binary classifier on the query / no-query decision*.
 
-Positives (things that SHOULD cause a query):
-- The first sample of any previously unseen class (new class discovery)
-- Any sample from a class that the user has designated as "relevant"
+Positives (things that SHOULD cause a query) -- see paper:
+  i) They are the first sample of a given class, or
+ ii) they are samples from classes designated as relevant.
 
-Query Precision = TP / (TP + FP)
-Relevant Recall = TP / (TP + FN)   (only considering relevant-class points)
+Query Precision (QP) = TP / (TP + FP)          -- over ALL positives above
+Relevant Recall (RR) = TP / (TP + FN)          -- over ALL positives (first appearances of any class + samples from relevant classes)
 
 "Precision" and "Recall" in the papers always refer to these query-decision metrics.
+Random baseline: QP_RDM ≈ Relevant_Rate (fraction of points from relevant classes)
 """
 
 from __future__ import annotations
@@ -56,9 +57,13 @@ def compute_should_query_from_annotations(
     Given a list of annotations (as returned by TileAnnotationDB.get_annotations_for_video),
     return a dict: tile_key -> should_query (bool)
 
-    A tile should be queried if:
-      - It is the first time we have seen its *final* label in the stream order, OR
-      - Its label was marked relevant.
+    Matches the paper definition exactly (SPIE Sec.5):
+      Positives (should query) =
+        i) the first sample of a given class, OR
+       ii) samples from classes designated as relevant.
+
+    "Designated as relevant" is at *class* level: if the user ever marked any
+    instance of the class as relevant, then ALL samples of that class are positives.
 
     `order_by` controls how we determine "first seen":
       - "stream" : use the order they appear in the list (assumes caller sorted by frame/position)
@@ -72,19 +77,25 @@ def compute_should_query_from_annotations(
     if order_by == "abs_frame":
         anns.sort(key=lambda a: (a.get("abs_frame", 0), a.get("tile_row", 0), a.get("tile_col", 0)))
 
+    # Class-level designation: a class is "relevant" if any of its annotations were marked relevant.
+    # This matches the paper language: "samples from classes designated as relevant."
+    relevant_classes: Set[str] = {
+        str(a.get("label", "")) for a in anns if a.get("relevant")
+    }
+
     seen_classes: Set[str] = set()
     should_query: Dict[Tuple, bool] = {}
 
     for a in anns:
         key = make_tile_key(a)
         label = str(a.get("label", ""))
-        is_relevant = bool(a.get("relevant", False))
 
         is_first = label not in seen_classes
         if is_first:
             seen_classes.add(label)
 
-        should = is_first or is_relevant
+        is_from_relevant = label in relevant_classes
+        should = is_first or is_from_relevant
         should_query[key] = should
 
     return should_query
@@ -108,7 +119,7 @@ def compute_query_metrics(
 
     Returns a dict with:
       - query_precision
-      - relevant_recall
+      - relevant_recall   # uses full positives (firsts of any class + relevant-class samples)
       - tp, fp, fn, tn
       - n_queries (actual)
       - n_should_query
@@ -133,15 +144,9 @@ def compute_query_metrics(
             fp += 1
         # tn not tracked explicitly
 
-        # For Relevant Recall we only care about points where the *final* label is relevant.
-        # We approximate by checking if the point was marked should_query *because of relevance*.
-        # A better way is to also pass per-point "is_relevant" .
-        # For now we use a simple heuristic: if it contributed to should_query and is relevant in spirit.
-        # We improve this below with richer input.
-
-    # Simpler and more accurate: we will also compute relevant-only numbers if caller provides richer data.
-    # For this basic version we compute RR only over points that "should" be queried *and* are from relevant classes.
-    # The caller can pass a separate relevant_should set if desired.
+        # Note: relevant_recall (primary) uses the full set of positives defined for the task
+        # (first sample of any class OR samples from relevant classes). See evaluate_... for
+        # the relevant-class-only reference stats.
 
     n_queries = len(actual_set)
     n_should = sum(1 for v in should_query.values() if v)
@@ -172,7 +177,7 @@ def compute_relevant_recall_only(
     actual_queried: List[Tuple],
     should_query_relevant: Dict[Tuple, bool],   # only the points that are relevant-class
 ) -> float:
-    """Relevant Recall computed strictly over relevant-class points."""
+    """Recall computed strictly over samples from relevant-designated classes (for reference only; primary RR includes first appearances)."""
     if not should_query_relevant:
         return 0.0
     actual_set = set(actual_queried)
@@ -245,8 +250,8 @@ def evaluate_from_annotations_and_queries(
         The decision to query counts fully.
     processed_keys: if provided, filter annotations and should-computation to *only*
         the tiles that were actually sent to A/RED in this run. This ensures we
-        only count relevant (and first) tiles/classes that were actually presented
-        to A/RED (addresses the "only counting relevant classes that are actually sent").
+        only count positives (firsts + relevant) for tiles/classes that were actually presented
+        to A/RED.
     """
     if processed_keys:
         proc_set = set(processed_keys)
@@ -254,24 +259,37 @@ def evaluate_from_annotations_and_queries(
 
     should = compute_should_query_from_annotations(annotations)
 
-    # Build a "relevant only" should set for cleaner RR
-    # (per papers: Relevant Recall considers only points from relevant classes)
+    # Determine relevant classes at class level (consistent with updated should_query logic)
+    relevant_classes: Set[str] = {
+        str(a.get("label", "")) for a in annotations if a.get("relevant")
+    }
+
+    # Compute relevant-class-only stats for reference / detailed audit (not used for primary RR).
+    # Primary RR now uses the full positives set (firsts of any class + rel samples).
     relevant_only_should = {}
     for a in annotations:
         key = make_tile_key(a)
-        is_rel = bool(a.get("relevant", False))
-        if should.get(key, False) and is_rel:
+        if str(a.get("label", "")) in relevant_classes:
             relevant_only_should[key] = True
 
     metrics = compute_query_metrics(actual_queried_keys, should, total_points)
-    # Per papers: Relevant Recall only considers points from relevant classes.
-    # We report the strict version as the primary relevant_recall.
-    strict_rr = round(
-        compute_relevant_recall_only(actual_queried_keys, relevant_only_should), 4
-    )
+
+    # RR now uses the full set of positives (including first appearances of ANY class)
+    # per the requirement to match the paper definition of positives for both QP and RR.
+    # We still compute the "relevant classes only" version for reference / detailed stats.
+    actual_set = set(actual_queried_keys)
+    n_relevant_pos = len(relevant_only_should)
+    relevant_tp = sum(1 for k in relevant_only_should if k in actual_set)
+    relevant_fn = n_relevant_pos - relevant_tp
+    strict_rr = round(relevant_tp / n_relevant_pos, 4) if n_relevant_pos > 0 else 0.0
+
     metrics["relevant_recall_strict"] = strict_rr
-    metrics["relevant_recall"] = strict_rr  # primary RR is over relevant only
-    # (the broad rr from compute_query_metrics includes first-of-class for non-relevant)
+    # Do NOT override relevant_recall -- keep the broad version from compute_query_metrics
+    # which does RR = TP / (TP + FN) over ALL positives (firsts of any + relevant samples)
+    # Expose the relevant-only numbers for the detailed breakdown / auditing
+    metrics["relevant_tp"] = relevant_tp
+    metrics["relevant_fn"] = relevant_fn
+    metrics["n_relevant_positives"] = n_relevant_pos
 
     # Use override if provided (from live stats ared_queries, which counts cache decisions)
     # Per user: cache queries are user queries and count fully for "total queries A_RED made"
@@ -281,7 +299,12 @@ def evaluate_from_annotations_and_queries(
         metrics["n_actual_queries"] = n_queries
 
     total = metrics["total_points"]
-    rel_rate = metrics["relevant_rate"]
+    # Use *class-relevant point rate* for the random baseline (paper's "Relevant_Rate").
+    # This is the fraction of streamed points whose final class was designated relevant.
+    # (Broader n_should includes first-of-irrelevant too; paper baseline approx uses relevant anomalies rate.)
+    n_rel_class_points = sum(1 for a in annotations if str(a.get("label", "")) in relevant_classes)
+    rel_rate = n_rel_class_points / max(1, total) if total > 0 else 0.0
+    metrics["relevant_rate"] = round(rel_rate, 4)
     # Recompute query_rate using authoritative n_queries (important for display)
     metrics["query_rate"] = round(n_queries / max(1, total), 4)
 
@@ -300,7 +323,8 @@ def evaluate_from_annotations_and_queries(
     # Raw class counts
     from collections import Counter
     label_counts = Counter(str(a.get("label","")) for a in annotations)
-    relevant_counts = Counter(str(a.get("label","")) for a in annotations if a.get("relevant"))
+    # relevant class counts now based on designation (any tile of class marked rel designates the class)
+    relevant_counts = Counter(str(a.get("label","")) for a in annotations if str(a.get("label","")) in relevant_classes)
 
     # People (person class) specific
     total_person_tiles = label_counts.get("person", 0)
@@ -315,8 +339,8 @@ def evaluate_from_annotations_and_queries(
             person_queried_keys.append(k)
     total_person_tiles_queried = len(person_queried_keys)
 
-    # Similarly for all relevant
-    relevant_queried = sum(1 for a in annotations if a.get("relevant") and make_tile_key(a) in actual_set)
+    # Similarly for all relevant (using class designation for consistency with RR)
+    relevant_queried = sum(1 for a in annotations if str(a.get("label", "")) in relevant_classes and make_tile_key(a) in actual_set)
 
     # Firsts computation (exact order used for "should")
     seen = set()
@@ -328,28 +352,33 @@ def evaluate_from_annotations_and_queries(
             first_of_class[lab] = a.get("abs_frame", -1)
 
     n_first = len(first_of_class)
-    n_rel_should = len(relevant_only_should)
+    # n_rel_pos already in metrics; keep for any legacy refs in detailed
+    n_rel_should = len(relevant_only_should)  # alias for the RR positives count
 
-    # Recompute should_query breakdown
+    # Recompute should_query breakdown (approximate; main logic is in compute_should_query_from_annotations)
     should_from_first = 0
     should_from_relevant_only = 0
     should_from_both = 0
     for a in annotations:
         key = make_tile_key(a)
         if not should.get(key, False): continue
-        is_first = str(a.get("label","")) in first_of_class and first_of_class[str(a.get("label",""))] == a.get("abs_frame", -1)  # rough
-        is_rel = a.get("relevant")
-        if is_first and is_rel:
+        lab = str(a.get("label", ""))
+        is_first_approx = lab in first_of_class and first_of_class.get(lab) == a.get("abs_frame", -1)
+        is_rel_class = lab in relevant_classes
+        if is_first_approx and is_rel_class:
             should_from_both += 1
-        elif is_first:
+        elif is_first_approx:
             should_from_first += 1
-        elif is_rel:
+        elif is_rel_class:
             should_from_relevant_only += 1
 
     # Full TP/FP/FN already in metrics, but we document
     tp = metrics["tp"]
     fp = metrics["fp"]
     fn = metrics["fn"]
+    rel_tp = metrics.get("relevant_tp", 0)
+    rel_fn = metrics.get("relevant_fn", 0)
+    n_rel_pos = metrics.get("n_relevant_positives", 0)
 
     # Build giant transparent report
     n_sent = len(processed_keys) if processed_keys is not None else None
@@ -373,19 +402,21 @@ def evaluate_from_annotations_and_queries(
             "from_first_only_approx": should_from_first,
             "from_relevant_only_approx": should_from_relevant_only,
             "from_both_approx": should_from_both,
-            "note": "Exact should computed per paper rule in compute_should_query_from_annotations. Filtered to only tiles sent in this run if processed_keys provided."
+            "note": "Exact should computed per paper rule (positives = first of any class OR samples of relevant classes). Filtered to only tiles sent in this run if processed_keys provided."
         },
-        "RELEVANT_SHOULD_POSITIVES": n_rel_should,
+        "RELEVANT_CLASS_SAMPLES": n_rel_pos,
+        "RELEVANT_TP": rel_tp,
+        "RELEVANT_FN": rel_fn,
         "TP": tp,
         "FP": fp,
         "FN": fn,
         "TN_NOT_TRACKED": "We only care about query decisions (positives for the query task)",
-        "QUERY_PRECISION_WORK": f"QP = {tp} / ({tp} + {fp}) = {metrics['query_precision']}",
-        "RELEVANT_RECALL_WORK": f"RR (relevant only) = TP / (TP + FN over relevant_should) = {metrics['relevant_recall']}",
+        "QUERY_PRECISION_WORK": f"QP = {tp} / ({tp} + {fp}) = {metrics['query_precision']}   (TP/FP over ALL positives: first-of-any-class OR rel-class samples)",
+        "RELEVANT_RECALL_WORK": f"RR = {tp} / ({tp} + {fn}) = {metrics['relevant_recall']}   (TP / (TP + FN) over ALL positives, INCLUDING first appearances of classes)",
         "RANDOM_BASELINE": baseline,
         "TOTAL_STREAM_TILES_USED_FOR_RATES": total,
-        "NOTE_ON_TOTAL": "total_points uses # tiles actually sent to A/RED this run (from processed). Only relevant tiles/classes that were sent are counted in should/positives (per the check requested).",
-        "PAPER_REFERENCES": "SPIE_IVSP_2026 Sec.5 eq.8-11; IJSC_2026-1 Alg.1 + evaluation; PerformanceMetricsPlan.md"
+        "NOTE_ON_TOTAL": "total_points uses # tiles actually sent to A/RED this run (from processed). Only tiles actually sent are used for should/positives (firsts of any class + relevant class samples).",
+        "PAPER_REFERENCES": "SPIE_IVSP_2026 Sec.5 eq.8-11 (positives = i first sample or ii relevant class); IJSC_2026-1 Alg.1 + evaluation; PerformanceMetricsPlan.md"
     }
 
     # Also keep the older audit for compatibility

@@ -1,0 +1,12 @@
+First question. About the metrics for RR. Of note, the First appearence of each class. 
+I can partially manage this by going through and trying to find the first occurance of the class
+But this has issues, mostly relating to my ability to spot them lol. 
+
+On that note, How do we decide when to make a new class? I am counting most "generic" background as just grass. 
+But I have special sections for sidewalk and tire marks and construction. 
+
+I feel when I get too specefic, I will introduce issues relating to my own biases, as I have to pick one when a tile may hold more than one.
+So I feel simpler is better. 
+
+Perhaps we need to move away from the idea of "Live footage." As currently, especially with the "warmup" period, 
+the algorithm makes too many queries to go along with a live system.
