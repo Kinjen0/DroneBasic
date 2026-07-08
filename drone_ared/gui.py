@@ -3211,59 +3211,57 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         self.browser_status_var.set(f"Selected frame {frame_idx}. Use 'Explore & Label Tiles on this Frame' for the per-frame label creation grid.")
 
     def _open_frame_tile_explorer(self):
-        """The 'label creation section for that frame'.
-        Decodes the frame, tiles it, shows all tiles (labeled or not) in a grid.
-        Clicking a tile lets you create/edit its label.
-        """
         if self.selected_frame is None or not self.current_video:
             messagebox.showinfo("Explorer", "Select a frame first.")
             return
-
+    
         explorer = tk.Toplevel(self)
         explorer.title(f"Tile Label Editor - Frame {self.selected_frame}")
-        explorer.geometry(f"{int(1280*min(self.ui_scale,1.6))}x{int(820*min(self.ui_scale,1.6))}")
+        explorer.geometry(f"{int(1450 * min(self.ui_scale, 1.8))}x{int(920 * min(self.ui_scale, 1.8))}")
+        explorer.minsize(1100, 750)
         explorer.resizable(True, True)
-
+    
         top = ttk.Frame(explorer)
-        top.pack(fill="x", padx=6, pady=4)
-        ttk.Label(top, text=f"Frame {self.selected_frame} — all tiles (click any to label/edit)").pack(side="left")
-
-        # Scrollable grid container — we make it fill the available width using dynamic columns
-        canvas = tk.Canvas(explorer, bg="#222")
+        top.pack(fill="x", padx=8, pady=6)
+        ttk.Label(top, text=f"Frame {self.selected_frame} — click any tile to label/edit").pack(side="left")
+        ttk.Button(top, text="Refresh / Re-tile", 
+                   command=lambda: self._populate_frame_tile_grid(explorer, tile_container, canvas)
+                  ).pack(side="right", padx=4)
+    
+        canvas = tk.Canvas(explorer, bg="#1f1f1f", highlightthickness=0)
         vsb = ttk.Scrollbar(explorer, orient="vertical", command=canvas.yview)
         canvas.configure(yscrollcommand=vsb.set)
         vsb.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
-
+    
         tile_container = ttk.Frame(canvas)
         self._tile_explorer_win = canvas.create_window((0, 0), window=tile_container, anchor="nw")
-        tile_container.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-
-        # Make the inner content try to use the full canvas width (prevents large black empty region)
-        def _on_explorer_resize(event=None):
+    
+        def _resize_container(event=None):
             try:
-                cw = max(200, canvas.winfo_width())
-                canvas.itemconfig(self._tile_explorer_win, width=cw)
+                cw = canvas.winfo_width()
+                if cw > 100:
+                    canvas.itemconfig(self._tile_explorer_win, width=cw)
             except Exception:
                 pass
-        canvas.bind("<Configure>", _on_explorer_resize, add="+")
-
-        # Initial population (after widgets exist)
-        self.after(50, lambda: self._populate_frame_tile_grid(explorer, tile_container, canvas))
-
-        # Refresh button (now tile_container exists)
-        ttk.Button(top, text="Re-tile & Refresh",
-                   command=lambda: self._populate_frame_tile_grid(explorer, tile_container, canvas)).pack(side="right")
-
+            
+        canvas.bind("<Configure>", _resize_container)
+    
+        explorer.update_idletasks()
+        self.after(30, lambda: self._populate_frame_tile_grid(explorer, tile_container, canvas))
+        self.after(120, _resize_container)
+    
     def _populate_frame_tile_grid(self, explorer_win, container, canvas_ref=None):
-        """Decode frame, tile it, show clickable tile cards in the container."""
+        """Improved version with better sizing and layout."""
         for w in container.winfo_children():
             w.destroy()
+
         self.current_frame_tiles = []
         self.current_frame_tile_labels = {}
         self._tile_photo_refs.clear()
 
         if not self.current_video or self.selected_frame is None:
+            ttk.Label(container, text="Could not load frame.").pack()
             return
 
         try:
@@ -3278,65 +3276,35 @@ class MultiFrameLabelBrowser(tk.Toplevel):
 
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-            # Lazy import to avoid hard dep at module load time
             try:
                 from .tiling import GridTiler
             except Exception:
                 from drone_ared.tiling import GridTiler
 
-            # Use the shared helper so the tile explorer also sees the live entry boxes.
             tw, th = self._get_live_tile_size()
-            sx = sy = None
-            try:
-                if self.main_window and hasattr(self.main_window, 'config'):
-                    tcfg = self.main_window.config.tiling
-                    sx = getattr(tcfg, 'stride_x', None)
-                    sy = getattr(tcfg, 'stride_y', None)
-            except Exception:
-                pass
-
-            # Debug so user can see what size the browser actually decided to use
-            try:
-                print(f"[MultiFrameBrowser] Using tile size for explorer: {tw}x{th}")
-            except Exception:
-                pass
-
-            # Prefer a live controller tiler only if its size matches the live values (otherwise
-            # create fresh so we respect live param changes without restart).
-            tiler = None
-            if self.controller and getattr(self.controller, 'tiler', None):
-                ct = self.controller.tiler
-                if getattr(ct, 'tile_w', None) == tw and getattr(ct, 'tile_h', None) == th:
-                    tiler = ct
-            if tiler is None:
-                tiler = GridTiler(tile_width=tw, tile_height=th, stride_x=sx, stride_y=sy)
-
-            try:
-                print(f"[MultiFrameBrowser] Tiling frame {self.selected_frame} at {tw}x{th}")
-            except Exception:
-                pass
-
+            tiler = GridTiler(tile_width=tw, tile_height=th)
             tiles = tiler.tile_frame(frame_rgb, self.selected_frame, 0, video_path=self.current_video)
             self.current_frame_tiles = tiles
 
             if not tiles:
-                ttk.Label(container, text="No tiles generated for this frame (frame too small?).").pack()
+                ttk.Label(container, text="No tiles generated.").pack()
                 return
 
-            # Dynamic layout so the grid actually fills the window instead of leaving
-            # large black/empty space on the right. We compute cols from the current
-            # available width (the canvas item was stretched in the Toplevel).
+            # --- Better column calculation ---
             try:
-                avail_w = max(400, container.winfo_width() or 900)
+                avail_w = max(800, container.winfo_width() or explorer_win.winfo_width() or 1200)
             except Exception:
-                avail_w = 900
-            thumb = 180
-            cols = max(2, (avail_w - 20) // (thumb + 8))
-            # Cap at a reasonable number so individual tiles don't become tiny
+                avail_w = 1200
+
+            thumb_size = 220  # increased
+            padding = 12
+            cols = max(3, (avail_w - 40) // (thumb_size + padding))
             cols = min(cols, 8)
+
             for idx, tile in enumerate(tiles):
-                # Lookup current label (using domain key as part of ongoing refactor)
-                label, rel = None, False
+                # Lookup current label
+                label = None
+                rel = False
                 try:
                     if self.tile_db:
                         key = TileKey(self.current_video, tile.frame_idx, tile.tile_row, tile.tile_col,
@@ -3346,40 +3314,47 @@ class MultiFrameLabelBrowser(tk.Toplevel):
                             label, rel = hit
                 except Exception:
                     pass
+
                 self.current_frame_tile_labels[idx] = (label, rel)
 
                 # Card
-                card = ttk.Frame(container, relief="groove", borderwidth=1)
+                card = ttk.Frame(container, relief="groove", borderwidth=2, padding=4)
                 r, c = divmod(idx, cols)
-                card.grid(row=r, column=c, padx=3, pady=3)
+                card.grid(row=r, column=c, padx=6, pady=6, sticky="nsew")
 
-                # Larger preview of the tile
+                # Larger preview
                 small = tile.image.copy()
-                small.thumbnail((180, 180), Image.Resampling.LANCZOS)
+                small.thumbnail((thumb_size, thumb_size), Image.Resampling.LANCZOS)
                 tkimg = ImageTk.PhotoImage(small)
-                self._tile_photo_refs.append(tkimg)  # keep
+                self._tile_photo_refs.append(tkimg)
 
                 img_lbl = ttk.Label(card, image=tkimg)
                 img_lbl.pack()
 
                 status = f"{label or 'unlabeled'}{' [R]' if rel else ''}"
-                ttk.Label(card, text=status, width=18, anchor="center").pack()
+                ttk.Label(card, text=status, width=22, anchor="center").pack(pady=4)
 
                 # Click to label
                 def make_edit(t=tile, i=idx):
                     return lambda e: self._quick_label_tile(explorer_win, t, i, container, canvas_ref)
 
                 for child in (card, img_lbl):
-                    child.bind("<Button-1>", make_edit(t=tile, i=idx))
+                    child.bind("<Button-1>", make_edit())
 
+            # Force layout update
+            container.update_idletasks()
             if canvas_ref:
-                container.update_idletasks()
                 canvas_ref.configure(scrollregion=canvas_ref.bbox("all"))
 
+            # Make grid expand nicely
+            for i in range(cols):
+                container.columnconfigure(i, weight=1)
+
         except Exception as e:
-            messagebox.showerror("Tile Explorer", str(e))
             import traceback
             traceback.print_exc()
+            messagebox.showerror("Tile Explorer", str(e))
+
 
     def _quick_label_tile(self, parent, tile: "Tile", tile_local_idx: int, grid_container, canvas_ref):
         """Quick label dialog for a specific tile. Saves to DB and refreshes grid."""

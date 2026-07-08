@@ -10,3 +10,70 @@ So I feel simpler is better.
 
 Perhaps we need to move away from the idea of "Live footage." As currently, especially with the "warmup" period, 
 the algorithm makes too many queries to go along with a live system.
+
+
+========== FULL A/RED METRICS AUDIT (EVERY SINGLE DATAPOINT) ==========
+Video: /home/wes/Desktop/PHXResearch/DroneBasic/Videos/DJI_0018.MP4
+QP: 0.1706    RR (incl. first appearances of classes): 0.7544
+Total queries A/RED made (CACHE QUERIES COUNT AS USER QUERIES): 252
+Total stream tiles seen: 24108
+Total labeled (people-tagged) tiles in DB: 2354
+---------------------------------------------------------------------
+1. CORE COUNTS (what you asked for):
+   TOTAL_TILES_ACTUALLY_SENT_TO_ARED          = 24108
+   TOTAL_PERSON_TILES (people tiles)          = 50
+   TOTAL_PERSON_TILES_QUERIED                 = 40
+   TOTAL_QUERIES_ARED_MADE (incl. all cache)  = 252
+   TOTAL_LABELED_TILES_IN_DB                  = 2353
+   TOTAL_RELEVANT_TILES                       = 50
+   TOTAL_RELEVANT_TILES_QUERIED               = 40
+
+2. PER-CLASS HUMAN TAGGED (from DB annotations):
+   grass: 1468 total labeled (0 relevant)
+   tire mark: 542 total labeled (0 relevant)
+   sidewalk: 115 total labeled (0 relevant)
+   construction: 63 total labeled (0 relevant)
+   shadow: 53 total labeled (0 relevant)
+   person: 50 total labeled (50 relevant)
+   bag: 36 total labeled (0 relevant)
+   tree: 26 total labeled (0 relevant)
+
+3. FIRST OCCURRENCES (new-class positives part of should):
+   grass first seen at frame 0
+   tree first seen at frame 0
+   sidewalk first seen at frame 0
+   bag first seen at frame 0
+   person first seen at frame 0
+   shadow first seen at frame 0
+   tire mark first seen at frame 65
+   construction first seen at frame 270
+
+4. SHOULD_QUERY GT POSITIVES (paper definition):
+   N_SHOULD_QUERY_TOTAL = 57
+   N_FIRST_OF_CLASS     = 8
+   N_RELEVANT_CLASS_SAMPLES = 50
+   (Note: RR uses ALL positives per paper: first appearances of any class + samples from relevant classes. See section 6.)
+
+5. A/RED QUERY OUTCOMES (broad positives for QP and RR):
+   TP (queried a positive) = 43
+   FP (queried but not a positive) = 209
+   FN (positive but not queried) = 14
+   Note: positives = (first sample of any class) OR (any sample of a relevant-designated class)
+
+   (For reference: relevant-class samples only)
+   relevant class samples = 50
+   relevant TP (queried among them) = 40
+   relevant FN = 10
+
+6. EXACT CALCULATIONS (formulas + numbers from papers):
+   QP = TP / (TP + FP)   --> 0.1706
+   RR = TP / (TP + FN)   --> 0.7544
+   (RR includes first appearances of classes + relevant samples)
+   (Cache-satisfied A/RED decisions are included in the query count above.)
+
+7. RANDOM BASELINE (from papers at same query count):
+   approx QP = relevant_rate = 0.0021
+
+QP=0.171  RR=0.754  A/RED Queries=252  Person tiles queried=40/50  vs Random≈0.002
+======================================================================
+Data sources: DB annotations (human labels) + A/RED decision log (pipeline.queried_identities + stats['ared_queries']). See metrics.py + SPIE_IVSP_2026 / IJSC_2026-1.
