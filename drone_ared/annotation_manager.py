@@ -31,28 +31,38 @@ class AnnotationManager:
         self.db = db
         self._current_video: Optional[str] = None
         self._current_tile_size: Optional[Tuple[int, int]] = None
+        self._current_stride: Optional[Tuple[Optional[int], Optional[int]]] = None  # (sx, sy) for overlap support
 
-    def set_scope(self, video_path: Optional[str] = None, tile_size: Optional[Tuple[int, int]] = None):
+    def set_scope(self, video_path: Optional[str] = None, tile_size: Optional[Tuple[int, int]] = None,
+                  stride: Optional[Tuple[Optional[int], Optional[int]]] = None):
         if video_path:
             # normalize via db if available
             norm = getattr(self.db, '_normalize_video_path', lambda p: p)
             self._current_video = norm(video_path)
         if tile_size:
             self._current_tile_size = tile_size
+        if stride is not None:
+            self._current_stride = stride
 
     def get_annotations(self, video: Optional[str] = None, use_scope: bool = True,
                         limit: Optional[int] = None, **filter_kwargs) -> List[Dict]:
         v = video or (self._current_video if use_scope else None)
         tw = th = None
+        sx = sy = None
         if use_scope and self._current_tile_size:
             tw, th = self._current_tile_size
+        if use_scope and self._current_stride:
+            sx, sy = self._current_stride
         if v is None:
             return []
-        # Pop injected keys to avoid duplicate kwarg if caller also supplied tile sizes via **filter_kwargs
+        # Pop injected keys to avoid duplicate kwarg if caller also supplied via **filter_kwargs
         fk = dict(filter_kwargs)
         fk.pop('tile_width', None)
         fk.pop('tile_height', None)
-        return self.db.get_annotations_for_video(v, limit=limit, tile_width=tw, tile_height=th, **fk)
+        fk.pop('stride_x', None)
+        fk.pop('stride_y', None)
+        return self.db.get_annotations_for_video(v, limit=limit, tile_width=tw, tile_height=th,
+                                                 stride_x=sx, stride_y=sy, **fk)
 
     def bulk_delete(self, label: Optional[str] = None, labels: Optional[List[str]] = None,
                     use_scope: bool = True, **kw) -> int:

@@ -320,11 +320,33 @@ class DroneAREDController:
         This implements the evaluation methodology from:
           - IJSC_2026-1.pdf : "Real-Time Memory-Bounded A/RED"
           - SPIE_IVSP_2026.pdf : "Shallow vs. Deep Features for A/RED"
+
+        Note on stride/overlap: by default we now scope to the current tiler's stride
+        (if known) so that metrics reflect the exact grid the run used. Passing use_scope=False
+        (or calling the raw DB method without stride) will still return cross-stride data if you
+        want a full historical view.
         """
+        sx = sy = None
+        try:
+            if self.tiler:
+                sx = getattr(self.tiler, 'stride_x', None)
+                sy = getattr(self.tiler, 'stride_y', None)
+            if (sx is None or sy is None) and self.config and getattr(self.config, 'tiling', None):
+                t = self.config.tiling
+                sx = getattr(t, 'stride_x', None)
+                sy = getattr(t, 'stride_y', None)
+        except Exception:
+            pass
+
         if self.annotation_manager:
-            anns = self.annotation_manager.get_annotations(video=video_path, use_scope=False)
+            # When we have a stride we prefer scoped results for the current grid.
+            # use_scope=False keeps the old "all history" behavior if the caller wants it.
+            anns = self.annotation_manager.get_annotations(video=video_path, use_scope=True)
+            # If the manager returned nothing under scope, fall back to un-scoped for metrics convenience
+            if not anns:
+                anns = self.annotation_manager.get_annotations(video=video_path, use_scope=False)
         elif self.tile_db is not None:
-            anns = self.tile_db.get_annotations_for_video(video_path)
+            anns = self.tile_db.get_annotations_for_video(video_path, stride_x=sx, stride_y=sy)
         else:
             return {"error": "No tile database loaded"}
 
@@ -336,7 +358,7 @@ class DroneAREDController:
                     if self.annotation_manager:
                         anns = self.annotation_manager.get_annotations(video=v, use_scope=False)
                     else:
-                        anns = self.tile_db.get_annotations_for_video(v)
+                        anns = self.tile_db.get_annotations_for_video(v, stride_x=sx, stride_y=sy)
                     video_path = v
                     break
 
@@ -491,14 +513,26 @@ class DroneAREDController:
             col = meta.get("col", meta.get("tile_col", 0))
             tw = meta.get("tile_width", 0) or getattr(tile_img, 'width', 0) if tile_img else 0
             th = meta.get("tile_height", 0) or getattr(tile_img, 'height', 0) if tile_img else 0
+            # NEW: carry stride from meta (preferred) or current tiler/config so DB can scope by grid step
+            sx = meta.get("stride_x")
+            sy = meta.get("stride_y")
+            if (sx is None or sy is None) and self.tiler is not None:
+                sx = getattr(self.tiler, 'stride_x', None)
+                sy = getattr(self.tiler, 'stride_y', None)
+            if (sx is None or sy is None):
+                tcfg = getattr(self, 'config', None) and getattr(self.config, 'tiling', None)
+                if tcfg:
+                    sx = getattr(tcfg, 'stride_x', None)
+                    sy = getattr(tcfg, 'stride_y', None)
 
             if self.tile_db is not None and vpath and abs_f >= 0:
-                key = TileKey(vpath, int(abs_f), int(row), int(col), int(tw or 0), int(th or 0))
+                key = TileKey(vpath, int(abs_f), int(row), int(col), int(tw or 0), int(th or 0),
+                              stride_x=sx, stride_y=sy)
                 exact = self.tile_db.lookup_key(key)
                 if exact:
                     label, rel = exact
                     if not self.edit_mode:
-                        print(f"[Pipeline]   -> EXACT DB HIT for {Path(vpath).name} f{abs_f} [{row},{col}]: '{label}' (relevant={rel}). Auto (no GUI).")
+                        print(f"[Pipeline]   -> EXACT DB HIT for {Path(vpath).name} f{abs_f} [{row},{col}] stride=({sx},{sy}): '{label}' (relevant={rel}). Auto (no GUI).")
                         if self.label_store is not None:
                             try:
                                 self.label_store.add(emb, label, rel)
@@ -549,12 +583,13 @@ class DroneAREDController:
             print(f"[Pipeline]   -> Received label from GUI: '{label}' (relevant={rel})")
 
             # Save the human decision to BOTH stores
-            # a) Exact DB (for perfect recall by identity, stride-independent, editable)
+            # a) Exact DB (now stride-aware for overlap safety)
             if self.tile_db is not None and vpath and abs_f >= 0:
                 try:
                     bx = meta.get("bbox", (col * tw, row * th, col * tw + tw, row * th + th))
                     cx, cy = bx[0], bx[1]
-                    key = TileKey(vpath, int(abs_f), int(row), int(col), int(tw or 0), int(th or 0))
+                    key = TileKey(vpath, int(abs_f), int(row), int(col), int(tw or 0), int(th or 0),
+                                  stride_x=sx, stride_y=sy)
                     self.tile_db.set_annotation_for_key(key, label, rel, embedding=emb, crop_x=cx, crop_y=cy)
                 except Exception as e:
                     print(f"[Pipeline]   WARNING: failed to save to TileAnnotationDB: {e}")
@@ -618,6 +653,15 @@ class DroneAREDController:
             return
 
         print(f"[Pipeline] Starting video: {video_path}")
+
+        # Log tiling configuration (helps confirm overlap is active)
+        try:
+            t = self.config.tiling
+            print(f"[Pipeline] Tiling: {t.tile_width}x{t.tile_height} stride=({t.stride_x},{t.stride_y}) "
+                  f"overlap~({max(0,t.tile_width-(t.stride_x or t.tile_width))},{max(0,t.tile_height-(t.stride_y or t.tile_height))}) "
+                  f"frame_stride={t.frame_stride}")
+        except Exception:
+            pass
 
         if self.label_only_mode:
             # Delegate entirely to the dedicated label-only processor.
@@ -924,8 +968,11 @@ class DroneAREDController:
                 existing = None
                 if self.tile_db is not None:
                     try:
+                        # Use current tiler stride so we scope correctly under overlap
+                        sx = getattr(self.tiler, 'stride_x', None) if self.tiler else None
+                        sy = getattr(self.tiler, 'stride_y', None) if self.tiler else None
                         key = TileKey(video_path, tile.frame_idx, tile.tile_row, tile.tile_col,
-                                      tile.width, tile.height)
+                                      tile.width, tile.height, stride_x=sx, stride_y=sy)
                         existing = self.tile_db.lookup_key(key)
                     except Exception:
                         existing = None

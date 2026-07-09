@@ -27,12 +27,24 @@ class TilingConfig:
     Recommendation: Use 256 or 320+ for more context per tile on drone footage.
     The DINO preprocessor will still resize the crop to the model's preferred
     resolution, but a larger original crop preserves more detail/context.
+
+    Overlap support (new):
+    - stride_x / stride_y control the step between consecutive tiles.
+    - stride < tile size → overlapping tiles (recommended for 240x240 to avoid cutting objects).
+    - You can set stride directly, or use the GUI overlap controls (overlap_px = tile - stride).
+    - Default (stride == tile size) = classic non-overlapping grid.
     """
     tile_width: int = 256
     tile_height: int = 256
     # Stride: if None, non-overlapping (stride == tile size). Overlap if smaller.
+    # stride_x/y are the authoritative runtime values used by GridTiler.
     stride_x: Optional[int] = None
     stride_y: Optional[int] = None
+    # Optional convenience fields for overlap in pixels (tile_size - stride).
+    # These are primarily for UI / documentation. When > 0 the GUI may use them
+    # to compute stride = max(1, tile - overlap). The pipeline always uses stride_*.
+    overlap_x: int = 0
+    overlap_y: int = 0
     # Optional: process only every Nth frame (1 = every frame). Higher = faster, fewer tiles.
     frame_stride: int = 5
     # Future: support "adaptive" tiling, saliency-based, multi-scale, etc.
@@ -43,9 +55,18 @@ class TilingConfig:
             self.stride_x = self.tile_width
         if self.stride_y is None:
             self.stride_y = self.tile_height
+        # Keep overlap fields non-negative (they are sugar; stride is truth)
+        self.overlap_x = max(0, int(self.overlap_x or 0))
+        self.overlap_y = max(0, int(self.overlap_y or 0))
 
     def effective_stride(self) -> Tuple[int, int]:
         return (self.stride_x, self.stride_y)
+
+    def effective_overlap(self) -> Tuple[int, int]:
+        """Return (overlap_x, overlap_y) implied by current tile size and stride."""
+        ox = max(0, self.tile_width - (self.stride_x or self.tile_width))
+        oy = max(0, self.tile_height - (self.stride_y or self.tile_height))
+        return (ox, oy)
 
 
 @dataclass
@@ -193,8 +214,9 @@ class PipelineConfig:
         with open(path) as f:
             data = json.load(f)
         # Reconstruct nested dataclasses manually for simplicity
+        tdata = data.get("tiling", {})
         return cls(
-            tiling=TilingConfig(**data.get("tiling", {})),
+            tiling=TilingConfig(**tdata),
             features=FeatureConfig(**data.get("features", {})),
             ared=AREDConfig(**data.get("ared", {})),
             label_cache=LabelCacheConfig(**data.get("label_cache", {})),

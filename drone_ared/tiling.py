@@ -82,7 +82,10 @@ class GridTiler(Tiler):
     Simple non-overlapping (or overlapping) regular grid tiling.
 
     This matches the user's stated "Tiling" approach.
-    Default tile size 224x224 matches common DINO input expectations.
+    Default tile size 256x256 (configurable). Use stride < tile size for overlap.
+
+    Overlap example: tile=240, overlap=48 → stride=192. Tiles will share a 48 px strip.
+    All emitted tiles are exactly (tile_w, tile_h) pixels; partial edge tiles are skipped.
     """
 
     def __init__(

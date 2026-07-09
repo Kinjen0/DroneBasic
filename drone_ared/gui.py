@@ -789,6 +789,7 @@ class MainWindow:
         self._stats_job = None
         self._pending_label_request: Optional[LabelRequest] = None
         self.discovered_classes: set = set()  # labels we have assigned in this run (for immediate UI feedback)
+        self.run_class_counts: dict[str, int] = {}  # per-run counts for display in class boxes (not full DB history)
         self.class_relevance: dict[str, bool] = {}  # class name -> is_relevant (set at creation time)
         self._last_queried_global = -1
 
@@ -797,6 +798,12 @@ class MainWindow:
 
         # Register for status from worker
         self.controller.on_stats = self._on_worker_stats
+
+        # Ensure clean shutdown (prevents "terminate called without an active exception" and VSCode crash reports)
+        try:
+            self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
+        except Exception:
+            pass
 
     def _build_ui(self):
         # --- Make UI elements larger and more readable on high-res displays ---
@@ -823,7 +830,7 @@ class MainWindow:
         file_menu.add_command(label="Save ARED Model State", command=self._save_ared_state)
         file_menu.add_command(label="Load ARED Model State", command=self._load_ared_state)
         file_menu.add_separator()
-        file_menu.add_command(label="Exit", command=self.root.quit)
+        file_menu.add_command(label="Exit", command=self._on_closing)
         menubar.add_cascade(label="File", menu=file_menu)
         self.root.config(menu=menubar)
 
@@ -858,12 +865,20 @@ class MainWindow:
         self._add_param_row(param_frame, "Tile W (px, uniform)", "tile_w", self.config.tiling.tile_width)
         self._add_param_row(param_frame, "Tile H (px, uniform)", "tile_h", self.config.tiling.tile_height)
         self._add_param_row(param_frame, "Frame stride (every Nth)", "frame_stride", self.config.tiling.frame_stride)
+
+        # Overlapping tiles controls (new). Checkbox enables; entries are overlap in pixels.
+        # stride = tile_size - overlap (clamped >= 1). When disabled or 0, stride = tile size (non-overlapping).
+        self.overlap_enabled_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(param_frame, text="Enable overlapping tiles (stride = tile - overlap)",
+                        variable=self.overlap_enabled_var).pack(anchor="w", pady=int(2*s))
+
+        self._add_param_row(param_frame, "Overlap X (px)", "overlap_x", getattr(self.config.tiling, "overlap_x", 0))
+        self._add_param_row(param_frame, "Overlap Y (px)", "overlap_y", getattr(self.config.tiling, "overlap_y", 0))
+
         self._add_param_row(param_frame, "Kappa (higher = MORE queries)", "kappa", self.config.ared.kappa, is_float=True)
         self._add_param_row(param_frame, "Buffer size", "buf_size", self.config.ared.l_buf_size)
         self._add_param_row(param_frame, "Cache threshold (L2)", "cache_thresh", self.config.label_cache.auto_label_threshold, is_float=True)
         self._add_param_row(param_frame, "DINO model name", "dino_model", self.config.features.model_name, is_str=True)
-
-        s = self.ui_scale
         ttk.Checkbutton(param_frame, text="Use label cache (similarity)", variable=tk.BooleanVar(value=self.config.label_cache.enabled)).pack(anchor="w", pady=int(2*s))
 
         # NEW: Exact tile annotation DB controls
@@ -890,6 +905,14 @@ class MainWindow:
         self.label_only_var = tk.BooleanVar(value=getattr(self.config.tile_annotations, "label_only_default", False))
         ttk.Checkbutton(param_frame, text="Label Only Mode (no A/RED, no DINO — pure labeling + Skip/Resume)",
                         variable=self.label_only_var).pack(anchor="w", pady=int(3*s))
+
+        # Initialize overlap checkbox from config (if stride < tile size, or explicit overlap > 0)
+        tcfg0 = self.config.tiling
+        initial_overlap = bool((tcfg0.stride_x is not None and tcfg0.stride_x < tcfg0.tile_width) or
+                               (tcfg0.stride_y is not None and tcfg0.stride_y < tcfg0.tile_height) or
+                               getattr(tcfg0, "overlap_x", 0) > 0 or
+                               getattr(tcfg0, "overlap_y", 0) > 0)
+        self.overlap_enabled_var.set(initial_overlap)
         ttk.Button(param_frame, text="Review / Edit Past Labels...", command=self._open_review_window).pack(fill="x", pady=int(3*s))
         ttk.Button(param_frame, text="Multi-Frame Browser (scroll many frames + select to label)", 
                    command=self._open_multi_frame_browser).pack(fill="x", pady=int(3*s))
@@ -982,6 +1005,33 @@ class MainWindow:
             self.config.tiling.tile_width = int(getattr(self, "_tile_w_var").get())
             self.config.tiling.tile_height = int(getattr(self, "_tile_h_var").get())
             self.config.tiling.frame_stride = int(getattr(self, "_frame_stride_var").get())
+
+            # Overlap → stride computation (new)
+            # stride = tile - overlap when enabled and overlap > 0. Otherwise stride = tile (non-overlap).
+            try:
+                tw = self.config.tiling.tile_width
+                th = self.config.tiling.tile_height
+                ox = max(0, int(getattr(self, "_overlap_x_var").get() or 0))
+                oy = max(0, int(getattr(self, "_overlap_y_var").get() or 0))
+                enabled = bool(self.overlap_enabled_var.get())
+                if enabled and (ox > 0 or oy > 0):
+                    self.config.tiling.stride_x = max(1, tw - ox)
+                    self.config.tiling.stride_y = max(1, th - oy)
+                    self.config.tiling.overlap_x = ox
+                    self.config.tiling.overlap_y = oy
+                else:
+                    # Force clean non-overlapping
+                    self.config.tiling.stride_x = tw
+                    self.config.tiling.stride_y = th
+                    self.config.tiling.overlap_x = 0
+                    self.config.tiling.overlap_y = 0
+            except Exception:
+                # Fall back to safe non-overlap if anything is malformed
+                self.config.tiling.stride_x = self.config.tiling.tile_width
+                self.config.tiling.stride_y = self.config.tiling.tile_height
+                self.config.tiling.overlap_x = 0
+                self.config.tiling.overlap_y = 0
+
             self.config.ared.kappa = float(getattr(self, "_kappa_var").get())
             self.config.ared.l_buf_size = int(getattr(self, "_buf_size_var").get())
             self.config.label_cache.auto_label_threshold = float(getattr(self, "_cache_thresh_var").get())
@@ -1009,6 +1059,20 @@ class MainWindow:
 
     def _start(self):
         self._read_params_into_config()
+
+        # Reset per-run tracking so "Discovered Classes" and counts start fresh for *this* execution.
+        # We still pull historical *names* (from label_store + exact DB) so old classes remain
+        # clickable without re-typing. Only the numbers shown now reflect work in the current run.
+        self.discovered_classes = set()
+        self.run_class_counts = {}
+
+        # Immediately refresh the main "Discovered Classes" list so historical names (with 0 run counts)
+        # appear right away instead of waiting for the first poll tick. Numbers will only grow for work
+        # done since this Start.
+        try:
+            self._refresh_class_list()
+        except Exception:
+            pass
 
         # Prepare label store (embedding similarity)
         if self.config.label_cache.enabled:
@@ -1061,6 +1125,78 @@ class MainWindow:
         self.status_var.set("Stopped. You can change parameters/videos and press Start again.")
         if self.controller.stats:
             self._update_stats_display(self.controller.stats)
+
+    def _on_closing(self):
+        """Clean shutdown handler to avoid 'terminate called without an active exception' and VSCode crash reports.
+
+        Common causes on Linux + OpenCV + threads + sqlite + Tk:
+        - Worker thread still alive when Tk exits
+        - Unreleased cv2.VideoCapture or sqlite connections
+        - Pending after() jobs firing during destruction
+        """
+        print("[MainWindow] Shutdown requested (WM_DELETE or Exit).")
+        try:
+            # 1. Stop worker (signals events + drains label queue + joins)
+            if hasattr(self, "controller") and self.controller:
+                try:
+                    self.controller.stop(join_timeout=2.0)
+                except Exception:
+                    pass
+
+            # Cancel any pending stat-poller / after jobs
+            if getattr(self, "_stats_job", None):
+                try:
+                    self.root.after_cancel(self._stats_job)
+                except Exception:
+                    pass
+                self._stats_job = None
+
+            # 2. Close DBs (this is critical for the sqlite WAL + "terminate" symptom)
+            if getattr(self, "tile_db", None):
+                try:
+                    self.tile_db.close()
+                except Exception:
+                    pass
+            if getattr(self, "annotation_manager", None):
+                try:
+                    self.annotation_manager.close()
+                except Exception:
+                    pass
+
+            # 3. Flush label cache
+            if getattr(self, "label_store", None):
+                try:
+                    self.label_store.save()
+                except Exception:
+                    pass
+
+            # 4. Destroy child windows first (they may hold video caps or threads)
+            for attr in ("_labeling_win", "_review_win", "_multi_frame_browser"):
+                win = getattr(self, attr, None)
+                if win is not None:
+                    try:
+                        if hasattr(win, "destroy"):
+                            win.destroy()
+                    except Exception:
+                        pass
+
+            # 5. Give Tk a tiny moment to process destructions
+            try:
+                self.root.update_idletasks()
+            except Exception:
+                pass
+
+        except Exception as e:
+            print("[MainWindow] Error during clean shutdown:", e)
+        finally:
+            try:
+                self.root.quit()
+            except Exception:
+                pass
+            try:
+                self.root.destroy()
+            except Exception:
+                pass
 
     def _save_label_cache(self):
         if self.label_store:
@@ -1345,13 +1481,16 @@ class MainWindow:
     def _set_active_tile_db(self, db: "TileAnnotationDB", path: str):
         """Central helper: wires DB + manager + controller + config + UI state.
         Simplifies duplication across load/new/clone/start paths.
+        Now also propagates current stride for overlap-aware scoping.
         """
         self.tile_db = db
         self.controller.set_tile_database(db)
         self.annotation_manager = AnnotationManager(db)
         tw = self.config.tiling.tile_width
         th = self.config.tiling.tile_height
-        self.annotation_manager.set_scope(tile_size=(tw, th))
+        sx = getattr(self.config.tiling, 'stride_x', None)
+        sy = getattr(self.config.tiling, 'stride_y', None)
+        self.annotation_manager.set_scope(tile_size=(tw, th), stride=(sx, sy) if (sx or sy) else None)
         self.controller.set_annotation_manager(self.annotation_manager)
         self.config.tile_annotations.db_path = path
         if hasattr(self, "_tile_ann_db_var"):
@@ -1604,38 +1743,31 @@ class MainWindow:
         cur_label = meta.get("current_label")
         cur_rel = bool(meta.get("current_relevant", False))
 
-        # Gather current known classes from both store and ARED
+        # Gather current known classes from both store and ARED.
+        # Collect *names* from history (label_store + exact DB) so old classes are clickable
+        # without re-typing.  Use ONLY per-run counts for the numbers shown.
         classes = []
-        counts = {}
         if self.label_store:
             classes.extend(self.label_store.get_all_labels())
-            counts.update(self.label_store.get_class_counts())
         if self.controller.ared_adapter:
             classes.extend(self.controller.ared_adapter.get_known_labels())
 
-        # Pull from TileAnnotationDB as well.
-        # This ensures that when using the efficient sparse labeling mode
-        # (label only relevant tiles + Skip the rest, resume by skipping already labeled),
-        # the classes are available for clicking in the next LabelingDialog
-        # without the user having to re-create them.
         if hasattr(self.controller, 'get_labels_from_annotation_db'):
             try:
                 for lbl in self.controller.get_labels_from_annotation_db():
                     if lbl not in classes:
                         classes.append(lbl)
-                    if lbl not in counts:
-                        counts[lbl] = counts.get(lbl, 0)
             except Exception:
                 pass
 
-        # Include GUI-assigned ones immediately (so new classes appear in the very next dialog)
         for lbl in getattr(self, 'discovered_classes', []):
             if lbl not in classes:
                 classes.append(lbl)
-            if lbl not in counts:
-                counts[lbl] = counts.get(lbl, 0)
 
         classes = sorted(set(classes))
+
+        # Per-run counts only (0 for anything not yet labeled in *this* execution)
+        counts = {lbl: self.run_class_counts.get(lbl, 0) for lbl in classes}
 
         # Build relevance map (source of truth is our class_relevance; seed from store if possible)
         class_relevance = dict(getattr(self, 'class_relevance', {}))
@@ -1673,6 +1805,8 @@ class MainWindow:
             print(f"[GUI] Label SUBMITTED from dialog: '{label}' (relevant={relevant})")
             self._pending_label_request = None
             self.discovered_classes.add(label)
+            # Track count for *this run only* so the class boxes start near zero instead of full DB history
+            self.run_class_counts[label] = self.run_class_counts.get(label, 0) + 1
             self.class_relevance[label] = relevant
             self._refresh_class_list()
             self.status_var.set(f"Last label assigned: {label} (relevant={relevant})")
@@ -1714,26 +1848,23 @@ class MainWindow:
 
     def _refresh_class_list(self):
         self.class_listbox.delete(0, "end")
-        counts = {}
+        # Collect names from history (label cache + exact DB + ARED + this run) so old classes
+        # remain clickable.  Numbers shown are strictly from this run (run_class_counts).
+        all_labels = set(getattr(self, 'discovered_classes', set()))
         if self.label_store:
-            counts.update(self.label_store.get_class_counts())
-        all_labels = set(counts.keys())
+            all_labels.update(self.label_store.get_all_labels())
         if self.controller.ared_adapter:
             all_labels.update(self.controller.ared_adapter.get_known_labels())
-
-        # IMPORTANT for sparse/resume Label Only mode:
-        # Pull labels from the exact TileAnnotationDB so that classes labeled
-        # during an efficient "only label the relevant ones + Skip the rest" pass
-        # immediately appear in the clickable list. Without this, the user would
-        # have to re-type every class name after skipping many tiles.
         if hasattr(self.controller, 'get_labels_from_annotation_db'):
             try:
                 all_labels.update(self.controller.get_labels_from_annotation_db())
             except Exception:
                 pass
 
-        # Include ones we just assigned in the GUI (for immediate visibility on next queries)
-        all_labels.update(getattr(self, 'discovered_classes', set()))
+        # Force display counts to per-run only. This is the key fix: previously full
+        # get_class_counts() from store/DB were merged in, making boxes start with total history.
+        run_counts = getattr(self, 'run_class_counts', {})
+        counts = {lbl: run_counts.get(lbl, 0) for lbl in all_labels}
 
         # Ensure we have a relevance entry (seed from store when possible)
         for lbl in all_labels:
@@ -1941,19 +2072,21 @@ class LabelReviewWindow(tk.Toplevel):
         v = self.video_var.get()
         if not v:
             return
-        tw = th = None
+        tw = th = sx = sy = None
         try:
             parent = getattr(self, 'master', None)
             if parent and hasattr(parent, 'config'):
                 tcfg = parent.config.tiling
                 tw, th = tcfg.tile_width, tcfg.tile_height
+                sx, sy = getattr(tcfg, 'stride_x', None), getattr(tcfg, 'stride_y', None)
         except Exception:
             pass
         if self.annotation_manager:
-            self.annotation_manager.set_scope(video_path=v, tile_size=(tw, th) if tw else None)
+            self.annotation_manager.set_scope(video_path=v, tile_size=(tw, th) if tw else None, stride=(sx, sy) if (sx or sy) else None)
             self.annotations = self.annotation_manager.get_annotations(video=v, use_scope=True)
         else:
-            self.annotations = self.tile_db.get_annotations_for_video(v, tile_width=tw, tile_height=th)
+            self.annotations = self.tile_db.get_annotations_for_video(v, tile_width=tw, tile_height=th,
+                                                                         stride_x=sx, stride_y=sy)
         self.ann_list.delete(0, "end")
         for i, a in enumerate(self.annotations):
             rel_mark = " [R]" if a["relevant"] else ""
@@ -2042,10 +2175,12 @@ class LabelReviewWindow(tk.Toplevel):
         new_label = self.label_var.get().strip() or "__UNLABELED__"
         new_rel = self.rel_var.get()
 
+        sx = ann.get("stride_x")
+        sy = ann.get("stride_y")
         try:
             if self.annotation_manager:
                 key = TileKey(ann["video_path"], ann["abs_frame"], ann["tile_row"], ann["tile_col"],
-                              ann["tile_width"], ann["tile_height"])
+                              ann["tile_width"], ann["tile_height"], stride_x=sx, stride_y=sy)
                 self.annotation_manager.db.set_annotation_for_key(key, new_label, new_rel,
                                                                   embedding=None,
                                                                   crop_x=ann.get("crop_x"), crop_y=ann.get("crop_y"))
@@ -2073,15 +2208,17 @@ class LabelReviewWindow(tk.Toplevel):
         if not messagebox.askyesno("Delete", "Remove this annotation from the DB?"):
             return
         ann = self.current_ann
+        sx = ann.get("stride_x")
+        sy = ann.get("stride_y")
         try:
             if self.annotation_manager:
                 key = TileKey(ann["video_path"], ann["abs_frame"], ann["tile_row"], ann["tile_col"],
-                              ann["tile_width"], ann["tile_height"])
+                              ann["tile_width"], ann["tile_height"], stride_x=sx, stride_y=sy)
                 self.annotation_manager.db.delete_key(key)
             else:
                 self.tile_db.delete_annotation(
                     ann["video_path"], ann["abs_frame"], ann["tile_row"], ann["tile_col"],
-                    ann["tile_width"], ann["tile_height"]
+                    ann["tile_width"], ann["tile_height"], stride_x=sx, stride_y=sy
                 )
             self.status_var.set("Deleted.")
             self._load_annotations_for_current_video()
@@ -2246,6 +2383,96 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         except Exception:
             pass
         return int(tw), int(th)
+
+    def _get_live_stride(self, tw: Optional[int] = None, th: Optional[int] = None) -> Tuple[int, int]:
+        """Return (stride_x, stride_y) from live GUI controls / config, falling back to non-overlap (stride == tile).
+
+        If the user has typed overlap values + enabled the checkbox, we compute stride here too
+        so browsers and explorers see the correct step without requiring Start.
+        """
+        sx = sy = None
+        source = "default"
+
+        try:
+            # Highest priority: live overlap controls on the main window
+            if self.main_window is not None:
+                enabled = False
+                if hasattr(self.main_window, "overlap_enabled_var"):
+                    try:
+                        enabled = bool(self.main_window.overlap_enabled_var.get())
+                    except Exception:
+                        pass
+
+                ox = oy = 0
+                if hasattr(self.main_window, "_overlap_x_var"):
+                    try:
+                        ox = max(0, int(str(self.main_window._overlap_x_var.get() or "0").strip()))
+                    except Exception:
+                        pass
+                if hasattr(self.main_window, "_overlap_y_var"):
+                    try:
+                        oy = max(0, int(str(self.main_window._overlap_y_var.get() or "0").strip()))
+                    except Exception:
+                        pass
+
+                if enabled and (ox > 0 or oy > 0):
+                    # Derive from live overlap values (preferred when checkbox is on)
+                    tw0 = tw or self._get_live_tile_size()[0]
+                    th0 = th or self._get_live_tile_size()[1]
+                    sx = max(1, int(tw0) - ox)
+                    sy = max(1, int(th0) - oy)
+                    source = "live_overlap"
+                    return sx, sy
+
+            # Next: explicit stride fields if user ever types them directly (future-proof)
+            # Currently we expose overlap; stride is derived. But if present on config, honor it.
+            if self.main_window is not None and hasattr(self.main_window, "config"):
+                try:
+                    tcfg = self.main_window.config.tiling
+                    if getattr(tcfg, "stride_x", None) is not None:
+                        sx = int(tcfg.stride_x)
+                    if getattr(tcfg, "stride_y", None) is not None:
+                        sy = int(tcfg.stride_y)
+                    if sx is not None and sy is not None:
+                        source = "main_config_stride"
+                except Exception:
+                    pass
+
+            # Controller tiler (live after Start)
+            if (sx is None or sy is None) and self.controller and getattr(self.controller, "tiler", None):
+                try:
+                    sx = sx or getattr(self.controller.tiler, "stride_x", None)
+                    sy = sy or getattr(self.controller.tiler, "stride_y", None)
+                    if sx is not None and sy is not None:
+                        source = "controller_tiler"
+                except Exception:
+                    pass
+
+            # Controller config
+            if (sx is None or sy is None) and self.controller and hasattr(self.controller, "config"):
+                try:
+                    tcfg = self.controller.config.tiling
+                    sx = sx or getattr(tcfg, "stride_x", None)
+                    sy = sy or getattr(tcfg, "stride_y", None)
+                    if sx is not None and sy is not None:
+                        source = "controller_config"
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Final fallback: non-overlapping using provided or live tile size
+        if sx is None or sy is None:
+            tw0, th0 = (tw, th) if (tw and th) else self._get_live_tile_size()
+            sx = int(tw0)
+            sy = int(th0)
+            source = source or "nonoverlap_fallback"
+
+        try:
+            print(f"[MultiFrameBrowser] live stride -> {sx}x{sy} (source={source})")
+        except Exception:
+            pass
+        return int(sx), int(sy)
 
     def _build_ui(self):
         s = self.ui_scale
@@ -2432,11 +2659,14 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         except Exception:
             pass
 
+        # Live stride from main window controls (critical for overlap)
+        sx, sy = self._get_live_stride(tw, th)
         if self.annotation_manager:
-            self.annotation_manager.set_scope(video_path=v, tile_size=(tw, th) if tw else None)
+            self.annotation_manager.set_scope(video_path=v, tile_size=(tw, th) if tw else None, stride=(sx, sy) if (sx or sy) else None)
             anns = self.annotation_manager.get_annotations(video=v, use_scope=True)
         else:
-            anns = self.tile_db.get_annotations_for_video(v, tile_width=tw, tile_height=th)
+            anns = self.tile_db.get_annotations_for_video(v, tile_width=tw, tile_height=th,
+                                                             stride_x=sx, stride_y=sy)
         self.frame_to_anns = {}
         for a in anns:
             f = a["abs_frame"]
@@ -2944,9 +3174,11 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         if not self.current_video:
             return
         try:
-            # Scope using the shared live-value helper (reads the boxes the user typed)
+            # Scope using the shared live-value helper (reads the boxes the user typed) + stride
             tw, th = self._get_live_tile_size()
-            anns = self.tile_db.get_annotations_for_video(self.current_video, tile_width=tw, tile_height=th)
+            sx, sy = self._get_live_stride(tw, th)
+            anns = self.tile_db.get_annotations_for_video(self.current_video, tile_width=tw, tile_height=th,
+                                                           stride_x=sx, stride_y=sy)
             self.frame_to_anns = {}
             for a in anns:
                 f = a["abs_frame"]
@@ -3305,7 +3537,8 @@ class MultiFrameLabelBrowser(tk.Toplevel):
                 from drone_ared.tiling import GridTiler
 
             tw, th = self._get_live_tile_size()
-            tiler = GridTiler(tile_width=tw, tile_height=th)
+            sx, sy = self._get_live_stride(tw, th)
+            tiler = GridTiler(tile_width=tw, tile_height=th, stride_x=sx, stride_y=sy)
             tiles = tiler.tile_frame(frame_rgb, self.selected_frame, 0, video_path=self.current_video)
             self.current_frame_tiles = tiles
 
@@ -3330,8 +3563,10 @@ class MultiFrameLabelBrowser(tk.Toplevel):
                 rel = False
                 try:
                     if self.tile_db:
+                        # Use live stride so overlap grids don't pull labels from a different stride's positions
+                        sx, sy = self._get_live_stride(tile.width, tile.height)
                         key = TileKey(self.current_video, tile.frame_idx, tile.tile_row, tile.tile_col,
-                                      tile.width, tile.height)
+                                      tile.width, tile.height, stride_x=sx, stride_y=sy)
                         hit = self.tile_db.lookup_key(key)
                         if hit:
                             label, rel = hit
@@ -3472,9 +3707,10 @@ class MultiFrameLabelBrowser(tk.Toplevel):
                 self.class_relevance[name] = True
             try:
                 cx, cy = tile.bbox[0], tile.bbox[1]
+                sx, sy = self._get_live_stride(tile.width, tile.height)
                 if self.annotation_manager:
                     key = TileKey(self.current_video, tile.frame_idx, tile.tile_row, tile.tile_col,
-                                  tile.width, tile.height)
+                                  tile.width, tile.height, stride_x=sx, stride_y=sy)
                     self.annotation_manager.db.set_annotation_for_key(key, name, rel, embedding=None, crop_x=cx, crop_y=cy)
                 else:
                     self.tile_db.set_annotation(
@@ -3489,6 +3725,19 @@ class MultiFrameLabelBrowser(tk.Toplevel):
                 self._populate_frame_tile_grid(parent, grid_container, canvas_ref)
                 # Light refresh: update counts on strip cards, keep thumbs loaded
                 self._refresh_annotations_light()
+
+                # Feed per-run counters on the main window so "Discovered Classes" list
+                # and counts grow from this run (not from full DB). Keep change tiny.
+                try:
+                    if self.main_window is not None:
+                        self.main_window.discovered_classes.add(name)
+                        rc = getattr(self.main_window, 'run_class_counts', None)
+                        if rc is not None:
+                            rc[name] = rc.get(name, 0) + 1
+                        if hasattr(self.main_window, '_refresh_class_list'):
+                            self.main_window._refresh_class_list()
+                except Exception:
+                    pass
             except Exception as e:
                 messagebox.showerror("Save", str(e))
 
@@ -3553,14 +3802,18 @@ class MultiFrameLabelBrowser(tk.Toplevel):
 
         ttk.Button(ed, text="Save Change to DB", command=save).pack(fill="x", padx=8, pady=6)
         def _do_delete():
+            sx = ann.get("stride_x")
+            sy = ann.get("stride_y")
+            sx = ann.get("stride_x")
+            sy = ann.get("stride_y")
             if self.annotation_manager:
                 key = TileKey(ann["video_path"], ann["abs_frame"], ann["tile_row"], ann["tile_col"],
-                              ann["tile_width"], ann["tile_height"])
+                              ann["tile_width"], ann["tile_height"], stride_x=sx, stride_y=sy)
                 self.annotation_manager.db.delete_key(key)
             else:
                 self.tile_db.delete_annotation(
                     ann["video_path"], ann["abs_frame"], ann["tile_row"], ann["tile_col"],
-                    ann["tile_width"], ann["tile_height"])
+                    ann["tile_width"], ann["tile_height"], stride_x=sx, stride_y=sy)
             ed.destroy()
             self._refresh_annotations_light()
         ttk.Button(ed, text="Delete this annotation", command=_do_delete).pack(fill="x", padx=8)

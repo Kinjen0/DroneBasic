@@ -69,6 +69,8 @@ class TileAnnotationDB:
                 tile_col INTEGER NOT NULL,
                 tile_width INTEGER NOT NULL,
                 tile_height INTEGER NOT NULL,
+                stride_x INTEGER,                    -- NEW for overlap support (NULL = legacy/non-overlap)
+                stride_y INTEGER,
                 crop_x INTEGER,                      -- pixel origin of the crop (for exact re-extract)
                 crop_y INTEGER,
                 label TEXT NOT NULL,
@@ -76,6 +78,10 @@ class TileAnnotationDB:
                 embedding BLOB,                      -- float32 bytes or NULL
                 embedding_dim INTEGER,
                 updated_ts REAL NOT NULL,
+                -- stride_x/stride_y are stored (NULL for legacy runs).
+                -- The application query logic (lookup_key + get_annotations_for_video) now
+                -- scopes results so that different strides for the same (w,h) do not bleed labels.
+                -- We keep the original PK for backward compatibility with existing DBs.
                 PRIMARY KEY (video_path, abs_frame, tile_row, tile_col, tile_width, tile_height)
             )
         """)
@@ -86,6 +92,22 @@ class TileAnnotationDB:
             CREATE INDEX IF NOT EXISTS idx_label ON annotations (label)
         """)
         self.conn.commit()
+        # Lightweight migration for overlap support (add stride columns if missing)
+        self._ensure_stride_columns()
+
+    def _ensure_stride_columns(self):
+        """Add stride_x / stride_y columns if the DB is from before overlap support."""
+        try:
+            cur = self.conn.cursor()
+            cur.execute("PRAGMA table_info(annotations)")
+            cols = {row[1] for row in cur.fetchall()}
+            if "stride_x" not in cols:
+                cur.execute("ALTER TABLE annotations ADD COLUMN stride_x INTEGER")
+            if "stride_y" not in cols:
+                cur.execute("ALTER TABLE annotations ADD COLUMN stride_y INTEGER")
+            self.conn.commit()
+        except Exception as e:
+            print(f"[TileDB] Note: stride column migration check: {e}")
 
     # ------------------------------------------------------------------
     # Core API
@@ -102,18 +124,39 @@ class TileAnnotationDB:
         return self.lookup_key(key)
 
     def lookup_key(self, key: TileKey) -> Optional[Tuple[str, bool]]:
-        """Preferred: lookup using a TileKey domain object."""
+        """Preferred: lookup using a TileKey domain object.
+
+        Overlap-aware behavior:
+        - If the key carries explicit stride_x/stride_y, we prefer rows that match that stride.
+        - We also accept legacy rows where stride_x/stride_y IS NULL (pre-overlap data).
+        - This prevents non-overlap labels from "bleeding" onto the wrong physical tiles
+          when the current grid uses a different stride.
+        - If no stride is supplied in the key we do a legacy lookup (size + grid pos only).
+        """
         if not key.video_path:
             return None
         vpath = self._normalize_video_path(key.video_path)
 
         cur = self.conn.cursor()
-        cur.execute("""
+
+        base = """
             SELECT label, relevant FROM annotations
             WHERE video_path=? AND abs_frame=? AND tile_row=? AND tile_col=?
                   AND tile_width=? AND tile_height=?
-            LIMIT 1
-        """, key.to_tuple())
+        """
+        # IMPORTANT: use the *normalized* vpath as first param (to_tuple may contain the raw path)
+        t = key.to_tuple()
+        params = [vpath, t[1], t[2], t[3], t[4], t[5]]
+
+        if key.stride_x is not None or key.stride_y is not None:
+            # Stride-aware: match exact stride OR legacy NULL stride rows.
+            # This lets old data still be found when the user hasn't labeled under the new stride yet,
+            # while protecting against wrong-grid bleed for explicitly different strides.
+            base += " AND ( (stride_x IS NULL AND stride_y IS NULL) OR (stride_x=? AND stride_y=?) )"
+            params.extend([key.stride_x, key.stride_y])
+
+        base += " LIMIT 1"
+        cur.execute(base, params)
         row = cur.fetchone()
         if row:
             label, rel = row
@@ -151,15 +194,21 @@ class TileAnnotationDB:
         cy = crop_y if crop_y is not None else (key.tile_row * key.tile_height)
 
         cur = self.conn.cursor()
+        # stride columns (may be NULL for legacy rows)
+        sx = key.stride_x
+        sy = key.stride_y
+
         cur.execute("""
             INSERT INTO annotations
                 (video_path, abs_frame, tile_row, tile_col, tile_width, tile_height,
-                 crop_x, crop_y, label, relevant, embedding, embedding_dim, updated_ts)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 stride_x, stride_y, crop_x, crop_y, label, relevant, embedding, embedding_dim, updated_ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(video_path, abs_frame, tile_row, tile_col, tile_width, tile_height)
             DO UPDATE SET
                 label=excluded.label,
                 relevant=excluded.relevant,
+                stride_x=COALESCE(excluded.stride_x, stride_x),
+                stride_y=COALESCE(excluded.stride_y, stride_y),
                 crop_x=COALESCE(excluded.crop_x, crop_x),
                 crop_y=COALESCE(excluded.crop_y, crop_y),
                 embedding=COALESCE(excluded.embedding, embedding),
@@ -168,6 +217,7 @@ class TileAnnotationDB:
         """, (
             vpath, int(key.abs_frame), int(key.tile_row), int(key.tile_col),
             int(key.tile_width), int(key.tile_height),
+            sx, sy,
             int(cx), int(cy),
             str(label), 1 if relevant else 0,
             emb_blob, emb_dim, ts
@@ -178,23 +228,29 @@ class TileAnnotationDB:
     def get_annotations_for_video(self, video_path: str, limit: Optional[int] = None,
                                   tile_width: Optional[int] = None,
                                   tile_height: Optional[int] = None,
+                                  stride_x: Optional[int] = None,
+                                  stride_y: Optional[int] = None,
                                   filt: Optional[AnnotationFilter] = None) -> List[Dict[str, Any]]:
         """Return list of annotations for a video (with crop info for re-extraction).
 
         Pass tile_width and/or tile_height (or a full AnnotationFilter) to scope results.
-        This is critical for isolation when the user changes tile size in the GUI.
+        For overlapping tiles, also pass stride_x/stride_y (or via filt) to avoid mixing
+        labels created under different grid steps. Legacy rows (NULL stride) are included
+        when no explicit stride filter is given.
         """
         if filt is not None:
             video_path = video_path or filt.video_path or video_path
             tile_width = tile_width or filt.tile_width
             tile_height = tile_height or filt.tile_height
+            stride_x = stride_x if stride_x is not None else filt.stride_x
+            stride_y = stride_y if stride_y is not None else filt.stride_y
             # labels filter not applied here for simplicity (list is per video)
 
         vpath = self._normalize_video_path(video_path)
         cur = self.conn.cursor()
         q = """
             SELECT video_path, abs_frame, tile_row, tile_col, tile_width, tile_height,
-                   crop_x, crop_y, label, relevant, updated_ts
+                   stride_x, stride_y, crop_x, crop_y, label, relevant, updated_ts
             FROM annotations
             WHERE video_path=?
         """
@@ -205,6 +261,10 @@ class TileAnnotationDB:
         if tile_height is not None:
             q += " AND tile_height=?"
             params.append(int(tile_height))
+        if stride_x is not None or stride_y is not None:
+            # Match exact stride OR legacy NULL-stride records (best-effort compatibility)
+            q += " AND ( (stride_x IS NULL AND stride_y IS NULL) OR (stride_x=? AND stride_y=?) )"
+            params.extend([stride_x, stride_y])
         q += " ORDER BY abs_frame, tile_row, tile_col"
         if limit:
             q += f" LIMIT {int(limit)}"
@@ -219,11 +279,13 @@ class TileAnnotationDB:
                 "tile_col": r[3],
                 "tile_width": r[4],
                 "tile_height": r[5],
-                "crop_x": r[6] if r[6] is not None else r[3] * r[4],
-                "crop_y": r[7] if r[7] is not None else r[2] * r[5],
-                "label": r[8],
-                "relevant": bool(r[9]),
-                "updated_ts": r[10],
+                "stride_x": r[6],
+                "stride_y": r[7],
+                "crop_x": r[8] if r[8] is not None else r[3] * r[4],
+                "crop_y": r[9] if r[9] is not None else r[2] * r[5],
+                "label": r[10],
+                "relevant": bool(r[11]),
+                "updated_ts": r[12],
             })
         return results
 
@@ -376,20 +438,30 @@ class TileAnnotationDB:
         return None
 
     def delete_annotation(self, video_path: str, abs_frame: int, tile_row: int, tile_col: int,
-                          tile_width: int, tile_height: int) -> bool:
+                          tile_width: int, tile_height: int, stride_x: Optional[int] = None,
+                          stride_y: Optional[int] = None) -> bool:
         """Remove a specific annotation (rarely needed)."""
-        key = TileKey(video_path, int(abs_frame), int(tile_row), int(tile_col), int(tile_width), int(tile_height))
+        key = TileKey(video_path, int(abs_frame), int(tile_row), int(tile_col), int(tile_width), int(tile_height),
+                      stride_x=stride_x, stride_y=stride_y)
         return self.delete_key(key)
 
     def delete_key(self, key: TileKey) -> bool:
-        """Delete using domain key (preferred during refactor)."""
+        """Delete using domain key (preferred during refactor).
+
+        When stride is present on the key we scope the delete to that stride (or legacy NULL).
+        """
         vpath = self._normalize_video_path(key.video_path)
         cur = self.conn.cursor()
-        cur.execute("""
+        sql = """
             DELETE FROM annotations
             WHERE video_path=? AND abs_frame=? AND tile_row=? AND tile_col=?
                   AND tile_width=? AND tile_height=?
-        """, key.to_tuple())
+        """
+        params = list(key.to_tuple()[:6])
+        if key.stride_x is not None or key.stride_y is not None:
+            sql += " AND ( (stride_x IS NULL AND stride_y IS NULL) OR (stride_x=? AND stride_y=?) )"
+            params.extend([key.stride_x, key.stride_y])
+        cur.execute(sql, params)
         deleted = cur.rowcount > 0
         self.conn.commit()
         return deleted

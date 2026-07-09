@@ -28,8 +28,16 @@ class TileKey:
     Replaces passing around 6+ separate parameters (video, frame, row, col, w, h).
     Used for lookups, saves, deletes, etc.
 
-    This enables clean scoping by video + tile resolution (critical for isolation
-    when users experiment with different tile sizes like 128 vs 256).
+    IMPORTANT for overlapping tiles:
+    - (tile_row, tile_col) are *grid indices* produced by a specific stride.
+    - Different stride/overlap values produce different (row, col) for the same physical pixels.
+    - Therefore identity for correct label matching must incorporate stride (or the actual
+      pixel crop origin) when overlap is used.
+
+    We now carry optional stride_x / stride_y (None = unknown/legacy non-overlapping run).
+    Lookups and saves should supply the stride used by the current GridTiler when possible.
+    The DB also stores crop_x/crop_y (absolute pixel top-left) which can be used for
+    physical-region matching independent of grid addressing.
     """
     video_path: str
     abs_frame: int
@@ -37,10 +45,14 @@ class TileKey:
     tile_col: int
     tile_width: int
     tile_height: int
+    # New: the stride used to generate this grid position. Critical for overlap support.
+    # When None we treat it as legacy (usually stride == tile size).
+    stride_x: Optional[int] = None
+    stride_y: Optional[int] = None
 
-    def to_tuple(self) -> Tuple[str, int, int, int, int, int]:
+    def to_tuple(self) -> Tuple[str, int, int, int, int, int, Optional[int], Optional[int]]:
         return (self.video_path, self.abs_frame, self.tile_row, self.tile_col,
-                self.tile_width, self.tile_height)
+                self.tile_width, self.tile_height, self.stride_x, self.stride_y)
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "TileKey":
@@ -52,14 +64,22 @@ class TileKey:
             tile_col=int(d["tile_col"]),
             tile_width=int(d["tile_width"]),
             tile_height=int(d["tile_height"]),
+            stride_x=d.get("stride_x"),
+            stride_y=d.get("stride_y"),
         )
 
     def size(self) -> Tuple[int, int]:
         return (self.tile_width, self.tile_height)
 
+    def stride(self) -> Tuple[Optional[int], Optional[int]]:
+        return (self.stride_x, self.stride_y)
+
     def __repr__(self) -> str:
+        s = ""
+        if self.stride_x is not None or self.stride_y is not None:
+            s = f" stride=({self.stride_x},{self.stride_y})"
         return (f"TileKey({self.video_path}, f{self.abs_frame}, "
-                f"r{self.tile_row}c{self.tile_col}, {self.tile_width}x{self.tile_height})")
+                f"r{self.tile_row}c{self.tile_col}, {self.tile_width}x{self.tile_height}{s})")
 
 
 @dataclass
@@ -69,13 +89,20 @@ class AnnotationFilter:
     All non-None fields are ANDed together.
     Supports scoping to video + exact tile size (prevents cross-size leakage).
 
+    For overlapping tiles: pass stride_x/stride_y to isolate labels created
+    under a particular grid step. Legacy records (NULL stride in DB) are
+    matched when the filter does not specify stride.
+
     Example:
-        filt = AnnotationFilter(video_path=..., tile_width=128, tile_height=128, labels=["dirt"])
+        filt = AnnotationFilter(video_path=..., tile_width=240, tile_height=240,
+                                stride_x=192, stride_y=192, labels=["person"])
     """
     video_path: Optional[str] = None
     labels: Optional[List[str]] = None   # match any of these (for IN clause)
     tile_width: Optional[int] = None
     tile_height: Optional[int] = None
+    stride_x: Optional[int] = None
+    stride_y: Optional[int] = None
     relevant: Optional[bool] = None
     frame_min: Optional[int] = None
     frame_max: Optional[int] = None

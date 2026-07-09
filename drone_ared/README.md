@@ -40,6 +40,18 @@ python run_drone_ared.py
 
 - All major pieces are in their own files with ABCs or clear hooks:
   - `tiling.py` — add new tiler strategies
+
+## Tiling and Overlap
+
+The default is a non-overlapping grid. For 240×240 tiles (or any size) you can enable **overlapping tiles** in the GUI:
+
+- Check **"Enable overlapping tiles (stride = tile - overlap)"**
+- Enter **Overlap X (px)** and/or **Overlap Y (px)** (e.g. 32 or 48 for 240×240)
+- The effective stride becomes `tile_size - overlap` (clamped ≥ 1).
+
+Overlapping tiles help avoid cutting objects that cross tile boundaries. This increases the number of tiles (roughly by `(tile / (tile-overlap))²`).
+
+All labels are stored with exact (video, frame, tile position, size). The system correctly recalls labels even when you change stride later (provided the (row, col) + size matches what was labeled). Different stride values for the same nominal tile size produce different grids; treat (tile size + stride) as a unit when building a corpus.
   - `feature_extractor.py` — swap DINOv3, add projector, etc.
   - `label_store.py` — replace with FAISS / sqlite-vss
   - `ared_adapter.py` — the only place that knows about the original A_RED
