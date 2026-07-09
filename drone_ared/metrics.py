@@ -239,6 +239,7 @@ def evaluate_from_annotations_and_queries(
     total_points: Optional[int] = None,
     ared_query_count_override: Optional[int] = None,
     processed_keys: Optional[List[Tuple]] = None,
+    run_params: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     High-level helper. Produces exhaustive data for the user.
@@ -252,6 +253,10 @@ def evaluate_from_annotations_and_queries(
         the tiles that were actually sent to A/RED in this run. This ensures we
         only count positives (firsts + relevant) for tiles/classes that were actually presented
         to A/RED.
+    run_params: optional dict of key experiment settings for this run, e.g.:
+        {"kappa": 1.0, "tile_size": (256,256), "frame_stride": 3,
+         "annotation_db": "drone_tile_annotations.db", "dino_model": "...", ...}
+        These are attached to the result and surfaced in the detailed audit.
     """
     if processed_keys:
         proc_set = set(processed_keys)
@@ -430,6 +435,22 @@ def evaluate_from_annotations_and_queries(
         f"Person tiles queried={total_person_tiles_queried}/{total_person_tiles}  "
         f"vs Random≈{baseline['random_query_precision_approx']:.3f}"
     )
+
+    # Attach caller-provided run parameters (kappa, tile size, frame stride, DB path, model, etc.)
+    # so that every metrics report is self-describing for reproducibility.
+    if run_params:
+        metrics["run_params"] = dict(run_params)
+        # Also fold a compact subset into the detailed audit for easy reading
+        if "detailed_breakdown" in metrics:
+            metrics["detailed_breakdown"]["RUN_PARAMS"] = {
+                k: v for k, v in run_params.items()
+                if k in ("kappa", "tile_size", "frame_stride", "annotation_db", "db_path",
+                         "dino_model", "model_name", "stride_x", "stride_y",
+                         "l_buf_size", "k_comp_pts", "data_augmentation_enabled")
+            }
+    else:
+        metrics["run_params"] = None
+
     return metrics
 
 

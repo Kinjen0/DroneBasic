@@ -34,7 +34,7 @@ class TilingConfig:
     stride_x: Optional[int] = None
     stride_y: Optional[int] = None
     # Optional: process only every Nth frame (1 = every frame). Higher = faster, fewer tiles.
-    frame_stride: int = 3
+    frame_stride: int = 5
     # Future: support "adaptive" tiling, saliency-based, multi-scale, etc.
     tiling_mode: str = "grid"   # "grid", "sliding", "pyramid" (future)
 

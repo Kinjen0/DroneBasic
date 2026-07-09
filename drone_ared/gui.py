@@ -1201,6 +1201,23 @@ class MainWindow:
     def _refresh_metrics_display(self, result: Dict[str, Any]):
         if not hasattr(self, 'metrics_text'):
             return
+        # Run parameters (kappa, tile size, frame stride, DB, model, etc.) if present
+        rp = result.get("run_params") or {}
+        rp_lines = []
+        if rp:
+            ts = rp.get("tile_size")
+            tile_str = f"{ts[0]}x{ts[1]}" if isinstance(ts, (list, tuple)) and len(ts) == 2 else str(ts or "?")
+            rp_lines = [
+                "0. RUN PARAMETERS (reproducibility):",
+                f"   kappa={rp.get('kappa', '?')}   tile_size={tile_str}   frame_stride={rp.get('frame_stride', '?')}",
+                f"   stride=({rp.get('stride_x', '?')},{rp.get('stride_y', '?')})",
+                f"   annotation_db={rp.get('annotation_db') or rp.get('db_path', '?')}",
+                f"   dino_model={rp.get('dino_model', '?')}   l_buf={rp.get('l_buf_size', '?')} k={rp.get('k_comp_pts', '?')}",
+                f"   label_cache={rp.get('label_cache_enabled', '?')} (thresh={rp.get('label_cache_threshold', '?')})",
+                f"   data_aug={rp.get('data_augmentation_enabled', '?')}   edit_mode={rp.get('edit_mode', '?')} label_only={rp.get('label_only_mode', '?')}",
+                "---------------------------------------------------------------------",
+            ]
+
         lines = [
             "========== FULL A/RED METRICS AUDIT (EVERY SINGLE DATAPOINT) ==========",
             f"Video: {result.get('video', '?')}",
@@ -1208,8 +1225,9 @@ class MainWindow:
             f"Total queries A/RED made (CACHE QUERIES COUNT AS USER QUERIES): {result.get('ared_queries_made', result.get('n_actual_queries', 0))}",
             f"Total stream tiles seen: {result.get('total_stream_tiles', result.get('total_points', 0))}",
             f"Total labeled (people-tagged) tiles in DB: {result.get('n_labeled', 0)}",
-            "---------------------------------------------------------------------",
         ]
+        lines.extend(rp_lines)
+        lines.append("---------------------------------------------------------------------")
 
         audit = result.get("detailed_breakdown") or result.get("audit", {})
         if audit:
@@ -1272,7 +1290,9 @@ class MainWindow:
         if getattr(self.controller, 'label_only_mode', False):
             # In pure label-only we have no A/RED queries, so just show stats
             n_l = self.controller.stats.get("tiles_processed", 0)
-            self._refresh_metrics_display({
+            # Still try to snapshot run params for reproducibility even in label-only
+            run_p = getattr(self.controller, "_collect_run_params", lambda: {})()
+            disp = {
                 "video": self.controller.stats.get("current_video", "?"),
                 "query_precision": 0.0,
                 "relevant_recall": 0.0,
@@ -1280,8 +1300,11 @@ class MainWindow:
                 "total_points": n_l,
                 "n_labeled": n_l,
                 "summary": "Label Only run — every tile was presented for human labeling (no A/RED query decisions). All labels are direct people-tagged.",
-                "audit": {"total_annotations_in_db": n_l, "first_of_class_count": "N/A (full labeling)", "relevant_tiles_count": "see DB", "should_query_total": "N/A"}
-            })
+                "audit": {"total_annotations_in_db": n_l, "first_of_class_count": "N/A (full labeling)", "relevant_tiles_count": "see DB", "should_query_total": "N/A"},
+            }
+            if run_p:
+                disp["run_params"] = run_p
+            self._refresh_metrics_display(disp)
             return
 
         # Normal A/RED run — try to compute real metrics
@@ -3360,12 +3383,18 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         """Quick label dialog for a specific tile. Saves to DB and refreshes grid."""
         q = tk.Toplevel(parent)
         q.title(f"Label Tile r{tile.tile_row}c{tile.tile_col} (f{tile.frame_idx})")
-        q.geometry("680x780")
+        q.geometry("680x980")
 
         s = self.ui_scale
         # Image
         big = tile.image.copy()
         big.thumbnail((420, 420), Image.Resampling.LANCZOS)
+        orig_w, orig_h = big.size
+        new_size = (int(420), int(420))
+        
+        # Use .resize() instead of .thumbnail() to guarantee enlargement
+        big = big.resize(new_size, Image.Resampling.LANCZOS)
+    
         tkbig = ImageTk.PhotoImage(big)
         ttk.Label(q, image=tkbig).pack(pady=4)
         # keep ref on q
@@ -3394,8 +3423,10 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         if cur_label and cur_label in self.class_relevance:
             suggested_rel = self.class_relevance[cur_label]
 
+        large_font = ("TkDefaultFont", int(10*self.ui_scale))
+
         ttk.Label(q, text="Existing classes (double-click or select + Assign):").pack(anchor="w", padx=8)
-        lb = tk.Listbox(q, height=10, exportselection=False)
+        lb = tk.Listbox(q, height=10, exportselection=False, font=large_font)
         lb.pack(fill="x", padx=8)
         for k in sorted(set(known)):
             lb.insert("end", k)

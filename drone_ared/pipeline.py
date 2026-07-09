@@ -353,18 +353,77 @@ class DroneAREDController:
         stream_total = len(processed) if processed else self.stats.get("tiles_processed", labeled_total)
         ared_query_count = self.stats.get("ared_queries", len(queried))
 
+        # Collect run parameters so metrics reports are reproducible (kappa, tile size, stride, DB, model, etc.)
+        run_params = self._collect_run_params()
+
         result = ared_metrics.evaluate_from_annotations_and_queries(
             anns, queried, 
             total_points=stream_total,
             ared_query_count_override=ared_query_count,
-            processed_keys=processed
+            processed_keys=processed,
+            run_params=run_params,
         )
         result["video"] = video_path
         result["n_labeled"] = labeled_total
         result["total_stream_tiles"] = stream_total
         result["ared_queries_made"] = ared_query_count
         result["n_processed_in_run"] = len(processed)
+        # Ensure top-level visibility of key params even if caller inspects the flat dict
+        if run_params:
+            result["run_params"] = run_params
+            # Convenience top-level aliases for the most requested items
+            result["kappa"] = run_params.get("kappa")
+            result["tile_size"] = run_params.get("tile_size")
+            result["frame_stride"] = run_params.get("frame_stride")
+            result["annotation_db"] = run_params.get("annotation_db")
+            result["dino_model"] = run_params.get("dino_model")
         return result
+
+    def _collect_run_params(self) -> Dict[str, Any]:
+        """Snapshot key experiment settings at metrics computation time."""
+        p: Dict[str, Any] = {}
+        try:
+            t = self.config.tiling
+            a = self.config.ared
+            f = self.config.features
+            ta = self.config.tile_annotations
+
+            p["kappa"] = float(a.kappa)
+            p["tile_size"] = (int(t.tile_width), int(t.tile_height))
+            p["frame_stride"] = int(t.frame_stride)
+            p["stride_x"] = int(t.stride_x) if t.stride_x is not None else int(t.tile_width)
+            p["stride_y"] = int(t.stride_y) if t.stride_y is not None else int(t.tile_height)
+
+            # Which annotation DB was active
+            if self.tile_db is not None:
+                p["annotation_db"] = str(getattr(self.tile_db, "db_path", "?"))
+            else:
+                p["annotation_db"] = getattr(ta, "db_path", None) or "?"
+
+            # DINO / feature config
+            p["dino_model"] = getattr(f, "model_name", None)
+            p["dino_normalize"] = getattr(f, "normalize", None)
+            p["dino_pooling"] = getattr(f, "pooling", None)
+
+            # A/RED core knobs
+            p["l_buf_size"] = int(a.l_buf_size)
+            p["k_comp_pts"] = int(a.k_comp_pts)
+            p["qs_var"] = int(a.qs_var)
+            p["nghbhood_merge"] = bool(a.nghbhood_merge)
+            p["singleton_merge"] = bool(a.singleton_merge)
+            p["data_augmentation_enabled"] = bool(getattr(a, "data_augmentation_enabled", False))
+
+            # Label cache
+            lc = self.config.label_cache
+            p["label_cache_enabled"] = bool(lc.enabled)
+            p["label_cache_threshold"] = float(getattr(lc, "auto_label_threshold", 0.0))
+
+            # Misc
+            p["edit_mode"] = bool(getattr(self, "edit_mode", False))
+            p["label_only_mode"] = bool(getattr(self, "label_only_mode", False))
+        except Exception as e:
+            p["collect_error"] = str(e)
+        return p
 
     def update_config(self, new_config: PipelineConfig):
         """Apply new parameters for the *next* start()."""
