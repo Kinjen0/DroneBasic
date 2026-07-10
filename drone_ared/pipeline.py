@@ -378,12 +378,21 @@ class DroneAREDController:
         # Collect run parameters so metrics reports are reproducible (kappa, tile size, stride, DB, model, etc.)
         run_params = self._collect_run_params()
 
+        # Pull per-class A/RED query counts from the adapter (the "queried this run" source).
+        ared_qc = {}
+        if self.ared_adapter:
+            try:
+                ared_qc = self.ared_adapter.get_query_counts() or {}
+            except Exception:
+                ared_qc = {}
+
         result = ared_metrics.evaluate_from_annotations_and_queries(
             anns, queried, 
             total_points=stream_total,
             ared_query_count_override=ared_query_count,
             processed_keys=processed,
             run_params=run_params,
+            ared_query_counts=ared_qc,
         )
         result["video"] = video_path
         result["n_labeled"] = labeled_total
@@ -399,6 +408,11 @@ class DroneAREDController:
             result["frame_stride"] = run_params.get("frame_stride")
             result["annotation_db"] = run_params.get("annotation_db")
             result["dino_model"] = run_params.get("dino_model")
+        # Top-level aliases for the newly added F1 and classes discovered (x/y) so GUI can read them uniformly
+        if "f1_score" not in result and "f1_score" in (result.get("detailed_breakdown") or {}):
+            # Should not normally be needed; evaluate already puts f1_score at top level via compute_query_metrics
+            pass
+        # classes_discovered_x_of_y is populated inside evaluate_from... when ared_query_counts is passed
         return result
 
     def _collect_run_params(self) -> Dict[str, Any]:

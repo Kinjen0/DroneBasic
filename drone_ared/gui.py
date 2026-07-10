@@ -961,7 +961,7 @@ class MainWindow:
         self.metrics_text.configure(yscrollcommand=ysb.set)
 
         self.metrics_text.insert("1.0", "Click 'Compute from DB (last video)' after a run.\n"
-                                        "EXPANDED + SCROLLABLE: every datapoint - total person tiles, person tiles queried, total A/RED queries (caches count as user queries), full work for QP/RR (RR includes first appearances of classes per paper positives def).")
+                                        "EXPANDED + SCROLLABLE: every datapoint - total relevant tiles, total relevant queried, total A/RED queries (caches count as user queries), full work for QP/RR (RR includes first appearances of classes per paper positives def).")
         self.metrics_text.config(state="disabled")
 
         btn_row = ttk.Frame(metrics_frame)
@@ -1361,7 +1361,8 @@ class MainWindow:
         lines = [
             "========== FULL A/RED METRICS AUDIT (EVERY SINGLE DATAPOINT) ==========",
             f"Video: {result.get('video', '?')}",
-            f"QP: {result.get('query_precision', 0):.4f}    RR (incl. first appearances of classes): {result.get('relevant_recall', 0):.4f}",
+            f"QP: {result.get('query_precision', 0):.4f}    RR: {result.get('relevant_recall', 0):.4f}    F1: {result.get('f1_score', 0):.4f}",
+            f"Classes discovered (A/RED queried this run / unique in run): {result.get('classes_discovered_x_of_y', '?')}",
             f"Total queries A/RED made (CACHE QUERIES COUNT AS USER QUERIES): {result.get('ared_queries_made', result.get('n_actual_queries', 0))}",
             f"Total stream tiles seen: {result.get('total_stream_tiles', result.get('total_points', 0))}",
             f"Total labeled (people-tagged) tiles in DB: {result.get('n_labeled', 0)}",
@@ -1373,12 +1374,11 @@ class MainWindow:
         if audit:
             lines.append("1. CORE COUNTS (what you asked for):")
             lines.append(f"   TOTAL_TILES_ACTUALLY_SENT_TO_ARED          = {audit.get('TOTAL_TILES_ACTUALLY_SENT_TO_ARED_THIS_RUN', '?')}")
-            lines.append(f"   TOTAL_PERSON_TILES (people tiles)          = {audit.get('TOTAL_PERSON_TILES', audit.get('total_person_tiles', '?'))}")
-            lines.append(f"   TOTAL_PERSON_TILES_QUERIED                 = {audit.get('TOTAL_PERSON_TILES_QUERIED', audit.get('total_person_tiles_queried', '?'))}")
+            lines.append(f"   TOTAL_RELEVANT_TILES                       = {audit.get('TOTAL_RELEVANT_TILES', audit.get('total_relevant_tiles', '?'))}")
+            lines.append(f"   TOTAL_RELEVANT_TILES_QUERIED (Total relevant queried) = {audit.get('TOTAL_RELEVANT_TILES_QUERIED', audit.get('total_relevant_tiles_queried', '?'))}")
             lines.append(f"   TOTAL_QUERIES_ARED_MADE (incl. all cache)  = {audit.get('TOTAL_QUERIES_ARED_MADE', result.get('ared_queries_made', '?'))}")
             lines.append(f"   TOTAL_LABELED_TILES_IN_DB                  = {audit.get('TOTAL_LABELED_TILES_IN_DB', result.get('n_labeled', '?'))}")
-            lines.append(f"   TOTAL_RELEVANT_TILES                       = {audit.get('TOTAL_RELEVANT_TILES', '?')}")
-            lines.append(f"   TOTAL_RELEVANT_TILES_QUERIED               = {audit.get('TOTAL_RELEVANT_TILES_QUERIED', '?')}")
+            lines.append(f"   CLASSES_DISCOVERED (A/RED queried / unique in run) = {audit.get('CLASSES_DISCOVERED_X_Y', result.get('classes_discovered_x_of_y', '?'))}")
             lines.append("")
             lines.append("2. PER-CLASS HUMAN TAGGED (from DB annotations):")
             for lab, cnt in sorted((audit.get("CLASS_COUNTS") or {}).items(), key=lambda x: -x[1]):
@@ -1409,6 +1409,8 @@ class MainWindow:
             lines.append("6. EXACT CALCULATIONS (formulas + numbers from papers):")
             lines.append(f"   QP = TP / (TP + FP)   --> {result.get('query_precision', 0)}")
             lines.append(f"   RR = TP / (TP + FN)   --> {result.get('relevant_recall', 0)}")
+            lines.append(f"   F1 = 2 * QP * RR / (QP + RR)   --> {result.get('f1_score', 0)}")
+            lines.append(f"   Classes discovered (queried by A/RED this run / unique classes in run): {result.get('classes_discovered_x_of_y', '?')}")
             lines.append(f"   (RR includes first appearances of classes + relevant samples)")
             lines.append(f"   (Cache-satisfied A/RED decisions are included in the query count above.)")
             lines.append("")
@@ -1436,6 +1438,8 @@ class MainWindow:
                 "video": self.controller.stats.get("current_video", "?"),
                 "query_precision": 0.0,
                 "relevant_recall": 0.0,
+                "f1_score": 0.0,
+                "classes_discovered_x_of_y": "0/0",
                 "n_actual_queries": 0,
                 "total_points": n_l,
                 "n_labeled": n_l,

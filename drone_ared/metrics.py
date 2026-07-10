@@ -154,12 +154,16 @@ def compute_query_metrics(
     qp = tp / (tp + fp) if (tp + fp) > 0 else 0.0
     rr = tp / (tp + fn) if (tp + fn) > 0 else 0.0
 
+    # F1 score (harmonic mean of Query Precision and Relevant Recall)
+    f1 = 2 * qp * rr / (qp + rr) if (qp + rr) > 0 else 0.0
+
     # Rough relevant rate (fraction of points that are positives for the query task)
     relevant_rate = n_should / max(1, total_points)
 
     return {
         "query_precision": round(qp, 4),
         "relevant_recall": round(rr, 4),
+        "f1_score": round(f1, 4),
         "tp": tp,
         "fp": fp,
         "fn": fn,
@@ -240,6 +244,7 @@ def evaluate_from_annotations_and_queries(
     ared_query_count_override: Optional[int] = None,
     processed_keys: Optional[List[Tuple]] = None,
     run_params: Optional[Dict[str, Any]] = None,
+    ared_query_counts: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
     """
     High-level helper. Produces exhaustive data for the user.
@@ -331,21 +336,17 @@ def evaluate_from_annotations_and_queries(
     # relevant class counts now based on designation (any tile of class marked rel designates the class)
     relevant_counts = Counter(str(a.get("label","")) for a in annotations if str(a.get("label","")) in relevant_classes)
 
-    # People (person class) specific
-    total_person_tiles = label_counts.get("person", 0)
-    person_anns = [a for a in annotations if str(a.get("label","")) == "person"]
-
-    # Queried people tiles: keys that A/RED queried AND final label is person
-    actual_set = set(actual_queried_keys)
-    person_queried_keys = []
-    for a in person_anns:
-        k = make_tile_key(a)
-        if k in actual_set:
-            person_queried_keys.append(k)
-    total_person_tiles_queried = len(person_queried_keys)
-
-    # Similarly for all relevant (using class designation for consistency with RR)
+    # Relevant-class stats (class-level: a class is relevant if any of its instances were marked relevant).
+    # These replace the former hard-coded "person" counts per user request.
+    # "Total relevant queried" = number of tiles whose label belongs to a relevant-designated class AND that were queried by A/RED.
     relevant_queried = sum(1 for a in annotations if str(a.get("label", "")) in relevant_classes and make_tile_key(a) in actual_set)
+    total_relevant_tiles = sum(label_counts[lab] for lab in relevant_counts)
+    total_relevant_tiles_queried = relevant_queried
+
+    # Legacy "person" numbers are now aliased to the relevant numbers so existing display code
+    # shows "Total relevant queried" instead of person-specific counts.
+    total_person_tiles = total_relevant_tiles
+    total_person_tiles_queried = total_relevant_tiles_queried
 
     # Firsts computation (exact order used for "should")
     seen = set()
@@ -387,19 +388,37 @@ def evaluate_from_annotations_and_queries(
 
     # Build giant transparent report
     n_sent = len(processed_keys) if processed_keys is not None else None
+
+    # x/y classes discovered this run (queried by A/RED vs total unique classes in the run's processed tiles)
+    qc = dict(ared_query_counts or {})
+    queried_class_names = [c for c, cnt in qc.items() if cnt > 0]
+    n_classes_queried = len(queried_class_names)
+    n_unique_in_run = len(label_counts)
+    classes_discovered_str = f"{n_classes_queried}/{n_unique_in_run}"
+
+    metrics["n_classes_discovered_this_run"] = n_classes_queried
+    metrics["n_unique_classes_in_run"] = n_unique_in_run
+    metrics["classes_discovered_x_of_y"] = classes_discovered_str
+
     metrics["detailed_breakdown"] = {
         "TOTAL_TILES_ACTUALLY_SENT_TO_ARED_THIS_RUN": n_sent if n_sent is not None else "N/A (no processed_keys; falling back to all DB annotations)",
         "TOTAL_LABELED_TILES_IN_DB": len(annotations),
-        "TOTAL_PERSON_TILES": total_person_tiles,   # "total number of people tiles"
-        "TOTAL_PERSON_TILES_QUERIED": total_person_tiles_queried,  # "total number of people tiles queried"
-        "TOTAL_RELEVANT_TILES": sum(label_counts[lab] for lab in relevant_counts),
-        "TOTAL_RELEVANT_TILES_QUERIED": relevant_queried,
+        # The following TOTAL_PERSON_* keys are retained for compatibility with any external consumers.
+        # Their values are now the relevant-class totals (see user request to show "Total relevant queried").
+        "TOTAL_PERSON_TILES": total_relevant_tiles,
+        "TOTAL_PERSON_TILES_QUERIED": total_relevant_tiles_queried,
+        "TOTAL_RELEVANT_TILES": total_relevant_tiles,
+        "TOTAL_RELEVANT_TILES_QUERIED": total_relevant_tiles_queried,
         "TOTAL_QUERIES_ARED_MADE": n_queries,   # NOTE: cache queries counted fully as user queries
         "TOTAL_ACTUAL_QUERIED_KEYS_LOGGED": len(actual_queried_keys),
         "CACHE_TREATED_AS_USER_QUERY": True,  # per explicit user instruction
         "UNIQUE_CLASSES": len(label_counts),
         "CLASS_COUNTS": dict(label_counts),
         "RELEVANT_CLASS_COUNTS": dict(relevant_counts),
+        "CLASSES_DISCOVERED_X_Y": classes_discovered_str,
+        "CLASSES_QUERIED_BY_ARED_THIS_RUN": sorted(queried_class_names),
+        "N_CLASSES_QUERIED_THIS_RUN": n_classes_queried,
+        "N_UNIQUE_CLASSES_IN_RUN": n_unique_in_run,
         "FIRST_OCCURRENCE_BY_CLASS": first_of_class,
         "N_FIRST_OF_CLASS": n_first,
         "N_SHOULD_QUERY_TOTAL": metrics["n_should_query"],
@@ -418,6 +437,7 @@ def evaluate_from_annotations_and_queries(
         "TN_NOT_TRACKED": "We only care about query decisions (positives for the query task)",
         "QUERY_PRECISION_WORK": f"QP = {tp} / ({tp} + {fp}) = {metrics['query_precision']}   (TP/FP over ALL positives: first-of-any-class OR rel-class samples)",
         "RELEVANT_RECALL_WORK": f"RR = {tp} / ({tp} + {fn}) = {metrics['relevant_recall']}   (TP / (TP + FN) over ALL positives, INCLUDING first appearances of classes)",
+        "F1_WORK": f"F1 = 2 * QP * RR / (QP + RR) = {metrics['f1_score']}   (harmonic mean of QP and RR)",
         "RANDOM_BASELINE": baseline,
         "TOTAL_STREAM_TILES_USED_FOR_RATES": total,
         "NOTE_ON_TOTAL": "total_points uses # tiles actually sent to A/RED this run (from processed). Only tiles actually sent are used for should/positives (firsts of any class + relevant class samples).",
@@ -431,8 +451,10 @@ def evaluate_from_annotations_and_queries(
     metrics["summary"] = (
         f"QP={metrics['query_precision']:.3f}  "
         f"RR={metrics['relevant_recall']:.3f}  "
+        f"F1={metrics['f1_score']:.3f}  "
+        f"Classes={classes_discovered_str}  "
         f"A/RED Queries={n_queries}  "
-        f"Person tiles queried={total_person_tiles_queried}/{total_person_tiles}  "
+        f"Total relevant queried={total_relevant_tiles_queried}/{total_relevant_tiles}  "
         f"vs Random≈{baseline['random_query_precision_approx']:.3f}"
     )
 

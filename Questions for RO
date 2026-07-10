@@ -9,7 +9,8 @@ I feel when I get too specefic, I will introduce issues relating to my own biase
 So I feel simpler is better. 
 
 Perhaps we need to move away from the idea of "Live footage." As currently, especially with the "warmup" period, 
-the algorithm makes too many queries to go along with a live system.
+the algorithm makes too many queries to go along with a live system. 
+Additionally, especially with tile overlap, it takes too long to process even a single frame.
 
 
 ========== FULL A/RED METRICS AUDIT (EVERY SINGLE DATAPOINT) ==========
@@ -431,5 +432,151 @@ Total labeled (people-tagged) tiles in DB: 1699
    approx QP = relevant_rate = 0.0115
 
 QP=0.373  RR=0.834  A/RED Queries=580  Person tiles queried=212/254  vs Random≈0.011
+======================================================================
+Data sources: DB annotations (human labels) + A/RED decision log (pipeline.queried_identities + stats['ared_queries']). See metrics.py + SPIE_IVSP_2026 / IJSC_2026-1.
+
+========== FULL A/RED METRICS AUDIT (EVERY SINGLE DATAPOINT) ==========
+Video: /home/wes/Desktop/PHXResearch/DroneBasic/Videos/DJI_0019.MP4
+QP: 0.3971    RR: 0.8417    F1: 0.5396
+Classes discovered (A/RED queried this run / unique in run): 6/6
+Total queries A/RED made (CACHE QUERIES COUNT AS USER QUERIES): 551
+Total stream tiles seen: 22080
+Total labeled (people-tagged) tiles in DB: 1764
+0. RUN PARAMETERS (reproducibility):
+   kappa=0.65   tile_size=240x240   frame_stride=15
+   stride=(120,120)
+   annotation_db=/home/wes/Desktop/PHXResearch/DroneBasic/tiled.db
+   dino_model=facebook/dinov3-vitb16-pretrain-lvd1689m   l_buf=2000 k=5
+   label_cache=True (thresh=0.15)
+   data_aug=False   edit_mode=False label_only=False
+---------------------------------------------------------------------
+---------------------------------------------------------------------
+1. CORE COUNTS (what you asked for):
+   TOTAL_TILES_ACTUALLY_SENT_TO_ARED          = 22080
+   TOTAL_PERSON_TILES (people tiles)          = 254
+   TOTAL_PERSON_TILES_QUERIED                 = 214
+   TOTAL_QUERIES_ARED_MADE (incl. all cache)  = 551
+   TOTAL_LABELED_TILES_IN_DB                  = 835
+   TOTAL_RELEVANT_TILES                       = 254
+   TOTAL_RELEVANT_TILES_QUERIED               = 214
+   CLASSES_DISCOVERED (A/RED queried / unique in run) = 6/6
+
+2. PER-CLASS HUMAN TAGGED (from DB annotations):
+   grass: 410 total labeled (0 relevant)
+   person: 254 total labeled (254 relevant)
+   tire mark: 101 total labeled (0 relevant)
+   sidewalk: 35 total labeled (0 relevant)
+   construction: 23 total labeled (0 relevant)
+   bag: 12 total labeled (0 relevant)
+
+3. FIRST OCCURRENCES (new-class positives part of should):
+   grass first seen at frame 0
+   construction first seen at frame 0
+   tire mark first seen at frame 0
+   sidewalk first seen at frame 0
+   person first seen at frame 0
+   bag first seen at frame 30
+
+4. SHOULD_QUERY GT POSITIVES (paper definition):
+   N_SHOULD_QUERY_TOTAL = 259
+   N_FIRST_OF_CLASS     = 6
+   N_RELEVANT_CLASS_SAMPLES = 254
+   (Note: RR uses ALL positives per paper: first appearances of any class + samples from relevant classes. See section 6.)
+
+5. A/RED QUERY OUTCOMES (broad positives for QP and RR):
+   TP (queried a positive) = 218
+   FP (queried but not a positive) = 331
+   FN (positive but not queried) = 41
+   Note: positives = (first sample of any class) OR (any sample of a relevant-designated class)
+
+   (For reference: relevant-class samples only)
+   relevant class samples = 254
+   relevant TP (queried among them) = 214
+   relevant FN = 40
+
+6. EXACT CALCULATIONS (formulas + numbers from papers):
+   QP = TP / (TP + FP)   --> 0.3971
+   RR = TP / (TP + FN)   --> 0.8417
+   F1 = 2 * QP * RR / (QP + RR)   --> 0.5396
+   Classes discovered (queried by A/RED this run / unique classes in run): 6/6
+   (RR includes first appearances of classes + relevant samples)
+   (Cache-satisfied A/RED decisions are included in the query count above.)
+
+7. RANDOM BASELINE (from papers at same query count):
+   approx QP = relevant_rate = 0.0115
+
+QP=0.397  RR=0.842  F1=0.540  Classes=6/6  A/RED Queries=551  Person tiles queried=214/254  vs Random≈0.011
+======================================================================
+Data sources: DB annotations (human labels) + A/RED decision log (pipeline.queried_identities + stats['ared_queries']). See metrics.py + SPIE_IVSP_2026 / IJSC_2026-1.
+
+========== FULL A/RED METRICS AUDIT (EVERY SINGLE DATAPOINT) ==========
+Video: /home/wes/Desktop/PHXResearch/DroneBasic/Videos/DJI_0019.MP4
+QP: 0.3731    RR: 0.8340    F1: 0.5155
+Classes discovered (A/RED queried this run / unique in run): 6/6
+Total queries A/RED made (CACHE QUERIES COUNT AS USER QUERIES): 580
+Total stream tiles seen: 22080
+Total labeled (people-tagged) tiles in DB: 1764
+0. RUN PARAMETERS (reproducibility):
+   kappa=0.65   tile_size=240x240   frame_stride=15
+   stride=(120,120)
+   annotation_db=/home/wes/Desktop/PHXResearch/DroneBasic/tiled.db
+   dino_model=facebook/dinov3-vitb16-pretrain-lvd1689m   l_buf=2000 k=5
+   label_cache=True (thresh=0.15)
+   data_aug=False   edit_mode=False label_only=False
+---------------------------------------------------------------------
+---------------------------------------------------------------------
+1. CORE COUNTS (what you asked for):
+   TOTAL_TILES_ACTUALLY_SENT_TO_ARED          = 22080
+   TOTAL_RELEVANT_TILES                       = 254
+   TOTAL_RELEVANT_TILES_QUERIED (Total relevant queried) = 212
+   TOTAL_QUERIES_ARED_MADE (incl. all cache)  = 580
+   TOTAL_LABELED_TILES_IN_DB                  = 835
+   CLASSES_DISCOVERED (A/RED queried / unique in run) = 6/6
+
+2. PER-CLASS HUMAN TAGGED (from DB annotations):
+   grass: 410 total labeled (0 relevant)
+   person: 254 total labeled (254 relevant)
+   tire mark: 101 total labeled (0 relevant)
+   sidewalk: 35 total labeled (0 relevant)
+   construction: 23 total labeled (0 relevant)
+   bag: 12 total labeled (0 relevant)
+
+3. FIRST OCCURRENCES (new-class positives part of should):
+   grass first seen at frame 0
+   construction first seen at frame 0
+   tire mark first seen at frame 0
+   sidewalk first seen at frame 0
+   person first seen at frame 0
+   bag first seen at frame 30
+
+4. SHOULD_QUERY GT POSITIVES (paper definition):
+   N_SHOULD_QUERY_TOTAL = 259
+   N_FIRST_OF_CLASS     = 6
+   N_RELEVANT_CLASS_SAMPLES = 254
+   (Note: RR uses ALL positives per paper: first appearances of any class + samples from relevant classes. See section 6.)
+
+5. A/RED QUERY OUTCOMES (broad positives for QP and RR):
+   TP (queried a positive) = 216
+   FP (queried but not a positive) = 363
+   FN (positive but not queried) = 43
+   Note: positives = (first sample of any class) OR (any sample of a relevant-designated class)
+
+   (For reference: relevant-class samples only)
+   relevant class samples = 254
+   relevant TP (queried among them) = 212
+   relevant FN = 42
+
+6. EXACT CALCULATIONS (formulas + numbers from papers):
+   QP = TP / (TP + FP)   --> 0.3731
+   RR = TP / (TP + FN)   --> 0.834
+   F1 = 2 * QP * RR / (QP + RR)   --> 0.5155
+   Classes discovered (queried by A/RED this run / unique classes in run): 6/6
+   (RR includes first appearances of classes + relevant samples)
+   (Cache-satisfied A/RED decisions are included in the query count above.)
+
+7. RANDOM BASELINE (from papers at same query count):
+   approx QP = relevant_rate = 0.0115
+
+QP=0.373  RR=0.834  F1=0.515  Classes=6/6  A/RED Queries=580  Total relevant queried=212/254  vs Random≈0.011
 ======================================================================
 Data sources: DB annotations (human labels) + A/RED decision log (pipeline.queried_identities + stats['ared_queries']). See metrics.py + SPIE_IVSP_2026 / IJSC_2026-1.
