@@ -231,6 +231,9 @@ class AREDAdapter:
         self.num_points_processed: int = 0
         self.num_queries: int = 0
         self.discovered_labels: set = set()
+        # Per-class count of how many times A/RED decided to query for this label during *this run*.
+        # This is what the GUI class lists should display for "queried by A/RED".
+        self.query_counts: dict[str, int] = {}
 
         # Current label provider (set by Controller / tests)
         # Signature: (emb: np.ndarray, tile_img: Optional[Any], meta: dict) -> (label: str, relevant: bool)
@@ -363,6 +366,8 @@ class AREDAdapter:
                         obtained_rel = rel
                         self.oracle.y[_abs_index] = [label, rel]  # type: ignore
                         self.discovered_labels.add(label)
+                        if not is_peek:
+                            self.query_counts[label] = self.query_counts.get(label, 0) + 1
                         if is_peek:
                             print(f"[ARED]   -> Cache HIT on peek for abs_idx={_abs_index}. Auto (no GUI).")
                         else:
@@ -405,6 +410,8 @@ class AREDAdapter:
                 # Record + also feed back into the store so identical future tiles are cached
                 self.oracle.y[_abs_index] = [label, rel]  # type: ignore
                 self.discovered_labels.add(label)
+                # Count this A/RED query decision for the class (what the user wants to see in the class lists).
+                self.query_counts[label] = self.query_counts.get(label, 0) + 1
                 if getattr(self, "_label_store", None) is not None:
                     try:
                         self._label_store.add(emb, label, rel)
@@ -453,6 +460,8 @@ class AREDAdapter:
             self.num_points_processed += 1
             if was_queried:
                 self.num_queries += 1
+                # Note: per-class query_counts is incremented inside the real-query answer_query path
+                # (for both cache hits and provider answers) so we count exactly once per A/RED decision.
 
             # ------------------------------------------------------------------
             # Data Augmentation (optional, DINO rotation variants)
@@ -539,6 +548,10 @@ class AREDAdapter:
         old_provider = getattr(self, "_label_provider", None)
         old_fe = getattr(self, "_feature_extractor", None)
 
+        # Reset query counts for the new run (the loaded state is a warm-start for clustering,
+        # but A/RED query counts for "this run" should start fresh).
+        self.query_counts = {}
+
         # Re-create adapter with (approximately) same hyperparams
         new_cfg = type(self.config)(  # type: ignore
             kappa=state.kappa,
@@ -600,6 +613,16 @@ class AREDAdapter:
 
     def get_known_labels(self) -> List[str]:
         return sorted(self.ared.subspace_partition.set_of_known_labels)
+
+    def get_query_counts(self) -> Dict[str, int]:
+        """Return per-class counts of A/RED queries (real decisions) this run.
+
+        Incremented for every point where A/RED decided it needed a label
+        (whether the answer came from cache, exact DB, or human GUI).
+        This is the number the user wants to see in the class boxes:
+        "how many of each class have been queried by A/RED throughout the run".
+        """
+        return dict(getattr(self, 'query_counts', {}))
 
     @property
     def num_clusters(self) -> int:

@@ -1060,15 +1060,19 @@ class MainWindow:
     def _start(self):
         self._read_params_into_config()
 
-        # Reset per-run tracking so "Discovered Classes" and counts start fresh for *this* execution.
-        # We still pull historical *names* (from label_store + exact DB) so old classes remain
-        # clickable without re-typing. Only the numbers shown now reflect work in the current run.
+        # Reset GUI-side "new this run" name tracking (helps immediate visibility for classes created in this session).
+        # Historical names from DB/label cache are still collected below so they remain clickable.
         self.discovered_classes = set()
-        self.run_class_counts = {}
 
-        # Immediately refresh the main "Discovered Classes" list so historical names (with 0 run counts)
-        # appear right away instead of waiting for the first poll tick. Numbers will only grow for work
-        # done since this Start.
+        # Make sure A/RED query counts for this run start at zero. The class boxes should show
+        # "how many of each class A/RED queried and labeled during the current run".
+        if self.controller and getattr(self.controller, 'ared_adapter', None):
+            try:
+                self.controller.ared_adapter.query_counts = {}
+            except Exception:
+                pass
+
+        # Refresh right away so the lists reflect the fresh (zero) A/RED query counts + all known class names.
         try:
             self._refresh_class_list()
         except Exception:
@@ -1743,9 +1747,8 @@ class MainWindow:
         cur_label = meta.get("current_label")
         cur_rel = bool(meta.get("current_relevant", False))
 
-        # Gather current known classes from both store and ARED.
-        # Collect *names* from history (label_store + exact DB) so old classes are clickable
-        # without re-typing.  Use ONLY per-run counts for the numbers shown.
+        # Collect class *names* from all sources (label cache, exact DB via controller, ARED state, and classes assigned this GUI run).
+        # This preserves the required "click any old class" functionality.
         classes = []
         if self.label_store:
             classes.extend(self.label_store.get_all_labels())
@@ -1766,8 +1769,13 @@ class MainWindow:
 
         classes = sorted(set(classes))
 
-        # Per-run counts only (0 for anything not yet labeled in *this* execution)
-        counts = {lbl: self.run_class_counts.get(lbl, 0) for lbl in classes}
+        # Numbers = times A/RED queried for the class during *this run* (the original good behavior).
+        # Names above are harvested broadly so old classes from DB/cache/history remain clickable.
+        counts = {}
+        if self.controller.ared_adapter:
+            counts = self.controller.ared_adapter.get_query_counts() or {}
+        for lbl in classes:
+            counts.setdefault(lbl, 0)
 
         # Build relevance map (source of truth is our class_relevance; seed from store if possible)
         class_relevance = dict(getattr(self, 'class_relevance', {}))
@@ -1806,7 +1814,8 @@ class MainWindow:
             self._pending_label_request = None
             self.discovered_classes.add(label)
             # Track count for *this run only* so the class boxes start near zero instead of full DB history
-            self.run_class_counts[label] = self.run_class_counts.get(label, 0) + 1
+            # Note: the A/RED query count is tracked inside the adapter when the decision was made.
+            # We only need to remember the name for immediate clickability.
             self.class_relevance[label] = relevant
             self._refresh_class_list()
             self.status_var.set(f"Last label assigned: {label} (relevant={relevant})")
@@ -1848,8 +1857,8 @@ class MainWindow:
 
     def _refresh_class_list(self):
         self.class_listbox.delete(0, "end")
-        # Collect names from history (label cache + exact DB + ARED + this run) so old classes
-        # remain clickable.  Numbers shown are strictly from this run (run_class_counts).
+        # Collect names broadly (history + cache + DB + this run) so the user can click
+        # any previously seen class without re-typing. This functionality must remain.
         all_labels = set(getattr(self, 'discovered_classes', set()))
         if self.label_store:
             all_labels.update(self.label_store.get_all_labels())
@@ -1861,10 +1870,14 @@ class MainWindow:
             except Exception:
                 pass
 
-        # Force display counts to per-run only. This is the key fix: previously full
-        # get_class_counts() from store/DB were merged in, making boxes start with total history.
-        run_counts = getattr(self, 'run_class_counts', {})
-        counts = {lbl: run_counts.get(lbl, 0) for lbl in all_labels}
+        # Displayed numbers = how many times A/RED queried for the class during *this run*.
+        # This is the base functionality that was good: "how many of each class have been queried and labeled by A/RED".
+        # Names are still collected from all sources (DB, cache, history, this run) so old classes remain clickable.
+        counts = {}
+        if self.controller.ared_adapter:
+            counts = self.controller.ared_adapter.get_query_counts() or {}
+        for lbl in all_labels:
+            counts.setdefault(lbl, 0)
 
         # Ensure we have a relevance entry (seed from store when possible)
         for lbl in all_labels:
@@ -3726,14 +3739,12 @@ class MultiFrameLabelBrowser(tk.Toplevel):
                 # Light refresh: update counts on strip cards, keep thumbs loaded
                 self._refresh_annotations_light()
 
-                # Feed per-run counters on the main window so "Discovered Classes" list
-                # and counts grow from this run (not from full DB). Keep change tiny.
+                # Make the name known immediately for clickability in the main lists.
+                # Do NOT bump any "query count" here — this is manual labeling in the browser,
+                # not an A/RED query decision. The A/RED query counts come only from the adapter.
                 try:
                     if self.main_window is not None:
                         self.main_window.discovered_classes.add(name)
-                        rc = getattr(self.main_window, 'run_class_counts', None)
-                        if rc is not None:
-                            rc[name] = rc.get(name, 0) + 1
                         if hasattr(self.main_window, '_refresh_class_list'):
                             self.main_window._refresh_class_list()
                 except Exception:
