@@ -41,6 +41,12 @@ from .tile_database import TileAnnotationDB
 from .annotation_domain import TileKey  # domain model (wiring refactor)
 from .annotation_manager import AnnotationManager
 from . import metrics as ared_metrics   # Query Precision / Relevant Recall (see papers)
+from .label_sentinels import (
+    CONTROL_LABEL_SENTINELS,
+    LabelCancelled,
+    is_control_label,
+    is_persistable_label,
+)
 
 
 class LabelRequest:
@@ -51,8 +57,9 @@ class LabelRequest:
     - "Label Only" / sparse labeling sessions.
     - Skip / Move On without labeling (for efficient relevant-focused labeling to support metrics).
     - Edit / resume: pre-filling current label when tile already exists in DB.
+    - Cancel (stop/abort) without inventing a fake class label.
     """
-    __slots__ = ("tile", "embedding", "meta", "response_event", "result", "skipped")
+    __slots__ = ("tile", "embedding", "meta", "response_event", "result", "skipped", "cancelled", "cancel_reason")
 
     def __init__(self, tile: Tile, embedding: np.ndarray, meta: Dict):
         self.tile = tile
@@ -61,9 +68,18 @@ class LabelRequest:
         self.response_event = threading.Event()
         self.result: Optional[tuple[str, bool]] = None   # (label, relevant) or None
         self.skipped: bool = False   # True if user chose "Skip / Move On" without assigning
+        self.cancelled: bool = False  # True if run was stopped / request aborted (NOT a label)
+        self.cancel_reason: str = ""
 
     def set_result(self, label: Optional[str], relevant: bool = False):
-        """Set a normal label result. label may be None only for internal cases."""
+        """Set a normal label result. label may be None only for internal cases.
+        Control sentinels must not be passed here — use set_cancelled() / set_skip().
+        """
+        if label is not None and is_control_label(label):
+            # Defensive: never accept a control string as a real label result.
+            print(f"[LabelRequest] Refusing control sentinel '{label}' as set_result; treating as cancel.")
+            self.set_cancelled(reason=str(label))
+            return
         self.result = (label, relevant) if label is not None else None
         self.response_event.set()
 
@@ -72,6 +88,18 @@ class LabelRequest:
         The tile remains unlabeled in the DB (unless it already had a label).
         """
         self.skipped = True
+        self.result = None
+        self.response_event.set()
+
+    def set_cancelled(self, reason: str = "stopped"):
+        """Abort this request without producing a label (Stop button, window close, queue drain).
+
+        Unlike set_result("__STOPPED__", ...), this does NOT invent a class name that could
+        be written to the DB or learned by A/RED.
+        """
+        self.cancelled = True
+        self.cancel_reason = reason or "stopped"
+        self.skipped = True  # also mark skipped so Label Only paths that check skipped stay safe
         self.result = None
         self.response_event.set()
 
@@ -207,10 +235,12 @@ class DroneAREDController:
         self._stop_event.set()
         self._pause_event.set()  # unblock if paused
 
-        # Unblock any pending label request (worker may be blocked in req.wait() for human label)
+        # Unblock any pending label request WITHOUT inventing a fake class label.
+        # Previously this used set_result("__STOPPED__", False), which was then
+        # persisted to the annotation DB and learned by A/RED as a real class.
         if getattr(self, "_current_label_req", None):
             try:
-                self._current_label_req.set_result("__STOPPED__", False)
+                self._current_label_req.set_cancelled(reason="stopped")
             except Exception:
                 pass
             self._current_label_req = None
@@ -221,7 +251,7 @@ class DroneAREDController:
                 req = self.label_request_queue.get_nowait()
                 if req:
                     try:
-                        req.set_result("__STOPPED__", False)
+                        req.set_cancelled(reason="stopped")
                     except Exception:
                         pass
             except queue.Empty:
@@ -545,7 +575,10 @@ class DroneAREDController:
                 exact = self.tile_db.lookup_key(key)
                 if exact:
                     label, rel = exact
-                    if not self.edit_mode:
+                    # Poisoned control sentinels in the DB must never auto-answer A/RED.
+                    if is_control_label(label):
+                        print(f"[Pipeline]   -> EXACT DB HIT is control sentinel '{label}' — treating as miss (will re-query / not feed to A/RED).")
+                    elif not self.edit_mode:
                         print(f"[Pipeline]   -> EXACT DB HIT for {Path(vpath).name} f{abs_f} [{row},{col}] stride=({sx},{sy}): '{label}' (relevant={rel}). Auto (no GUI).")
                         if self.label_store is not None:
                             try:
@@ -560,9 +593,12 @@ class DroneAREDController:
             if self.label_store is not None:
                 hit = self.label_store.lookup(emb)
                 if hit:
-                    self.stats["cache_hits"] = self.stats.get("cache_hits", 0) + 1
-                    print(f"[Pipeline]   -> Label store (embedding) CACHE HIT: '{hit[0]}' (relevant={hit[1]}). Returning without GUI.")
-                    return hit
+                    if is_control_label(hit[0]):
+                        print(f"[Pipeline]   -> Label store CACHE HIT is control sentinel '{hit[0]}' — treating as miss.")
+                    else:
+                        self.stats["cache_hits"] = self.stats.get("cache_hits", 0) + 1
+                        print(f"[Pipeline]   -> Label store (embedding) CACHE HIT: '{hit[0]}' (relevant={hit[1]}). Returning without GUI.")
+                        return hit
                 else:
                     print(f"[Pipeline]   -> Label store (embedding) CACHE MISS.")
 
@@ -583,20 +619,34 @@ class DroneAREDController:
                 self.label_request_queue.put(req, timeout=5)
             except queue.Full:
                 self._current_label_req = None
-                print("[Pipeline]   -> WARNING: label queue full, falling back to __BACKGROUND__")
-                return "__BACKGROUND__", False
+                # Queue full is a control failure, not a real label — do not invent __BACKGROUND__.
+                print("[Pipeline]   -> WARNING: label queue full; cancelling this query (no fake label).")
+                raise LabelCancelled("queue_full")
 
             print("[Pipeline]   -> Waiting for GUI response (blocking worker thread)...")
             result = req.wait(timeout=300)
             self._current_label_req = None
+
+            # Cancel / skip / timeout: never persist and never return a fake class to A/RED.
+            if getattr(req, "cancelled", False):
+                reason = getattr(req, "cancel_reason", None) or "stopped"
+                print(f"[Pipeline]   -> Label request CANCELLED ({reason}); not saving, not feeding A/RED.")
+                raise LabelCancelled(reason)
+            if getattr(req, "skipped", False):
+                print("[Pipeline]   -> Label request SKIPPED; not saving, not feeding A/RED.")
+                raise LabelCancelled("skipped")
             if result is None:
-                print("[Pipeline]   -> TIMEOUT waiting for label, using __TIMEOUT__")
-                return "__TIMEOUT__", False
+                print("[Pipeline]   -> TIMEOUT waiting for label; not saving, not feeding A/RED.")
+                raise LabelCancelled("timeout")
 
             label, rel = result
+            if not is_persistable_label(label):
+                print(f"[Pipeline]   -> Refusing control/empty label '{label}'; not saving, not feeding A/RED.")
+                raise LabelCancelled(f"control_label:{label}")
+
             print(f"[Pipeline]   -> Received label from GUI: '{label}' (relevant={rel})")
 
-            # Save the human decision to BOTH stores
+            # Save the human decision to BOTH stores (only real labels reach here)
             # a) Exact DB (now stride-aware for overlap safety)
             if self.tile_db is not None and vpath and abs_f >= 0:
                 try:
@@ -1056,7 +1106,13 @@ class DroneAREDController:
                     continue
 
                 label, rel = result
-                if not label or label == "__SKIP__":
+                # Never save control sentinels or empty labels (e.g. legacy __STOPPED__ path)
+                if not is_persistable_label(label):
+                    self.stats["tiles_processed"] = self.stats.get("tiles_processed", 0) + 1
+                    if not nav_pending_on_unblock:
+                        self._advance_label_only_cursor(1, frame_stride, total_frames, tiles_per_frame)
+                    continue
+                if getattr(req, "cancelled", False):
                     self.stats["tiles_processed"] = self.stats.get("tiles_processed", 0) + 1
                     if not nav_pending_on_unblock:
                         self._advance_label_only_cursor(1, frame_stride, total_frames, tiles_per_frame)

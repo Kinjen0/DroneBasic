@@ -26,6 +26,8 @@ from typing import List, Dict, Tuple, Set, Any, Optional
 from collections import defaultdict
 import random
 
+from .label_sentinels import is_control_label, is_persistable_label
+
 
 # -----------------------------------------------------------------------------
 # Stable tile identity
@@ -330,11 +332,17 @@ def evaluate_from_annotations_and_queries(
     # 3. should computed from final labels using paper rule.
     # Formulas exactly as SPIE_IVSP_2026 eq.8/9 and IJSC paper.
 
-    # Raw class counts
+    # Raw class counts (ignore control-plane sentinels so metrics stay meaningful)
     from collections import Counter
-    label_counts = Counter(str(a.get("label","")) for a in annotations)
+    label_counts = Counter(
+        str(a.get("label", "")) for a in annotations
+        if is_persistable_label(str(a.get("label", "")))
+    )
     # relevant class counts now based on designation (any tile of class marked rel designates the class)
-    relevant_counts = Counter(str(a.get("label","")) for a in annotations if str(a.get("label","")) in relevant_classes)
+    relevant_counts = Counter(
+        str(a.get("label", "")) for a in annotations
+        if str(a.get("label", "")) in relevant_classes and is_persistable_label(str(a.get("label", "")))
+    )
 
     # Relevant-class stats (class-level: a class is relevant if any of its instances were marked relevant).
     # These replace the former hard-coded "person" counts per user request.

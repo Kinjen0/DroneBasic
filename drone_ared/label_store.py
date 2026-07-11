@@ -25,6 +25,8 @@ from typing import Optional, Tuple, List, Dict, Any
 import numpy as np
 from sklearn.neighbors import NearestNeighbors
 
+from .label_sentinels import is_control_label, is_persistable_label
+
 
 class PersistentLabelStore:
     """
@@ -72,11 +74,18 @@ class PersistentLabelStore:
         # We store the raw L2 distance from ARED usage, so compare directly.
         if dist <= self.auto_label_threshold:
             i = int(idxs[0, 0])
-            return self._labels[i], self._relevances[i]
+            lab = self._labels[i]
+            # Never return a poisoned control sentinel as an auto-label
+            if is_control_label(lab):
+                return None
+            return lab, self._relevances[i]
         return None
 
     def add(self, embedding: np.ndarray, label: str, relevant: bool) -> None:
-        """Remember this decision."""
+        """Remember this decision. Control sentinels are refused (not stored)."""
+        if not is_persistable_label(label):
+            print(f"[LabelStore] Refusing to store control-sentinel label '{label}'.")
+            return
         emb = np.asarray(embedding, dtype=np.float32).reshape(-1)
         self._embeddings.append(emb)
         self._labels.append(str(label))
@@ -123,13 +132,28 @@ class PersistentLabelStore:
         try:
             with open(self.db_path, "rb") as f:
                 data = pickle.load(f)
-            self._embeddings = [np.asarray(e, dtype=np.float32) for e in data.get("embeddings", [])]
-            self._labels = list(data.get("labels", []))
-            self._relevances = list(data.get("relevances", []))
+            raw_embs = [np.asarray(e, dtype=np.float32) for e in data.get("embeddings", [])]
+            raw_labels = list(data.get("labels", []))
+            raw_rels = list(data.get("relevances", []))
+            # Drop any historically poisoned control-sentinel entries
+            self._embeddings = []
+            self._labels = []
+            self._relevances = []
+            purged = 0
+            for e, lab, rel in zip(raw_embs, raw_labels, raw_rels):
+                if is_persistable_label(lab):
+                    self._embeddings.append(e)
+                    self._labels.append(str(lab))
+                    self._relevances.append(bool(rel))
+                else:
+                    purged += 1
             if "threshold" in data:
                 self.auto_label_threshold = float(data["threshold"])
             self._rebuild_index()
-            print(f"[LabelStore] Loaded {len(self)} cached labels from {self.db_path}")
+            msg = f"[LabelStore] Loaded {len(self)} cached labels from {self.db_path}"
+            if purged:
+                msg += f" (purged {purged} control-sentinel entries)"
+            print(msg)
         except Exception as e:
             print(f"[LabelStore] Failed to load {self.db_path}: {e}. Starting empty.")
             self._embeddings = []
@@ -141,10 +165,10 @@ class PersistentLabelStore:
     # ------------------------------------------------------------------
     def get_class_counts(self) -> Dict[str, int]:
         from collections import Counter
-        return dict(Counter(self._labels))
+        return dict(Counter(l for l in self._labels if is_persistable_label(l)))
 
     def get_all_labels(self) -> List[str]:
-        return sorted(set(self._labels))
+        return sorted({l for l in self._labels if is_persistable_label(l)})
 
     def get_class_relevance(self, label: str) -> Optional[bool]:
         """Return the relevant flag associated with a previously stored example of this class, if any."""

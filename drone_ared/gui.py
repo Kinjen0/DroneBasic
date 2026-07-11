@@ -1736,10 +1736,14 @@ class MainWindow:
         gidx = getattr(tile, 'global_idx', -1) if tile else -1
         if gidx != -1 and getattr(self, '_last_queried_global', -1) == gidx:
             # Already handled this tile's query; ignore stale/duplicate
-            # CRITICAL: still satisfy the req or the worker thread will block forever on wait()
-            print("[GUI]   -> Duplicate request for same global_idx, ignoring (but satisfying req to unblock worker).")
+            # CRITICAL: still satisfy the req or the worker thread will block forever on wait().
+            # Use cancel/skip — never invent a fake class label like __DUPLICATE__.
+            print("[GUI]   -> Duplicate request for same global_idx, ignoring (cancelling req to unblock worker).")
             try:
-                req.set_result("__DUPLICATE__", False)
+                if hasattr(req, "set_cancelled"):
+                    req.set_cancelled(reason="duplicate")
+                else:
+                    req.set_skip()
             except Exception:
                 pass
             return
@@ -1814,6 +1818,15 @@ class MainWindow:
                 print("[GUI] Skip notification received (no class recorded).")
                 self._pending_label_request = None
                 return
+            # Never record control-plane sentinels as discovered classes
+            try:
+                from .label_sentinels import is_control_label
+                if is_control_label(label):
+                    print(f"[GUI] Ignoring control-sentinel notification '{label}' (not a real class).")
+                    self._pending_label_request = None
+                    return
+            except Exception:
+                pass
             print(f"[GUI] Label SUBMITTED from dialog: '{label}' (relevant={relevant})")
             self._pending_label_request = None
             self.discovered_classes.add(label)

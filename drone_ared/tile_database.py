@@ -34,6 +34,7 @@ import numpy as np
 # Re-export domain models for backward compatibility and clean imports.
 # New code should prefer: from drone_ared.annotation_domain import TileKey, ...
 from .annotation_domain import TileKey, AnnotationFilter, TileAnnotation  # noqa: F401
+from .label_sentinels import CONTROL_LABEL_SENTINELS, is_control_label, is_persistable_label
 
 
 class TileAnnotationDB:
@@ -56,6 +57,15 @@ class TileAnnotationDB:
         self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL;")  # better concurrency / durability for edits
         self._create_tables()
+
+        # Remove any historically poisoned control-sentinel rows (e.g. __STOPPED__)
+        # so they cannot auto-answer future A/RED queries via exact DB hit.
+        try:
+            n = self.purge_control_sentinel_labels()
+            if n:
+                print(f"[TileDB] Purged {n} control-sentinel label row(s) from {self.db_path.name}")
+        except Exception as e:
+            print(f"[TileDB] Note: control-sentinel purge skipped: {e}")
 
         print(f"[TileDB] Opened annotation database at {self.db_path}")
 
@@ -179,6 +189,10 @@ class TileAnnotationDB:
                                crop_x: Optional[int] = None, crop_y: Optional[int] = None) -> None:
         """Preferred form using domain TileKey (improves readability & type safety)."""
         if not key.video_path or not label:
+            return
+        # Never persist control-plane sentinels (__STOPPED__, __TIMEOUT__, etc.)
+        if not is_persistable_label(label):
+            print(f"[TileDB] Refusing to store control-sentinel label '{label}' (not a real class).")
             return
         vpath = self._normalize_video_path(key.video_path)
         ts = time.time()
@@ -409,13 +423,36 @@ class TileAnnotationDB:
         and skips the rest, those class names must still appear in the main GUI's
         "Discovered Classes" list so they can be clicked instead of re-typed on
         subsequent tiles.
+
+        Control-plane sentinels (__STOPPED__, etc.) are filtered out.
         """
         try:
             cur = self.conn.cursor()
             cur.execute("SELECT DISTINCT label FROM annotations ORDER BY label")
-            return [row[0] for row in cur.fetchall()]
+            return [row[0] for row in cur.fetchall() if is_persistable_label(row[0])]
         except Exception:
             return []
+
+    def purge_control_sentinel_labels(self) -> int:
+        """Delete rows whose label is a control-plane sentinel (not a real class).
+
+        Returns the number of rows deleted. Safe to call on every open.
+        """
+        if not CONTROL_LABEL_SENTINELS:
+            return 0
+        try:
+            cur = self.conn.cursor()
+            placeholders = ",".join("?" for _ in CONTROL_LABEL_SENTINELS)
+            cur.execute(
+                f"DELETE FROM annotations WHERE label IN ({placeholders})",
+                tuple(CONTROL_LABEL_SENTINELS),
+            )
+            n = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else 0
+            self.conn.commit()
+            return int(n)
+        except Exception as e:
+            print(f"[TileDB] purge_control_sentinel_labels failed: {e}")
+            return 0
 
     def get_class_relevance(self, label: str) -> Optional[bool]:
         """Return the relevant flag for a class if it was previously assigned

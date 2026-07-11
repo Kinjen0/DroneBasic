@@ -45,6 +45,8 @@ import threading
 import contextlib
 from dataclasses import dataclass, field
 
+from .label_sentinels import LabelCancelled, is_control_label, is_persistable_label
+
 if TYPE_CHECKING:
     from .label_store import PersistentLabelStore
     from .config import AREDConfig
@@ -362,17 +364,21 @@ class AREDAdapter:
                     cached = self._label_store.lookup(emb)
                     if cached is not None:
                         label, rel = cached
-                        obtained_label = label
-                        obtained_rel = rel
-                        self.oracle.y[_abs_index] = [label, rel]  # type: ignore
-                        self.discovered_labels.add(label)
-                        if not is_peek:
-                            self.query_counts[label] = self.query_counts.get(label, 0) + 1
-                        if is_peek:
-                            print(f"[ARED]   -> Cache HIT on peek for abs_idx={_abs_index}. Auto (no GUI).")
+                        # Never accept control sentinels from a poisoned cache
+                        if is_control_label(label):
+                            print(f"[ARED]   -> Cache HIT is control sentinel '{label}' — ignoring (treating as miss).")
                         else:
-                            print(f"[ARED]   -> Cache HIT for this QUERY decision. Auto-labeled as '{label}' (relevant={rel}). (still counts as ARED query for labels-needed metric)")
-                        return label, rel
+                            obtained_label = label
+                            obtained_rel = rel
+                            self.oracle.y[_abs_index] = [label, rel]  # type: ignore
+                            self.discovered_labels.add(label)
+                            if not is_peek:
+                                self.query_counts[label] = self.query_counts.get(label, 0) + 1
+                            if is_peek:
+                                print(f"[ARED]   -> Cache HIT on peek for abs_idx={_abs_index}. Auto (no GUI).")
+                            else:
+                                print(f"[ARED]   -> Cache HIT for this QUERY decision. Auto-labeled as '{label}' (relevant={rel}). (still counts as ARED query for labels-needed metric)")
+                            return label, rel
                     else:
                         if is_peek:
                             print(f"[ARED]   -> Cache MISS on peek (will use provisional, no GUI).")
@@ -383,7 +389,8 @@ class AREDAdapter:
                     # Peek call (internal ARED accounting for non-queried points).
                     # Do NOT call human/GUI provider here -- that would query on every tile.
                     # Supply a provisional so ARED can continue; real cluster label may be back-filled later.
-                    label = meta.get("label", f"__PEEK_{abs_idx % 100}")
+                    # Use a private provisional that is never persisted as a real class name.
+                    label = meta.get("label") if meta.get("label") and not is_control_label(meta.get("label")) else f"__PEEK_{abs_idx % 100}"
                     rel = bool(meta.get("relevant", False))
                     obtained_label = label
                     obtained_rel = rel
@@ -399,10 +406,21 @@ class AREDAdapter:
                     # Fallback for headless / synthetic tests
                     label = meta.get("label", f"auto_{abs_idx % 5}")
                     rel = bool(meta.get("relevant", False))
+                    if is_control_label(label):
+                        raise LabelCancelled(f"fallback_control_label:{label}")
                     print(f"[ARED]   -> No provider, using fallback label '{label}' (relevant={rel})")
                 else:
-                    label, rel = self._label_provider(emb, tile_image, meta)
+                    try:
+                        label, rel = self._label_provider(emb, tile_image, meta)
+                    except LabelCancelled:
+                        # Propagate so process() can abort without learning a junk class
+                        raise
                     print(f"[ARED]   -> Provider returned label '{label}' (relevant={rel})")
+
+                # Hard refuse control sentinels even if provider returned them as strings
+                if not is_persistable_label(label):
+                    print(f"[ARED]   -> REFUSING control/empty label '{label}' (will not learn or store).")
+                    raise LabelCancelled(f"control_label:{label}")
 
                 obtained_label = label
                 obtained_rel = rel
@@ -423,11 +441,21 @@ class AREDAdapter:
             # Temporarily install
             self.oracle.answer_query = _interactive_answer  # type: ignore
 
+            cancelled_reason: Optional[str] = None
             try:
                 if self.num_points_processed == 0:
                     self.ared.process_first_point(emb)
                 else:
                     self.ared.process_point(emb)
+            except LabelCancelled as e:
+                # Stop / timeout / skip during a real query: do NOT learn a fake class.
+                # Best-effort: leave this point without a durable discovered label.
+                cancelled_reason = getattr(e, "reason", None) or str(e)
+                print(f"[ARED] LabelCancelled during process (reason={cancelled_reason}). "
+                      f"Not learning control labels; aborting this point cleanly.")
+                was_queried = False
+                obtained_label = None
+                obtained_rel = None
             finally:
                 # Restore
                 if original_answer is not None:
@@ -437,9 +465,28 @@ class AREDAdapter:
                     if hasattr(self.oracle, "answer_query"):
                         delattr(self.oracle, "answer_query")
 
+            if cancelled_reason is not None:
+                # Count the point as processed so the stream can continue / stop loop can exit,
+                # but report queried=False and no label so callers do not treat it as a real answer.
+                self.num_points_processed += 1
+                return {
+                    "abs_idx": abs_idx,
+                    "queried": False,
+                    "label": None,
+                    "relevant": None,
+                    "cancelled": True,
+                    "cancel_reason": cancelled_reason,
+                    "num_clusters": len(self.ared.subspace_partition.cluster_dict),
+                    "num_known_labels": len(self.ared.subspace_partition.set_of_known_labels),
+                }
+
             # Back-fill the label we (or ARED) decided for this abs_idx so later peeks are happy
-            if obtained_label is not None:
+            if obtained_label is not None and is_persistable_label(obtained_label):
                 self.oracle.y[abs_idx] = [obtained_label, obtained_rel]  # type: ignore
+            elif obtained_label is not None and is_control_label(obtained_label):
+                # Never back-fill control sentinels into oracle.y as durable classes
+                obtained_label = None
+                obtained_rel = None
             else:
                 # Non-queried point: ARED assigned it to an existing cluster.
                 # Best effort: find the cluster of the most recent point in the buffer.
@@ -452,8 +499,12 @@ class AREDAdapter:
                             cl = self.ared.subspace_partition.cluster_dict[cluster_key]
                             obtained_label = cl.label
                             obtained_rel = cl.relevance
-                            self.oracle.y[abs_idx] = [obtained_label, obtained_rel]  # type: ignore
-                            self.discovered_labels.add(obtained_label)
+                            if is_persistable_label(obtained_label):
+                                self.oracle.y[abs_idx] = [obtained_label, obtained_rel]  # type: ignore
+                                self.discovered_labels.add(obtained_label)
+                            else:
+                                obtained_label = None
+                                obtained_rel = None
                 except Exception:
                     pass  # best effort only
 
@@ -471,7 +522,8 @@ class AREDAdapter:
             # This is done here so it only affects points A/RED actually decided
             # to query.
             # ------------------------------------------------------------------
-            if was_queried and obtained_label and getattr(self.config, "data_augmentation_enabled", False):
+            if (was_queried and obtained_label and is_persistable_label(obtained_label)
+                    and getattr(self.config, "data_augmentation_enabled", False)):
                 try:
                     self._apply_data_augmentation(emb, tile_image, obtained_label, obtained_rel)
                 except Exception as e:
