@@ -2454,6 +2454,19 @@ class MultiFrameLabelBrowser(tk.Toplevel):
                     source = "live_overlap"
                     return sx, sy
 
+                # Checkbox OFF (or zero overlap): force non-overlapping stride = tile size.
+                # Do NOT fall through to stale config.stride_* left over from a previous
+                # overlapped Start — that made "overlap disabled" still use a smaller step.
+                if self.main_window is not None and hasattr(self.main_window, "overlap_enabled_var"):
+                    try:
+                        if not enabled:
+                            tw0 = tw or self._get_live_tile_size()[0]
+                            th0 = th or self._get_live_tile_size()[1]
+                            source = "live_nonoverlap"
+                            return int(tw0), int(th0)
+                    except Exception:
+                        pass
+
             # Next: explicit stride fields if user ever types them directly (future-proof)
             # Currently we expose overlap; stride is derived. But if present on config, honor it.
             if self.main_window is not None and hasattr(self.main_window, "config"):
@@ -3496,48 +3509,120 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         self.browser_status_var.set(f"Selected frame {frame_idx}. Use 'Explore & Label Tiles on this Frame' for the per-frame label creation grid.")
 
     def _open_frame_tile_explorer(self):
+        """Open a scrollable grid of ALL tiles for the selected frame so each can be labeled/edited.
+
+        Critical UX: the canvas must keep a correct scrollregion and support mouse-wheel
+        scrolling. Without that, dense non-overlapping grids (small tile sizes → many rows)
+        appear "cut off" after ~3–4 visible rows.
+        """
         if self.selected_frame is None or not self.current_video:
             messagebox.showinfo("Explorer", "Select a frame first.")
             return
-    
+
         explorer = tk.Toplevel(self)
         explorer.title(f"Tile Label Editor - Frame {self.selected_frame}")
         explorer.geometry(f"{int(1450 * min(self.ui_scale, 1.8))}x{int(920 * min(self.ui_scale, 1.8))}")
-        explorer.minsize(1100, 750)
+        explorer.minsize(900, 600)
         explorer.resizable(True, True)
-    
+
         top = ttk.Frame(explorer)
         top.pack(fill="x", padx=8, pady=6)
-        ttk.Label(top, text=f"Frame {self.selected_frame} — click any tile to label/edit").pack(side="left")
-        ttk.Button(top, text="Refresh / Re-tile", 
-                   command=lambda: self._populate_frame_tile_grid(explorer, tile_container, canvas)
-                  ).pack(side="right", padx=4)
-    
-        canvas = tk.Canvas(explorer, bg="#1f1f1f", highlightthickness=0)
-        vsb = ttk.Scrollbar(explorer, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=vsb.set)
-        vsb.pack(side="right", fill="y")
-        canvas.pack(side="left", fill="both", expand=True)
-    
+        info_var = tk.StringVar(value=f"Frame {self.selected_frame} — click any tile to label/edit  |  scroll for more rows")
+        ttk.Label(top, textvariable=info_var).pack(side="left")
+        # Keep a handle so populate can update the status line with tile counts
+        explorer._tile_explorer_info_var = info_var
+
+        # Body: canvas + vertical (and horizontal) scrollbars so tall/wide grids are fully reachable
+        body = ttk.Frame(explorer)
+        body.pack(fill="both", expand=True, padx=4, pady=4)
+        body.rowconfigure(0, weight=1)
+        body.columnconfigure(0, weight=1)
+
+        canvas = tk.Canvas(body, bg="#1f1f1f", highlightthickness=0)
+        vsb = ttk.Scrollbar(body, orient="vertical", command=canvas.yview)
+        hsb = ttk.Scrollbar(body, orient="horizontal", command=canvas.xview)
+        canvas.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        canvas.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+
         tile_container = ttk.Frame(canvas)
-        self._tile_explorer_win = canvas.create_window((0, 0), window=tile_container, anchor="nw")
-    
-        def _resize_container(event=None):
+        win_id = canvas.create_window((0, 0), window=tile_container, anchor="nw")
+        # Store on explorer so refresh can re-bind / re-use the same ids
+        explorer._tile_canvas = canvas
+        explorer._tile_container = tile_container
+        explorer._tile_win_id = win_id
+
+        def _on_container_configure(_event=None):
+            # Keep scrollregion in sync with the full content size (all rows/cols).
             try:
-                cw = canvas.winfo_width()
-                if cw > 100:
-                    canvas.itemconfig(self._tile_explorer_win, width=cw)
+                canvas.configure(scrollregion=canvas.bbox("all"))
             except Exception:
                 pass
-            
-        canvas.bind("<Configure>", _resize_container)
-    
+
+        def _on_canvas_configure(event=None):
+            # Stretch the embedded frame to the canvas width so columns reflow on resize,
+            # then refresh scrollregion so vertical height is never clipped.
+            try:
+                cw = event.width if event is not None else canvas.winfo_width()
+                if cw > 50:
+                    canvas.itemconfig(win_id, width=cw)
+                canvas.configure(scrollregion=canvas.bbox("all"))
+            except Exception:
+                pass
+
+        tile_container.bind("<Configure>", _on_container_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        def _on_mousewheel(event):
+            """Scroll the tile grid with the mouse wheel (Windows/macOS/Linux)."""
+            try:
+                if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
+                    canvas.yview_scroll(-3, "units")
+                elif getattr(event, "num", None) == 5 or getattr(event, "delta", 0) < 0:
+                    canvas.yview_scroll(3, "units")
+            except Exception:
+                pass
+            return "break"
+
+        # Bind wheel on canvas + bubble from children via bind_all scoped while explorer is open
+        canvas.bind("<MouseWheel>", _on_mousewheel)
+        canvas.bind("<Button-4>", _on_mousewheel)
+        canvas.bind("<Button-5>", _on_mousewheel)
+        tile_container.bind("<MouseWheel>", _on_mousewheel)
+        tile_container.bind("<Button-4>", _on_mousewheel)
+        tile_container.bind("<Button-5>", _on_mousewheel)
+
+        def _bind_wheel_recursive(widget):
+            try:
+                widget.bind("<MouseWheel>", _on_mousewheel)
+                widget.bind("<Button-4>", _on_mousewheel)
+                widget.bind("<Button-5>", _on_mousewheel)
+            except Exception:
+                pass
+            for child in widget.winfo_children():
+                _bind_wheel_recursive(child)
+
+        explorer._bind_tile_wheel = _bind_wheel_recursive
+        explorer._on_tile_mousewheel = _on_mousewheel
+
+        ttk.Button(
+            top, text="Refresh / Re-tile",
+            command=lambda: self._populate_frame_tile_grid(explorer, tile_container, canvas),
+        ).pack(side="right", padx=4)
+
         explorer.update_idletasks()
         self.after(30, lambda: self._populate_frame_tile_grid(explorer, tile_container, canvas))
-        self.after(120, _resize_container)
-    
+        self.after(100, _on_canvas_configure)
+
     def _populate_frame_tile_grid(self, explorer_win, container, canvas_ref=None):
-        """Improved version with better sizing and layout."""
+        """Build a fully scrollable grid of every tile on the selected frame.
+
+        Uses live tile size + stride (overlap if enabled). Thumb size scales down when
+        there are many tiles (typical for small non-overlapping sizes) so more of the
+        frame is visible without scrolling, while the canvas still scrolls to the rest.
+        """
         for w in container.winfo_children():
             w.destroy()
 
@@ -3560,6 +3645,7 @@ class MultiFrameLabelBrowser(tk.Toplevel):
                 return
 
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame_h, frame_w = frame_rgb.shape[:2]
 
             try:
                 from .tiling import GridTiler
@@ -3573,30 +3659,65 @@ class MultiFrameLabelBrowser(tk.Toplevel):
             self.current_frame_tiles = tiles
 
             if not tiles:
-                ttk.Label(container, text="No tiles generated.").pack()
+                ttk.Label(
+                    container,
+                    text=f"No tiles generated for {tw}x{th} stride=({sx},{sy}) on {frame_w}x{frame_h} frame.",
+                ).pack()
                 return
 
-            # --- Better column calculation ---
+            # Available width for column math (prefer live canvas width)
             try:
-                avail_w = max(800, container.winfo_width() or explorer_win.winfo_width() or 1200)
+                if canvas_ref is not None:
+                    avail_w = max(400, canvas_ref.winfo_width() or 0)
+                else:
+                    avail_w = 0
+                if avail_w < 200:
+                    avail_w = max(800, container.winfo_width() or explorer_win.winfo_width() or 1200)
             except Exception:
                 avail_w = 1200
 
-            thumb_size = 220  # increased
-            padding = 12
-            cols = max(3, (avail_w - 40) // (thumb_size + padding))
-            cols = min(cols, 8)
+            n_tiles = len(tiles)
+            # Adaptive thumb size: dense non-overlap grids (small tiles) need smaller thumbs
+            # so more rows fit on screen; sparse / large tiles can use larger previews.
+            if n_tiles >= 80:
+                thumb_size = 120
+            elif n_tiles >= 48:
+                thumb_size = 150
+            elif n_tiles >= 24:
+                thumb_size = 180
+            else:
+                thumb_size = 220
+            # Never show a thumb much larger than the native tile (avoids huge empty-looking cards)
+            thumb_size = min(thumb_size, max(64, max(tw, th) + 40))
+
+            padding = 14
+            cols = max(1, (avail_w - 24) // (thumb_size + padding))
+            # Cap columns reasonably but do not force a minimum of 3 (that wasted width
+            # and made tall grids even taller on narrow windows).
+            cols = max(1, min(cols, 12))
+
+            # How many grid rows the tiler produced (for status)
+            max_r = max((t.tile_row for t in tiles), default=0) + 1
+            max_c = max((t.tile_col for t in tiles), default=0) + 1
+
+            info_var = getattr(explorer_win, "_tile_explorer_info_var", None)
+            if info_var is not None:
+                info_var.set(
+                    f"Frame {self.selected_frame}  |  {n_tiles} tiles  "
+                    f"({max_c}×{max_r} grid, tile {tw}×{th}, stride {sx}×{sy})  "
+                    f"|  scroll for all rows  |  click a tile to label"
+                )
 
             for idx, tile in enumerate(tiles):
-                # Lookup current label
                 label = None
                 rel = False
                 try:
                     if self.tile_db:
-                        # Use live stride so overlap grids don't pull labels from a different stride's positions
-                        sx, sy = self._get_live_stride(tile.width, tile.height)
-                        key = TileKey(self.current_video, tile.frame_idx, tile.tile_row, tile.tile_col,
-                                      tile.width, tile.height, stride_x=sx, stride_y=sy)
+                        sx_k, sy_k = self._get_live_stride(tile.width, tile.height)
+                        key = TileKey(
+                            self.current_video, tile.frame_idx, tile.tile_row, tile.tile_col,
+                            tile.width, tile.height, stride_x=sx_k, stride_y=sy_k,
+                        )
                         hit = self.tile_db.lookup_key(key)
                         if hit:
                             label, rel = hit
@@ -3605,12 +3726,10 @@ class MultiFrameLabelBrowser(tk.Toplevel):
 
                 self.current_frame_tile_labels[idx] = (label, rel)
 
-                # Card
-                card = ttk.Frame(container, relief="groove", borderwidth=2, padding=4)
+                card = ttk.Frame(container, relief="groove", borderwidth=2, padding=3)
                 r, c = divmod(idx, cols)
-                card.grid(row=r, column=c, padx=6, pady=6, sticky="nsew")
+                card.grid(row=r, column=c, padx=4, pady=4, sticky="nsew")
 
-                # Larger preview
                 small = tile.image.copy()
                 small.thumbnail((thumb_size, thumb_size), Image.Resampling.LANCZOS)
                 tkimg = ImageTk.PhotoImage(small)
@@ -3619,24 +3738,48 @@ class MultiFrameLabelBrowser(tk.Toplevel):
                 img_lbl = ttk.Label(card, image=tkimg)
                 img_lbl.pack()
 
-                status = f"{label or 'unlabeled'}{' [R]' if rel else ''}"
-                ttk.Label(card, text=status, width=22, anchor="center").pack(pady=4)
+                status = f"r{tile.tile_row}c{tile.tile_col}  {label or 'unlabeled'}{' [R]' if rel else ''}"
+                ttk.Label(card, text=status, width=max(18, thumb_size // 8), anchor="center").pack(pady=2)
 
-                # Click to label
                 def make_edit(t=tile, i=idx):
                     return lambda e: self._quick_label_tile(explorer_win, t, i, container, canvas_ref)
 
                 for child in (card, img_lbl):
                     child.bind("<Button-1>", make_edit())
+                    # Wheel over cards must still scroll the outer canvas
+                    mw = getattr(explorer_win, "_on_tile_mousewheel", None)
+                    if mw is not None:
+                        try:
+                            child.bind("<MouseWheel>", mw)
+                            child.bind("<Button-4>", mw)
+                            child.bind("<Button-5>", mw)
+                        except Exception:
+                            pass
 
-            # Force layout update
-            container.update_idletasks()
-            if canvas_ref:
-                canvas_ref.configure(scrollregion=canvas_ref.bbox("all"))
-
-            # Make grid expand nicely
             for i in range(cols):
                 container.columnconfigure(i, weight=1)
+
+            # Layout + scrollregion so every row is reachable
+            container.update_idletasks()
+            if canvas_ref is not None:
+                try:
+                    cw = canvas_ref.winfo_width()
+                    win_id = getattr(explorer_win, "_tile_win_id", None)
+                    if win_id is not None and cw > 50:
+                        canvas_ref.itemconfig(win_id, width=cw)
+                    canvas_ref.configure(scrollregion=canvas_ref.bbox("all"))
+                    # Start scrolled to top so the first tiles are visible
+                    canvas_ref.yview_moveto(0.0)
+                except Exception:
+                    pass
+
+            # Bind wheel on all nested widgets created above
+            binder = getattr(explorer_win, "_bind_tile_wheel", None)
+            if binder is not None:
+                try:
+                    binder(container)
+                except Exception:
+                    pass
 
         except Exception as e:
             import traceback
