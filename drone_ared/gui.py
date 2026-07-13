@@ -2322,6 +2322,9 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         self.current_frame_tiles: List["Tile"] = []
         self.current_frame_tile_labels: Dict[int, Tuple[str, bool]] = {}  # tile_global_in_frame -> (label, rel)
         self._tile_photo_refs: List[ImageTk.PhotoImage] = []  # keep alive
+        # Preview size for tiles in "Explore & Label" (upscales small tiles for readability).
+        # Configurable via the explorer slider; default 300×300 as requested.
+        self.tile_preview_size: int = 300
 
         # Track known class relevance so we can auto-apply it to tiles (prevents forgetting in long sessions)
         self.class_relevance: dict[str, bool] = {}
@@ -3554,6 +3557,33 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         explorer._tile_container = tile_container
         explorer._tile_win_id = win_id
 
+        # Preview size control (default 300×300; upscales small native tiles for easier viewing)
+        ttk.Label(top, text="  Preview:").pack(side="left", padx=(12, 0))
+        preview_var = tk.IntVar(value=int(getattr(self, "tile_preview_size", 300) or 300))
+        explorer._tile_preview_var = preview_var
+        preview_scale = ttk.Scale(
+            top, from_=120, to=480, variable=preview_var, orient="horizontal", length=120,
+        )
+        preview_scale.pack(side="left", padx=4)
+        preview_lbl = ttk.Label(top, text=f"{preview_var.get()}px", width=5)
+        preview_lbl.pack(side="left")
+
+        def _sync_preview_lbl(*_):
+            try:
+                preview_lbl.config(text=f"{int(preview_var.get())}px")
+            except Exception:
+                pass
+        preview_var.trace_add("write", _sync_preview_lbl)
+
+        def _apply_preview_size(*_):
+            try:
+                self.tile_preview_size = max(80, min(640, int(preview_var.get())))
+            except Exception:
+                self.tile_preview_size = 300
+            self._populate_frame_tile_grid(explorer, tile_container, canvas)
+
+        preview_scale.bind("<ButtonRelease-1>", _apply_preview_size)
+
         def _on_container_configure(_event=None):
             # Keep scrollregion in sync with the full content size (all rows/cols).
             try:
@@ -3677,23 +3707,22 @@ class MultiFrameLabelBrowser(tk.Toplevel):
                 avail_w = 1200
 
             n_tiles = len(tiles)
-            # Adaptive thumb size: dense non-overlap grids (small tiles) need smaller thumbs
-            # so more rows fit on screen; sparse / large tiles can use larger previews.
-            if n_tiles >= 80:
-                thumb_size = 120
-            elif n_tiles >= 48:
-                thumb_size = 150
-            elif n_tiles >= 24:
-                thumb_size = 180
-            else:
-                thumb_size = 220
-            # Never show a thumb much larger than the native tile (avoids huge empty-looking cards)
-            thumb_size = min(thumb_size, max(64, max(tw, th) + 40))
+            # Preview size: default 300×300 (configurable via explorer slider).
+            # Small native tiles are *upscaled* so they stay easy to view; large tiles are
+            # downscaled to fit the same box. Dense grids still scroll fully.
+            try:
+                pvar = getattr(explorer_win, "_tile_preview_var", None)
+                if pvar is not None:
+                    thumb_size = max(80, min(640, int(pvar.get())))
+                else:
+                    thumb_size = int(getattr(self, "tile_preview_size", 300) or 300)
+            except Exception:
+                thumb_size = 300
+            self.tile_preview_size = thumb_size
 
             padding = 14
             cols = max(1, (avail_w - 24) // (thumb_size + padding))
-            # Cap columns reasonably but do not force a minimum of 3 (that wasted width
-            # and made tall grids even taller on narrow windows).
+            # Cap columns reasonably; more columns when previews are large keeps the grid usable.
             cols = max(1, min(cols, 12))
 
             # How many grid rows the tiler produced (for status)
@@ -3730,8 +3759,16 @@ class MultiFrameLabelBrowser(tk.Toplevel):
                 r, c = divmod(idx, cols)
                 card.grid(row=r, column=c, padx=4, pady=4, sticky="nsew")
 
+                # Scale to a fixed preview box (upscale small tiles, downscale large ones).
+                # thumbnail() never enlarges; resize() does, which is what we want for
+                # small non-overlap tiles (e.g. 128→300).
                 small = tile.image.copy()
-                small.thumbnail((thumb_size, thumb_size), Image.Resampling.LANCZOS)
+                ow, oh = small.size
+                if ow > 0 and oh > 0:
+                    scale = min(thumb_size / ow, thumb_size / oh)
+                    nw = max(1, int(round(ow * scale)))
+                    nh = max(1, int(round(oh * scale)))
+                    small = small.resize((nw, nh), Image.Resampling.LANCZOS)
                 tkimg = ImageTk.PhotoImage(small)
                 self._tile_photo_refs.append(tkimg)
 
@@ -3739,7 +3776,7 @@ class MultiFrameLabelBrowser(tk.Toplevel):
                 img_lbl.pack()
 
                 status = f"r{tile.tile_row}c{tile.tile_col}  {label or 'unlabeled'}{' [R]' if rel else ''}"
-                ttk.Label(card, text=status, width=max(18, thumb_size // 8), anchor="center").pack(pady=2)
+                ttk.Label(card, text=status, width=max(18, thumb_size // 10), anchor="center").pack(pady=2)
 
                 def make_edit(t=tile, i=idx):
                     return lambda e: self._quick_label_tile(explorer_win, t, i, container, canvas_ref)
@@ -3794,15 +3831,17 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         q.geometry("680x980")
 
         s = self.ui_scale
-        # Image
+        # Image: upscale small tiles so they are easy to see in the edit dialog
         big = tile.image.copy()
-        big.thumbnail((420, 420), Image.Resampling.LANCZOS)
-        orig_w, orig_h = big.size
-        new_size = (int(420), int(420))
-        
-        # Use .resize() instead of .thumbnail() to guarantee enlargement
-        big = big.resize(new_size, Image.Resampling.LANCZOS)
-    
+        target = max(300, int(getattr(self, "tile_preview_size", 300) or 300))
+        target = min(520, max(target, 420))  # roomy default for the dialog
+        ow, oh = big.size
+        if ow > 0 and oh > 0:
+            scale = min(target / ow, target / oh)
+            nw = max(1, int(round(ow * scale)))
+            nh = max(1, int(round(oh * scale)))
+            big = big.resize((nw, nh), Image.Resampling.LANCZOS)
+
         tkbig = ImageTk.PhotoImage(big)
         ttk.Label(q, image=tkbig).pack(pady=4)
         # keep ref on q
