@@ -110,7 +110,9 @@ class AREDConfig:
     singleton_merge: bool = True
     small_cluster_threshold: int = 3
     smart_forgetting_var: Tuple[int, float] = (3, 0.01)
-    verbose_flags: list = field(default_factory=lambda: [0])
+    # A_REDIN VERBOSE_FLAGS: only certain ints enable internal prints (1=add_l_pt, 5=merge, 6=forget).
+    # Default empty = quiet. GUI "Terminal logging" can enable [1,5,6] when desired.
+    verbose_flags: list = field(default_factory=list)
 
     # Data augmentation for DINO-based runs (our custom implementation).
     # When a tile is labeled (via query or DB), we rotate the original image,

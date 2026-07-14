@@ -50,6 +50,11 @@ CHECKPOINT_CSV_FIELDS = [
     "classes_discovered_x_of_y",
     "n_classes_queried",
     "n_unique_classes",
+    "baseline_random_qp",
+    "baseline_random_rr",
+    "qp_improvement_ratio_vs_random",
+    "rr_improvement_ratio_vs_random",
+    "relevant_recall_strict",
     "ared_clusters",
     "ared_known_labels",
     "elapsed_sec",
@@ -191,6 +196,12 @@ class RunMetricsLogger:
 
         Idempotent: stop() and the worker loop may both call this; only the first
         call writes the end package.
+
+        Always writes:
+          - end checkpoint in checkpoints.csv / run.json
+          - final_metrics inside run.json
+          - final_metrics.json (standalone full package for tools)
+          - final_audit.txt (human-readable)
         """
         if not self.enabled:
             return None
@@ -209,13 +220,54 @@ class RunMetricsLogger:
                 self._append_csv(snap)
 
             if final_metrics is None:
-                final_metrics = self._compute_full_metrics(controller)
+                try:
+                    final_metrics = self._compute_full_metrics(controller)
+                except Exception as e:
+                    print(f"[RunMetrics] Final metrics compute FAILED: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    final_metrics = {
+                        "error": f"final_metrics_compute_failed: {e}",
+                        "tiles_processed": n,
+                        "ared_queries": int(controller.stats.get("ared_queries", 0) or 0),
+                        "frames_read": int(controller.stats.get("frames_read", 0) or 0),
+                    }
 
-            # Compact final for JSON (drop huge audit if present — write to txt)
+            # If evaluation returned only an error (e.g. no annotations yet), still
+            # package stream counters so the run dir is never "empty" of finals.
+            if not final_metrics:
+                final_metrics = {"error": "no final_metrics produced"}
+            if isinstance(final_metrics, dict) and "error" in final_metrics:
+                final_metrics.setdefault("tiles_processed", n)
+                final_metrics.setdefault(
+                    "ared_queries", int(controller.stats.get("ared_queries", 0) or 0)
+                )
+                final_metrics.setdefault(
+                    "frames_read", int(controller.stats.get("frames_read", 0) or 0)
+                )
+                final_metrics.setdefault(
+                    "n_processed_identities",
+                    len(getattr(controller, "processed_identities", None) or []),
+                )
+                final_metrics.setdefault(
+                    "n_queried_identities",
+                    len(getattr(controller, "queried_identities", None) or []),
+                )
+                final_metrics.setdefault("run_params", _json_safe(self.run_params))
+                final_metrics.setdefault(
+                    "summary",
+                    f"Metrics incomplete: {final_metrics.get('error')} "
+                    f"(tiles={n}, queries={final_metrics.get('ared_queries')})",
+                )
+
+            # Compact for run.json (drop huge audit dict; keep summary + key fields)
             compact = None
             if final_metrics:
-                compact = {k: v for k, v in final_metrics.items() if k not in ("detailed_breakdown", "audit")}
-                # Keep a small summary audit
+                compact = {
+                    k: v
+                    for k, v in final_metrics.items()
+                    if k not in ("detailed_breakdown", "audit")
+                }
                 audit = final_metrics.get("detailed_breakdown") or final_metrics.get("audit")
                 if audit and isinstance(audit, dict):
                     compact["audit_summary"] = {
@@ -231,14 +283,31 @@ class RunMetricsLogger:
                             "QUERY_PRECISION_WORK",
                             "RELEVANT_RECALL_WORK",
                             "F1_WORK",
+                            "RANDOM_BASELINE",
+                            "RANDOM_RR_EQUALS_QUERY_RATE",
+                            "QP_IMPROVEMENT_RATIO_VS_RANDOM",
+                            "RR_IMPROVEMENT_RATIO_VS_RANDOM",
+                            "RUN_PARAMS",
                         )
                         if k in audit
                     }
                     try:
                         audit_path = self.run_dir / "final_audit.txt"
                         with open(audit_path, "w", encoding="utf-8") as f:
-                            f.write(final_metrics.get("summary", "") + "\n\n")
+                            f.write(str(final_metrics.get("summary", "")) + "\n\n")
                             for k, v in audit.items():
+                                f.write(f"{k}: {v}\n")
+                    except Exception as e:
+                        print(f"[RunMetrics] Could not write final_audit.txt: {e}")
+                else:
+                    # No detailed audit (error path) — still write a minimal final_audit.txt
+                    try:
+                        audit_path = self.run_dir / "final_audit.txt"
+                        with open(audit_path, "w", encoding="utf-8") as f:
+                            f.write(str(final_metrics.get("summary", "")) + "\n\n")
+                            for k, v in final_metrics.items():
+                                if k in ("detailed_breakdown", "audit"):
+                                    continue
                                 f.write(f"{k}: {v}\n")
                     except Exception as e:
                         print(f"[RunMetrics] Could not write final_audit.txt: {e}")
@@ -246,8 +315,40 @@ class RunMetricsLogger:
             self.final_metrics = _json_safe(compact) if compact else None
             self.status = status
             self.ended_at = _utc_now_iso()
+
+            # Standalone full final metrics file (includes audit) for tooling / paper tables
+            try:
+                full_path = self.run_dir / "final_metrics.json"
+                full_doc = _json_safe(final_metrics) if final_metrics else {}
+                # Keep detailed_breakdown in the standalone file
+                tmp = full_path.with_suffix(".json.tmp")
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(
+                        {
+                            "run_id": self.run_id,
+                            "status": self.status,
+                            "ended_at": self.ended_at,
+                            "run_params": _json_safe(self.run_params),
+                            "final_metrics": full_doc,
+                            "last_checkpoint": _json_safe(self.last_checkpoint),
+                        },
+                        f,
+                        indent=2,
+                    )
+                tmp.replace(full_path)
+            except Exception as e:
+                print(f"[RunMetrics] Could not write final_metrics.json: {e}")
+
             self._write_json()
-            print(f"[RunMetrics] Finalized run → {self.run_dir} (status={status})")
+            qp = (self.final_metrics or {}).get("query_precision")
+            rr = (self.final_metrics or {}).get("relevant_recall")
+            f1 = (self.final_metrics or {}).get("f1_score")
+            err = (self.final_metrics or {}).get("error")
+            print(
+                f"[RunMetrics] Finalized run → {self.run_dir} (status={status}) "
+                f"QP={qp} RR={rr} F1={f1}"
+                + (f" ERROR={err}" if err else "")
+            )
             return self.last_checkpoint
 
     def one_line_status(self) -> str:

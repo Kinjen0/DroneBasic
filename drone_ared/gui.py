@@ -970,6 +970,11 @@ class MainWindow:
             set_terminal_logging(enabled)
             try:
                 self.config.gui.terminal_logging = enabled
+                # Also quiet/unquiet original A_REDIN internal VERBOSE_FLAGS
+                self.config.ared.verbose_flags = [1, 5, 6] if enabled else []
+                adapter = getattr(self.controller, "ared_adapter", None)
+                if adapter is not None and getattr(adapter, "ared", None) is not None:
+                    adapter.ared.verbose_flags = list(self.config.ared.verbose_flags)
             except Exception:
                 pass
 
@@ -1174,10 +1179,13 @@ class MainWindow:
                 self.metrics_ckpt_on_video_var.get()
             )
 
-            # Terminal logging (repeating prints)
+            # Terminal logging (repeating prints + optional A_REDIN VERBOSE_FLAGS)
             if hasattr(self, "terminal_logging_var"):
                 self.config.gui.terminal_logging = bool(self.terminal_logging_var.get())
                 set_terminal_logging(self.config.gui.terminal_logging)
+                self.config.ared.verbose_flags = (
+                    [1, 5, 6] if self.config.gui.terminal_logging else []
+                )
         except Exception as e:
             messagebox.showerror("Params", f"Bad parameter value: {e}")
 

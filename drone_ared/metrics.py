@@ -323,6 +323,26 @@ def evaluate_from_annotations_and_queries(
     baseline = random_baseline_at_budget(n_queries, total, rel_rate)
     metrics.update({f"baseline_{k}": v for k, v in baseline.items()})
 
+    # Paper random baselines (SPIE eq.10–11 / IJSC §6.4):
+    #   QueryPrecision_RDM ≈ Relevant Rate
+    #   RelevantRecall_RDM = Query Rate
+    query_rate = metrics["query_rate"]
+    metrics["baseline_random_relevant_recall"] = round(query_rate, 4)  # RR_RDM = QR
+    metrics["baseline_random_relevant_recall_note"] = (
+        "Paper: RelevantRecall_RDM = Query Rate (fraction of stream queried at random)."
+    )
+    # Improvement ratios vs random (SPIE Fig.3 style)
+    qp = metrics["query_precision"]
+    rr = metrics["relevant_recall"]
+    qp_rdm = baseline.get("random_query_precision_approx") or rel_rate
+    rr_rdm = query_rate
+    metrics["qp_improvement_ratio_vs_random"] = (
+        round(qp / qp_rdm, 3) if qp_rdm and qp_rdm > 0 else None
+    )
+    metrics["rr_improvement_ratio_vs_random"] = (
+        round(rr / rr_rdm, 3) if rr_rdm and rr_rdm > 0 else None
+    )
+
     # === EVERY SINGLE DATAPOINT - FULL WORK SHOWN ===
     # Sources:
     # 1. annotations: every row in DB for the video (human labels + relevant flags). 
@@ -447,6 +467,9 @@ def evaluate_from_annotations_and_queries(
         "RELEVANT_RECALL_WORK": f"RR = {tp} / ({tp} + {fn}) = {metrics['relevant_recall']}   (TP / (TP + FN) over ALL positives, INCLUDING first appearances of classes)",
         "F1_WORK": f"F1 = 2 * QP * RR / (QP + RR) = {metrics['f1_score']}   (harmonic mean of QP and RR)",
         "RANDOM_BASELINE": baseline,
+        "RANDOM_RR_EQUALS_QUERY_RATE": metrics.get("baseline_random_relevant_recall"),
+        "QP_IMPROVEMENT_RATIO_VS_RANDOM": metrics.get("qp_improvement_ratio_vs_random"),
+        "RR_IMPROVEMENT_RATIO_VS_RANDOM": metrics.get("rr_improvement_ratio_vs_random"),
         "TOTAL_STREAM_TILES_USED_FOR_RATES": total,
         "NOTE_ON_TOTAL": "total_points uses # tiles actually sent to A/RED this run (from processed). Only tiles actually sent are used for should/positives (firsts of any class + relevant class samples).",
         "PAPER_REFERENCES": "SPIE_IVSP_2026 Sec.5 eq.8-11 (positives = i first sample or ii relevant class); IJSC_2026-1 Alg.1 + evaluation; PerformanceMetricsPlan.md"
@@ -509,6 +532,10 @@ def summarize_for_checkpoint(result: Dict[str, Any]) -> Dict[str, Any]:
         "n_unique_classes": result.get("n_unique_classes_in_run"),
         "summary": result.get("summary"),
         "baseline_random_qp": result.get("baseline_random_query_precision_approx"),
+        "baseline_random_rr": result.get("baseline_random_relevant_recall"),
+        "qp_improvement_ratio_vs_random": result.get("qp_improvement_ratio_vs_random"),
+        "rr_improvement_ratio_vs_random": result.get("rr_improvement_ratio_vs_random"),
+        "relevant_recall_strict": result.get("relevant_recall_strict"),
     }
 
 

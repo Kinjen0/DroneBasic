@@ -46,6 +46,7 @@ import contextlib
 from dataclasses import dataclass, field
 
 from .label_sentinels import LabelCancelled, is_control_label, is_persistable_label
+from .logutil import vprint
 
 if TYPE_CHECKING:
     from .label_store import PersistentLabelStore
@@ -313,7 +314,7 @@ class AREDAdapter:
         meta = meta or {}
         emb = np.asarray(embedding, dtype=np.float32).reshape(-1)
 
-        print(f"[ARED] received tile for process (meta={meta})")
+        vprint(f"[ARED] received tile for process (meta={meta})")
         with self._lock:
             abs_idx = self.ared.abs_index + 1   # what it will become inside
 
@@ -346,7 +347,7 @@ class AREDAdapter:
                     obtained_rel = rel
                     self.oracle.y[_abs_index] = [label, rel]  # type: ignore
                     self.discovered_labels.add(label)
-                    print(f"[ARED]   -> REPLAY using saved label '{label}' (relevant={rel})")
+                    vprint(f"[ARED]   -> REPLAY using saved label '{label}' (relevant={rel})")
                     return label, rel
 
                 is_peek = (call_num == 1 and self.num_points_processed > 0)
@@ -357,7 +358,7 @@ class AREDAdapter:
                 # represents work that would be needed from a user in a cold-start or no-cache scenario.
                 if not is_peek:
                     was_queried = True
-                    print(f"[ARED] A_RED decided to QUERY (call#{call_num}) for abs_idx={_abs_index} (tile meta: {meta}). will count for labels-needed + metrics (cache may still satisfy)")
+                    vprint(f"[ARED] A_RED decided to QUERY (call#{call_num}) for abs_idx={_abs_index} (tile meta: {meta}). will count for labels-needed + metrics (cache may still satisfy)")
 
                 # 1. Try persistent cache first -- always, for both peek and real queries
                 if getattr(self, "_label_store", None) is not None:
@@ -366,7 +367,7 @@ class AREDAdapter:
                         label, rel = cached
                         # Never accept control sentinels from a poisoned cache
                         if is_control_label(label):
-                            print(f"[ARED]   -> Cache HIT is control sentinel '{label}' — ignoring (treating as miss).")
+                            vprint(f"[ARED]   -> Cache HIT is control sentinel '{label}' — ignoring (treating as miss).")
                         else:
                             obtained_label = label
                             obtained_rel = rel
@@ -375,15 +376,15 @@ class AREDAdapter:
                             if not is_peek:
                                 self.query_counts[label] = self.query_counts.get(label, 0) + 1
                             if is_peek:
-                                print(f"[ARED]   -> Cache HIT on peek for abs_idx={_abs_index}. Auto (no GUI).")
+                                vprint(f"[ARED]   -> Cache HIT on peek for abs_idx={_abs_index}. Auto (no GUI).")
                             else:
-                                print(f"[ARED]   -> Cache HIT for this QUERY decision. Auto-labeled as '{label}' (relevant={rel}). (still counts as ARED query for labels-needed metric)")
+                                vprint(f"[ARED]   -> Cache HIT for this QUERY decision. Auto-labeled as '{label}' (relevant={rel}). (still counts as ARED query for labels-needed metric)")
                             return label, rel
                     else:
                         if is_peek:
-                            print(f"[ARED]   -> Cache MISS on peek (will use provisional, no GUI).")
+                            vprint(f"[ARED]   -> Cache MISS on peek (will use provisional, no GUI).")
                         else:
-                            print(f"[ARED]   -> Cache MISS for real query. Will request from provider (GUI).")
+                            vprint(f"[ARED]   -> Cache MISS for real query. Will request from provider (GUI).")
 
                 if is_peek:
                     # Peek call (internal ARED accounting for non-queried points).
@@ -395,11 +396,11 @@ class AREDAdapter:
                     obtained_label = label
                     obtained_rel = rel
                     self.oracle.y[_abs_index] = [label, rel]  # type: ignore
-                    print(f"[ARED] Peek answer_query (call#{call_num}) for abs_idx={_abs_index} -- provisional (no oracle query to user).")
+                    vprint(f"[ARED] Peek answer_query (call#{call_num}) for abs_idx={_abs_index} -- provisional (no oracle query to user).")
                     return label, rel
 
                 # Real query path (non-peek) -- provider will be called (or exact DB in pipeline layer)
-                print(f"[ARED] Real QUERY path reached provider for abs_idx={_abs_index}")
+                vprint(f"[ARED] Real QUERY path reached provider for abs_idx={_abs_index}")
 
                 # 2. Fall back to the registered provider (normally the GUI) -- only for real queries
                 if self._label_provider is None:
@@ -408,18 +409,18 @@ class AREDAdapter:
                     rel = bool(meta.get("relevant", False))
                     if is_control_label(label):
                         raise LabelCancelled(f"fallback_control_label:{label}")
-                    print(f"[ARED]   -> No provider, using fallback label '{label}' (relevant={rel})")
+                    vprint(f"[ARED]   -> No provider, using fallback label '{label}' (relevant={rel})")
                 else:
                     try:
                         label, rel = self._label_provider(emb, tile_image, meta)
                     except LabelCancelled:
                         # Propagate so process() can abort without learning a junk class
                         raise
-                    print(f"[ARED]   -> Provider returned label '{label}' (relevant={rel})")
+                    vprint(f"[ARED]   -> Provider returned label '{label}' (relevant={rel})")
 
                 # Hard refuse control sentinels even if provider returned them as strings
                 if not is_persistable_label(label):
-                    print(f"[ARED]   -> REFUSING control/empty label '{label}' (will not learn or store).")
+                    vprint(f"[ARED]   -> REFUSING control/empty label '{label}' (will not learn or store).")
                     raise LabelCancelled(f"control_label:{label}")
 
                 obtained_label = label
@@ -433,9 +434,9 @@ class AREDAdapter:
                 if getattr(self, "_label_store", None) is not None:
                     try:
                         self._label_store.add(emb, label, rel)
-                        print(f"[ARED]   -> Added to label store for future cache hits.")
+                        vprint(f"[ARED]   -> Added to label store for future cache hits.")
                     except Exception as e:
-                        print(f"[ARED]   -> WARNING: Failed to add to label store: {e}")
+                        vprint(f"[ARED]   -> WARNING: Failed to add to label store: {e}")
                 return label, rel
 
             # Temporarily install
@@ -451,7 +452,7 @@ class AREDAdapter:
                 # Stop / timeout / skip during a real query: do NOT learn a fake class.
                 # Best-effort: leave this point without a durable discovered label.
                 cancelled_reason = getattr(e, "reason", None) or str(e)
-                print(f"[ARED] LabelCancelled during process (reason={cancelled_reason}). "
+                vprint(f"[ARED] LabelCancelled during process (reason={cancelled_reason}). "
                       f"Not learning control labels; aborting this point cleanly.")
                 was_queried = False
                 obtained_label = None
@@ -539,10 +540,10 @@ class AREDAdapter:
                 "num_known_labels": len(self.ared.subspace_partition.set_of_known_labels),
             }
             if not was_queried:
-                print(f"[ARED] Point abs_idx={abs_idx} did NOT trigger a (real) query. ARED assigned internally (peek satisfied with provisional or cache). label='{obtained_label}'")
+                vprint(f"[ARED] Point abs_idx={abs_idx} did NOT trigger a (real) query. ARED assigned internally (peek satisfied with provisional or cache). label='{obtained_label}'")
             else:
-                print(f"[ARED] A_RED query to oracle COMPLETE for abs_idx={abs_idx}. Label='{obtained_label}' (relevant={obtained_rel})")
-            print(f"[ARED] Finished processing point. Total processed: {self.num_points_processed}, queries so far: {self.num_queries}")
+                vprint(f"[ARED] A_RED query to oracle COMPLETE for abs_idx={abs_idx}. Label='{obtained_label}' (relevant={obtained_rel})")
+            vprint(f"[ARED] Finished processing point. Total processed: {self.num_points_processed}, queries so far: {self.num_queries}")
             return info
 
     # ------------------------------------------------------------------
