@@ -36,6 +36,7 @@ from .annotation_manager import AnnotationManager
 from .annotation_domain import TileKey, AnnotationFilter
 from .tile_database import TileAnnotationDB
 from .gui_bulk_dialog import BulkLabelOpsDialog  # modular bulk editing UI
+from .logutil import vprint, set_terminal_logging
 # GridTiler is imported lazily inside the browser (to avoid pulling numpy/PIL deps at gui module load
 # if not already present from other paths).
 
@@ -834,8 +835,60 @@ class MainWindow:
         menubar.add_cascade(label="File", menu=file_menu)
         self.root.config(menu=menubar)
 
+        # ---- Scrollable main area (control bar + params can exceed viewport height) ----
+        # Outer: canvas + vertical scrollbar so buttons/params at the bottom stay reachable.
+        outer = ttk.Frame(self.root)
+        outer.pack(fill="both", expand=True)
+
+        self._main_canvas = tk.Canvas(outer, highlightthickness=0, borderwidth=0)
+        self._main_vscroll = ttk.Scrollbar(outer, orient="vertical", command=self._main_canvas.yview)
+        self._main_canvas.configure(yscrollcommand=self._main_vscroll.set)
+        self._main_vscroll.pack(side="right", fill="y")
+        self._main_canvas.pack(side="left", fill="both", expand=True)
+
+        # Interior frame that holds the entire UI content
+        scroll_inner = ttk.Frame(self._main_canvas)
+        self._main_canvas_window = self._main_canvas.create_window((0, 0), window=scroll_inner, anchor="nw")
+
+        def _on_inner_configure(_event=None):
+            # Keep scrollregion tight to content
+            self._main_canvas.configure(scrollregion=self._main_canvas.bbox("all"))
+
+        def _on_canvas_configure(event):
+            # Stretch interior to canvas width (vertical scroll only)
+            try:
+                self._main_canvas.itemconfigure(self._main_canvas_window, width=event.width)
+            except Exception:
+                pass
+
+        scroll_inner.bind("<Configure>", _on_inner_configure)
+        self._main_canvas.bind("<Configure>", _on_canvas_configure)
+
+        def _on_mousewheel(event):
+            # Only scroll main window when pointer is over it (not over a child Toplevel)
+            try:
+                w = self.root.winfo_containing(event.x_root, event.y_root)
+                if w is None:
+                    return
+                # Skip if over a different toplevel (labeling dialog, review, etc.)
+                top = w.winfo_toplevel()
+                if top is not self.root:
+                    return
+                if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
+                    self._main_canvas.yview_scroll(-3, "units")
+                elif getattr(event, "num", None) == 5 or getattr(event, "delta", 0) < 0:
+                    self._main_canvas.yview_scroll(3, "units")
+            except Exception:
+                pass
+
+        self._main_mousewheel_handler = _on_mousewheel
+        # bind_all so wheel works over nested ttk widgets; handler filters other toplevels
+        self.root.bind_all("<MouseWheel>", _on_mousewheel)
+        self.root.bind_all("<Button-4>", _on_mousewheel)
+        self.root.bind_all("<Button-5>", _on_mousewheel)
+
         # Control bar
-        ctrl = ttk.Frame(self.root)
+        ctrl = ttk.Frame(scroll_inner)
         ctrl.pack(fill="x", padx=int(6 * self.ui_scale), pady=int(4 * self.ui_scale))
 
         s = self.ui_scale
@@ -852,10 +905,10 @@ class MainWindow:
 
         # Status line
         self.status_var = tk.StringVar(value="Ready. Load videos and press Start.")
-        ttk.Label(self.root, textvariable=self.status_var, relief="sunken").pack(fill="x", padx=int(6*self.ui_scale), pady=int(2*self.ui_scale))
+        ttk.Label(scroll_inner, textvariable=self.status_var, relief="sunken").pack(fill="x", padx=int(6*self.ui_scale), pady=int(2*self.ui_scale))
 
         # Main content: left params, center stats + classes, right preview stub
-        body = ttk.Frame(self.root)
+        body = ttk.Frame(scroll_inner)
         body.pack(fill="both", expand=True, padx=int(6*self.ui_scale), pady=int(4*self.ui_scale))
 
         # Parameters (many are live for next run)
@@ -906,6 +959,69 @@ class MainWindow:
         ttk.Checkbutton(param_frame, text="Label Only Mode (no A/RED, no DINO — pure labeling + Skip/Resume)",
                         variable=self.label_only_var).pack(anchor="w", pady=int(3*s))
 
+        # Terminal logging: gate high-volume repeating prints (per-tile / per-frame / cache hits)
+        self.terminal_logging_var = tk.BooleanVar(
+            value=bool(getattr(self.config.gui, "terminal_logging", True))
+        )
+        set_terminal_logging(self.terminal_logging_var.get())
+
+        def _sync_terminal_logging(*_):
+            enabled = bool(self.terminal_logging_var.get())
+            set_terminal_logging(enabled)
+            try:
+                self.config.gui.terminal_logging = enabled
+            except Exception:
+                pass
+
+        ttk.Checkbutton(
+            param_frame,
+            text="Terminal logging (repeating per-tile / progress prints)",
+            variable=self.terminal_logging_var,
+            command=_sync_terminal_logging,
+        ).pack(anchor="w", pady=int(3*s))
+        self.terminal_logging_var.trace_add("write", _sync_terminal_logging)
+
+        # Running metrics logging (every N tiles → runs/<run_id>/)
+        ttk.Separator(param_frame, orient="horizontal").pack(fill="x", pady=int(4*s))
+        metrics_log_frame = ttk.LabelFrame(param_frame, text="Running Metrics Log (paper QP/RR/F1)")
+        metrics_log_frame.pack(fill="x", pady=int(2*s))
+        ml0 = getattr(self.config, "metrics_logging", None)
+        self.metrics_log_enabled_var = tk.BooleanVar(value=bool(getattr(ml0, "enabled", True)))
+        ttk.Checkbutton(
+            metrics_log_frame,
+            text="Save running metrics every N tiles (and on stop/finish)",
+            variable=self.metrics_log_enabled_var,
+        ).pack(anchor="w", pady=int(2*s))
+        self._add_param_row(
+            metrics_log_frame,
+            "Checkpoint every N tiles",
+            "metrics_ckpt_every",
+            int(getattr(ml0, "checkpoint_every", 5000) or 5000),
+        )
+        self._add_param_row(
+            metrics_log_frame,
+            "Runs output dir",
+            "metrics_out_dir",
+            str(getattr(ml0, "output_dir", "runs") or "runs"),
+            is_str=True,
+        )
+        self.metrics_ckpt_on_video_var = tk.BooleanVar(
+            value=bool(getattr(ml0, "checkpoint_on_video_end", True))
+        )
+        ttk.Checkbutton(
+            metrics_log_frame,
+            text="Also checkpoint when each video ends",
+            variable=self.metrics_ckpt_on_video_var,
+        ).pack(anchor="w", pady=int(1*s))
+        self._metrics_run_line_var = tk.StringVar(value="No metrics run yet.")
+        ttk.Label(
+            metrics_log_frame,
+            textvariable=self._metrics_run_line_var,
+            font=("TkDefaultFont", int(9 * self.ui_scale)),
+            relief="sunken",
+            wraplength=int(260 * self.ui_scale),
+        ).pack(fill="x", pady=int(2*s))
+
         # Initialize overlap checkbox from config (if stride < tile size, or explicit overlap > 0)
         tcfg0 = self.config.tiling
         initial_overlap = bool((tcfg0.stride_x is not None and tcfg0.stride_x < tcfg0.tile_width) or
@@ -939,7 +1055,7 @@ class MainWindow:
         stats_frame = ttk.LabelFrame(right, text="Live Stats")
         stats_frame.pack(fill="x")
 
-        self.stats_text = tk.Text(stats_frame, height=6, width=int(60 * min(s, 1.5)), state="disabled", font=("TkDefaultFont", int(11*s)))
+        self.stats_text = tk.Text(stats_frame, height=8, width=int(60 * min(s, 1.5)), state="disabled", font=("TkDefaultFont", int(11*s)))
         self.stats_text.pack(fill="x", padx=4, pady=4)
 
         # --- Metrics box (Query Precision + Relevant Recall as defined in the A/RED papers) ---
@@ -1042,6 +1158,26 @@ class MainWindow:
             self.config.tile_annotations.edit_mode_default = self.edit_mode_var.get()
             self.config.ared.data_augmentation_enabled = self.aug_var.get()
             self.config.tile_annotations.label_only_default = self.label_only_var.get()
+
+            # Running metrics log (every N tiles → runs/)
+            if not hasattr(self.config, "metrics_logging") or self.config.metrics_logging is None:
+                from .config import MetricsLoggingConfig
+                self.config.metrics_logging = MetricsLoggingConfig()
+            self.config.metrics_logging.enabled = bool(self.metrics_log_enabled_var.get())
+            self.config.metrics_logging.checkpoint_every = max(
+                1, int(getattr(self, "_metrics_ckpt_every_var").get() or 5000)
+            )
+            self.config.metrics_logging.output_dir = str(
+                getattr(self, "_metrics_out_dir_var").get() or "runs"
+            ).strip() or "runs"
+            self.config.metrics_logging.checkpoint_on_video_end = bool(
+                self.metrics_ckpt_on_video_var.get()
+            )
+
+            # Terminal logging (repeating prints)
+            if hasattr(self, "terminal_logging_var"):
+                self.config.gui.terminal_logging = bool(self.terminal_logging_var.get())
+                set_terminal_logging(self.config.gui.terminal_logging)
         except Exception as e:
             messagebox.showerror("Params", f"Bad parameter value: {e}")
 
@@ -1060,25 +1196,19 @@ class MainWindow:
     def _start(self):
         self._read_params_into_config()
 
-        # Reset GUI-side "new this run" name tracking (helps immediate visibility for classes created in this session).
-        # Historical names from DB/label cache are still collected below so they remain clickable.
+        # Fresh per-run class tracking. Class list shows: selected annotation DB + this run only
+        # (not embedding-cache history and not leftover A/RED labels from a previous model load).
         self.discovered_classes = set()
+        self.run_class_counts = {}
 
-        # Make sure A/RED query counts for this run start at zero. The class boxes should show
-        # "how many of each class A/RED queried and labeled during the current run".
+        # Make sure A/RED query counts for this run start at zero.
         if self.controller and getattr(self.controller, 'ared_adapter', None):
             try:
                 self.controller.ared_adapter.query_counts = {}
             except Exception:
                 pass
 
-        # Refresh right away so the lists reflect the fresh (zero) A/RED query counts + all known class names.
-        try:
-            self._refresh_class_list()
-        except Exception:
-            pass
-
-        # Prepare label store (embedding similarity)
+        # Prepare label store (embedding similarity) — used for auto-labeling, NOT for class list names
         if self.config.label_cache.enabled:
             self.label_store = PersistentLabelStore(
                 db_path=self.config.label_cache.db_path,
@@ -1098,6 +1228,12 @@ class MainWindow:
             self.controller.set_tile_database(None)
             self.annotation_manager = None
             self.controller.set_annotation_manager(None)
+
+        # Refresh after DB is wired so list reflects only this DB
+        try:
+            self._refresh_class_list()
+        except Exception:
+            pass
 
         # Edit mode (force re-label of known exact tiles for corrections)
         self.edit_mode = self.edit_mode_var.get()
@@ -1140,6 +1276,13 @@ class MainWindow:
         """
         print("[MainWindow] Shutdown requested (WM_DELETE or Exit).")
         try:
+            # Unbind global mousewheel handlers installed for main-window scrolling
+            for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+                try:
+                    self.root.unbind_all(seq)
+                except Exception:
+                    pass
+
             # 1. Stop worker (signals events + drains label queue + joins)
             if hasattr(self, "controller") and self.controller:
                 try:
@@ -1504,6 +1647,11 @@ class MainWindow:
         if hasattr(self, "_tile_ann_db_var"):
             self._tile_ann_db_var.set(path)
         self._refresh_db_info()
+        # Class list must track the newly selected DB only (drop other-DB names from view).
+        try:
+            self._refresh_class_list()
+        except Exception:
+            pass
 
     def _warn_on_tile_size_mismatch(self, db_path: str):
         """If we have a current tiling size, check if the loaded DB has any annotations at that size."""
@@ -1728,7 +1876,7 @@ class MainWindow:
         except queue.Empty:
             return
 
-        print(f"[GUI] Received label REQUEST from ARED for tile global={getattr(getattr(req,'tile',None),'global_idx','?')} meta={getattr(req,'meta',{})}")
+        vprint(f"[GUI] Received label REQUEST from ARED for tile global={getattr(getattr(req,'tile',None),'global_idx','?')} meta={getattr(req,'meta',{})}")
         self._pending_label_request = req
 
         # Guard against duplicate req for the exact same tile (shouldn't happen, but prevents "same tile twice")
@@ -1738,7 +1886,7 @@ class MainWindow:
             # Already handled this tile's query; ignore stale/duplicate
             # CRITICAL: still satisfy the req or the worker thread will block forever on wait().
             # Use cancel/skip — never invent a fake class label like __DUPLICATE__.
-            print("[GUI]   -> Duplicate request for same global_idx, ignoring (cancelling req to unblock worker).")
+            vprint("[GUI]   -> Duplicate request for same global_idx, ignoring (cancelling req to unblock worker).")
             try:
                 if hasattr(req, "set_cancelled"):
                     req.set_cancelled(reason="duplicate")
@@ -1755,50 +1903,23 @@ class MainWindow:
         cur_label = meta.get("current_label")
         cur_rel = bool(meta.get("current_relevant", False))
 
-        # Collect class *names* from all sources (label cache, exact DB via controller, ARED state, and classes assigned this GUI run).
-        # This preserves the required "click any old class" functionality.
-        classes = []
-        if self.label_store:
-            classes.extend(self.label_store.get_all_labels())
-        if self.controller.ared_adapter:
-            classes.extend(self.controller.ared_adapter.get_known_labels())
+        # Class names: selected annotation DB + classes assigned this GUI run only.
+        # Do NOT pull from embedding label_store or A/RED known labels (those mix other runs/models).
+        classes = self._collect_scoped_class_names()
 
-        if hasattr(self.controller, 'get_labels_from_annotation_db'):
-            try:
-                for lbl in self.controller.get_labels_from_annotation_db():
-                    if lbl not in classes:
-                        classes.append(lbl)
-            except Exception:
-                pass
-
-        for lbl in getattr(self, 'discovered_classes', []):
-            if lbl not in classes:
-                classes.append(lbl)
-
-        classes = sorted(set(classes))
-
-        # Numbers = times A/RED queried for the class during *this run* (the original good behavior).
-        # Names above are harvested broadly so old classes from DB/cache/history remain clickable.
+        # Numbers = times A/RED queried for the class during *this run*.
         counts = {}
         if self.controller.ared_adapter:
             counts = self.controller.ared_adapter.get_query_counts() or {}
         for lbl in classes:
             counts.setdefault(lbl, 0)
 
-        # Build relevance map (source of truth is our class_relevance; seed from store if possible)
+        # Build relevance map (prefer active annotation DB, then embedding cache)
         class_relevance = dict(getattr(self, 'class_relevance', {}))
         for lbl in classes:
             if lbl not in class_relevance:
                 seeded = False
-                if self.label_store:
-                    rel = self.label_store.get_class_relevance(lbl)
-                    if rel is not None:
-                        class_relevance[lbl] = rel
-                        seeded = True
-                # Also seed from the exact annotation DB (important for sparse mode
-                # where we labeled relevant classes directly without going through
-                # the embedding label_store).
-                if not seeded and hasattr(self.controller, 'tile_db') and self.controller.tile_db:
+                if hasattr(self.controller, 'tile_db') and self.controller.tile_db:
                     try:
                         rel = self.controller.tile_db.get_class_relevance(lbl)
                         if rel is not None:
@@ -1806,6 +1927,11 @@ class MainWindow:
                             seeded = True
                     except Exception:
                         pass
+                if not seeded and self.label_store:
+                    rel = self.label_store.get_class_relevance(lbl)
+                    if rel is not None:
+                        class_relevance[lbl] = rel
+                        seeded = True
                 if not seeded:
                     class_relevance[lbl] = False
 
@@ -1815,19 +1941,19 @@ class MainWindow:
             # For label-only sparse mode, if the label is the skip sentinel we just ignore it
             # (the actual skip decision was already handled via req.skipped in the processor).
             if label == "__SKIPPED__":
-                print("[GUI] Skip notification received (no class recorded).")
+                vprint("[GUI] Skip notification received (no class recorded).")
                 self._pending_label_request = None
                 return
             # Never record control-plane sentinels as discovered classes
             try:
                 from .label_sentinels import is_control_label
                 if is_control_label(label):
-                    print(f"[GUI] Ignoring control-sentinel notification '{label}' (not a real class).")
+                    vprint(f"[GUI] Ignoring control-sentinel notification '{label}' (not a real class).")
                     self._pending_label_request = None
                     return
             except Exception:
                 pass
-            print(f"[GUI] Label SUBMITTED from dialog: '{label}' (relevant={relevant})")
+            vprint(f"[GUI] Label SUBMITTED from dialog: '{label}' (relevant={relevant})")
             self._pending_label_request = None
             self.discovered_classes.add(label)
             # Track count for *this run only* so the class boxes start near zero instead of full DB history
@@ -1836,11 +1962,11 @@ class MainWindow:
             self.class_relevance[label] = relevant
             self._refresh_class_list()
             self.status_var.set(f"Last label assigned: {label} (relevant={relevant})")
-            print("[GUI] Dialog back to WAITING state for next A/RED query (worker continues processing non-queried tiles in background).")
+            vprint("[GUI] Dialog back to WAITING state for next A/RED query (worker continues processing non-queried tiles in background).")
 
         # Persistent window: create once, then update for new requests
         if not hasattr(self, '_labeling_win') or not self._labeling_win.winfo_exists():
-            print("[GUI] Creating new persistent LabelingDialog for this query.")
+            vprint("[GUI] Creating new persistent LabelingDialog for this query.")
             self._labeling_win = LabelingDialog(
                 self.root,
                 req,
@@ -1854,7 +1980,7 @@ class MainWindow:
                 current_relevant=cur_rel,
             )
         else:
-            print("[GUI] Updating existing persistent LabelingDialog with new query tile.")
+            vprint("[GUI] Updating existing persistent LabelingDialog with new query tile.")
             self._labeling_win.set_current_request(
                 req,
                 known_classes=classes,
@@ -1872,42 +1998,55 @@ class MainWindow:
         if hasattr(self, '_labeling_win') and self._labeling_win:
             self._labeling_win.main_window = self
 
+    def _collect_scoped_class_names(self) -> List[str]:
+        """Class names for dialogs / main list: active annotation DB + this-run discoveries only.
+
+        Explicitly excludes:
+          - embedding label_store history (often from other sessions/DBs)
+          - A/RED adapter known labels (loaded model / prior run state)
+        so the UI does not show classes from unrelated runs.
+        """
+        names: set = set()
+        # Prefer the GUI-owned active DB; fall back to controller helper if needed.
+        try:
+            if getattr(self, "tile_db", None) is not None:
+                for lbl in self.tile_db.get_all_labels() or []:
+                    if lbl:
+                        names.add(lbl)
+            elif hasattr(self.controller, "get_labels_from_annotation_db"):
+                for lbl in self.controller.get_labels_from_annotation_db() or []:
+                    if lbl:
+                        names.add(lbl)
+        except Exception:
+            pass
+        for lbl in getattr(self, "discovered_classes", set()) or set():
+            if lbl:
+                names.add(lbl)
+        # Filter control sentinels if any slipped through
+        try:
+            from .label_sentinels import is_control_label, is_persistable_label
+            names = {n for n in names if is_persistable_label(n) and not is_control_label(n)}
+        except Exception:
+            pass
+        return sorted(names)
+
     def _refresh_class_list(self):
         self.class_listbox.delete(0, "end")
-        # Collect names broadly (history + cache + DB + this run) so the user can click
-        # any previously seen class without re-typing. This functionality must remain.
-        all_labels = set(getattr(self, 'discovered_classes', set()))
-        if self.label_store:
-            all_labels.update(self.label_store.get_all_labels())
-        if self.controller.ared_adapter:
-            all_labels.update(self.controller.ared_adapter.get_known_labels())
-        if hasattr(self.controller, 'get_labels_from_annotation_db'):
-            try:
-                all_labels.update(self.controller.get_labels_from_annotation_db())
-            except Exception:
-                pass
+        # Scoped to selected annotation DB + classes created/used this run.
+        all_labels = self._collect_scoped_class_names()
 
         # Displayed numbers = how many times A/RED queried for the class during *this run*.
-        # This is the base functionality that was good: "how many of each class have been queried and labeled by A/RED".
-        # Names are still collected from all sources (DB, cache, history, this run) so old classes remain clickable.
         counts = {}
         if self.controller.ared_adapter:
             counts = self.controller.ared_adapter.get_query_counts() or {}
         for lbl in all_labels:
             counts.setdefault(lbl, 0)
 
-        # Ensure we have a relevance entry (seed from store when possible)
+        # Ensure we have a relevance entry (seed from active DB first, then label_store as fallback)
         for lbl in all_labels:
             if lbl not in self.class_relevance:
                 seeded = False
-                if self.label_store:
-                    rel = self.label_store.get_class_relevance(lbl)
-                    if rel is not None:
-                        self.class_relevance[lbl] = rel
-                        seeded = True
-                # Seed from exact DB for sparse mode (so [relevant] tags appear correctly
-                # for classes that were only labeled via the Skip/assign relevant workflow)
-                if not seeded and hasattr(self.controller, 'tile_db') and self.controller.tile_db:
+                if hasattr(self.controller, 'tile_db') and self.controller.tile_db:
                     try:
                         rel = self.controller.tile_db.get_class_relevance(lbl)
                         if rel is not None:
@@ -1915,10 +2054,15 @@ class MainWindow:
                             seeded = True
                     except Exception:
                         pass
+                if not seeded and self.label_store:
+                    rel = self.label_store.get_class_relevance(lbl)
+                    if rel is not None:
+                        self.class_relevance[lbl] = rel
+                        seeded = True
                 if not seeded:
                     self.class_relevance[lbl] = False
 
-        for lbl in sorted(all_labels):
+        for lbl in all_labels:
             c = counts.get(lbl, 0)
             display = f"{lbl} ({c})" if c > 0 else lbl
             if self.class_relevance.get(lbl, False):
@@ -1950,6 +2094,8 @@ class MainWindow:
         self.root.after(0, lambda: self._update_stats_display(stats))
 
     def _update_stats_display(self, stats: Dict[str, Any]):
+        run_dir = stats.get("metrics_run_dir") or ""
+        metrics_line = stats.get("metrics_last_line") or ""
         text = (
             f"Status: {stats.get('status', '?')}   Video: {stats.get('current_video', '')}\n"
             f"Frames: {stats.get('frames_read', 0)}   Tiles: {stats.get('tiles_processed', 0)}\n"
@@ -1957,10 +2103,20 @@ class MainWindow:
             f"Cache hits: {stats.get('cache_hits', 0)}   Actual human dialogs this run: {stats.get('user_queries', 0)}\n"
             f"ARED clusters: {stats.get('ared_clusters', '?')}   Known labels: {stats.get('ared_known_labels', '?')}"
         )
+        if metrics_line:
+            text += f"\n{metrics_line}"
+        if run_dir:
+            text += f"\nRun log: {run_dir}"
         self.stats_text.config(state="normal")
         self.stats_text.delete("1.0", "end")
         self.stats_text.insert("1.0", text)
         self.stats_text.config(state="disabled")
+
+        if hasattr(self, "_metrics_run_line_var"):
+            if metrics_line:
+                self._metrics_run_line_var.set(metrics_line)
+            elif run_dir:
+                self._metrics_run_line_var.set(f"Logging → {run_dir}")
 
         if stats.get("tiles_processed", 0) % 5 == 0 or stats.get("status") in ("finished", "stopped"):
             self._refresh_class_list()

@@ -484,6 +484,34 @@ def evaluate_from_annotations_and_queries(
     return metrics
 
 
+def summarize_for_checkpoint(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Compact subset of evaluate_from_annotations_and_queries for run logs / CSV.
+
+    Safe to call with partial results; missing keys become None.
+    """
+    audit = result.get("detailed_breakdown") or result.get("audit") or {}
+    return {
+        "query_precision": result.get("query_precision"),
+        "relevant_recall": result.get("relevant_recall"),
+        "f1_score": result.get("f1_score"),
+        "n_should_query": result.get("n_should_query"),
+        "tp": result.get("tp"),
+        "fp": result.get("fp"),
+        "fn": result.get("fn"),
+        "query_rate": result.get("query_rate"),
+        "relevant_rate": result.get("relevant_rate"),
+        "n_actual_queries": result.get("n_actual_queries"),
+        "total_points": result.get("total_points"),
+        "total_relevant_tiles": audit.get("TOTAL_RELEVANT_TILES"),
+        "total_relevant_tiles_queried": audit.get("TOTAL_RELEVANT_TILES_QUERIED"),
+        "classes_discovered_x_of_y": result.get("classes_discovered_x_of_y"),
+        "n_classes_queried": result.get("n_classes_discovered_this_run"),
+        "n_unique_classes": result.get("n_unique_classes_in_run"),
+        "summary": result.get("summary"),
+        "baseline_random_qp": result.get("baseline_random_query_precision_approx"),
+    }
+
+
 # -----------------------------------------------------------------------------
 # Helper for live runs: collect queried identities
 # -----------------------------------------------------------------------------

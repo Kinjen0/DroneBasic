@@ -183,6 +183,22 @@ class GUIConfig:
     # Affects Tk scaling factor, font point sizes, paddings, etc.
     ui_scale: float = 1.6
 
+    # When True, emit high-volume repeating terminal lines (per-tile progress, cache hits, etc.).
+    # Errors / start-stop / finalize always print regardless.
+    terminal_logging: bool = True
+
+
+@dataclass
+class MetricsLoggingConfig:
+    """Periodic running metrics + per-run save files (paper-style evaluation logs)."""
+    enabled: bool = True
+    # Snapshot QP/RR/F1 etc. every N tiles processed (also always on stop/finish).
+    checkpoint_every: int = 5000
+    # Directory for runs/<run_id>/run.json + checkpoints.csv
+    output_dir: str = "runs"
+    # Also write a checkpoint when each video ends (in addition to every N tiles).
+    checkpoint_on_video_end: bool = True
+
 
 @dataclass
 class PipelineConfig:
@@ -194,6 +210,7 @@ class PipelineConfig:
     tile_annotations: TileAnnotationConfig = field(default_factory=TileAnnotationConfig)  # NEW
     model_save: ModelSaveConfig = field(default_factory=ModelSaveConfig)
     gui: GUIConfig = field(default_factory=GUIConfig)
+    metrics_logging: MetricsLoggingConfig = field(default_factory=MetricsLoggingConfig)
 
     # Misc
     video_paths: list[str] = field(default_factory=list)
@@ -215,6 +232,10 @@ class PipelineConfig:
             data = json.load(f)
         # Reconstruct nested dataclasses manually for simplicity
         tdata = data.get("tiling", {})
+        ml_raw = data.get("metrics_logging", {}) or {}
+        # Only pass known fields so older configs without metrics_logging still load
+        ml_fields = {f.name for f in MetricsLoggingConfig.__dataclass_fields__.values()}  # type: ignore[attr-defined]
+        ml_kwargs = {k: v for k, v in ml_raw.items() if k in ml_fields}
         return cls(
             tiling=TilingConfig(**tdata),
             features=FeatureConfig(**data.get("features", {})),
@@ -223,6 +244,7 @@ class PipelineConfig:
             tile_annotations=TileAnnotationConfig(**data.get("tile_annotations", {})),
             model_save=ModelSaveConfig(**data.get("model_save", {})),
             gui=GUIConfig(**data.get("gui", {})),
+            metrics_logging=MetricsLoggingConfig(**ml_kwargs),
             video_paths=data.get("video_paths", []),
             output_dir=data.get("output_dir", "outputs"),
             random_seed=data.get("random_seed", 42),

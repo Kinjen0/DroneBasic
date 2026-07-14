@@ -47,6 +47,8 @@ from .label_sentinels import (
     is_control_label,
     is_persistable_label,
 )
+from .run_metrics_logger import RunMetricsLogger
+from .logutil import vprint
 
 
 class LabelRequest:
@@ -184,6 +186,9 @@ class DroneAREDController:
         # Callback the GUI can register to receive periodic status updates
         self.on_stats: Optional[Callable[[Dict], None]] = None
 
+        # Per-run metrics logger (QP/RR/F1 every N tiles → runs/<run_id>/)
+        self.run_metrics_logger: Optional[RunMetricsLogger] = None
+
     # ------------------------------------------------------------------
     # Public control surface (called from GUI)
     # ------------------------------------------------------------------
@@ -212,10 +217,69 @@ class DroneAREDController:
         create_ared = (self.ared_adapter is None)
         self._init_components(create_ared=create_ared)
 
+        # Start metrics run package (params snapshot after components exist so DB path is current)
+        self._start_run_metrics_logger()
+
         self._worker_thread = threading.Thread(target=self._run_loop, daemon=True, name="ared-worker")
         self._worker_thread.start()
         self.stats["status"] = "running"
         print("[Controller] Started processing thread")
+
+    def _start_run_metrics_logger(self):
+        """Create a fresh RunMetricsLogger for this Start (if logging enabled)."""
+        self.run_metrics_logger = None
+        try:
+            ml = getattr(self.config, "metrics_logging", None)
+            if ml is None or not getattr(ml, "enabled", True):
+                return
+            params = self._collect_run_params()
+            params["video_paths"] = list(self.config.video_paths or [])
+            params["label_only_mode"] = bool(getattr(self, "label_only_mode", False))
+            self.run_metrics_logger = RunMetricsLogger(
+                output_dir=getattr(ml, "output_dir", "runs") or "runs",
+                checkpoint_every=int(getattr(ml, "checkpoint_every", 5000) or 5000),
+                run_params=params,
+                enabled=True,
+                checkpoint_on_video_end=bool(getattr(ml, "checkpoint_on_video_end", True)),
+            )
+            # Surface path for GUI
+            self.stats["metrics_run_dir"] = str(self.run_metrics_logger.run_dir)
+            self.stats["metrics_last_line"] = "Metrics logging started."
+        except Exception as e:
+            print(f"[Controller] Run metrics logger failed to start: {e}")
+            self.run_metrics_logger = None
+
+    def _maybe_metrics_checkpoint(self, reason: str = "interval"):
+        """Record a running metrics checkpoint if logger is active."""
+        logger = getattr(self, "run_metrics_logger", None)
+        if not logger:
+            return
+        try:
+            if reason == "interval":
+                snap = logger.maybe_checkpoint(self, reason="interval")
+            else:
+                snap = logger.checkpoint(self, reason=reason)
+            if snap:
+                self.stats["metrics_last_line"] = logger.one_line_status()
+                self.stats["metrics_run_dir"] = str(logger.run_dir)
+                if self.on_stats:
+                    try:
+                        self.on_stats(self.stats.copy())
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"[Controller] metrics checkpoint error: {e}")
+
+    def _finalize_run_metrics(self, status: str = "finished"):
+        logger = getattr(self, "run_metrics_logger", None)
+        if not logger:
+            return
+        try:
+            logger.finalize(self, status=status)
+            self.stats["metrics_last_line"] = logger.one_line_status()
+            self.stats["metrics_run_dir"] = str(logger.run_dir)
+        except Exception as e:
+            print(f"[Controller] metrics finalize error: {e}")
 
     def pause(self):
         if not self._pause_event.is_set():
@@ -261,6 +325,8 @@ class DroneAREDController:
             self._worker_thread.join(timeout=join_timeout)
             self._worker_thread = None
         self.stats["status"] = "stopped"
+        # Persist running metrics package even on early stop
+        self._finalize_run_metrics(status="stopped")
         # Keep queried_identities for post-run metrics; clear only on next start
         print("[Controller] Stopped")
 
@@ -548,7 +614,7 @@ class DroneAREDController:
             and to the embedding store (for "similar appearance" on new content).
             """
             meta = meta or {}
-            print(f"[Pipeline] _gui_label_provider called for tile: {meta} (emb shape: {emb.shape if hasattr(emb,'shape') else 'N/A'})")
+            vprint(f"[Pipeline] _gui_label_provider called for tile: {meta} (emb shape: {emb.shape if hasattr(emb,'shape') else 'N/A'})")
 
             # --- 1. EXACT IDENTITY LOOKUP (new primary mechanism) ---
             vpath = meta.get("video_path") or meta.get("video") or ""
@@ -577,9 +643,9 @@ class DroneAREDController:
                     label, rel = exact
                     # Poisoned control sentinels in the DB must never auto-answer A/RED.
                     if is_control_label(label):
-                        print(f"[Pipeline]   -> EXACT DB HIT is control sentinel '{label}' — treating as miss (will re-query / not feed to A/RED).")
+                        vprint(f"[Pipeline]   -> EXACT DB HIT is control sentinel '{label}' — treating as miss (will re-query / not feed to A/RED).")
                     elif not self.edit_mode:
-                        print(f"[Pipeline]   -> EXACT DB HIT for {Path(vpath).name} f{abs_f} [{row},{col}] stride=({sx},{sy}): '{label}' (relevant={rel}). Auto (no GUI).")
+                        vprint(f"[Pipeline]   -> EXACT DB HIT for {Path(vpath).name} f{abs_f} [{row},{col}] stride=({sx},{sy}): '{label}' (relevant={rel}). Auto (no GUI).")
                         if self.label_store is not None:
                             try:
                                 self.label_store.add(emb, label, rel)
@@ -587,24 +653,24 @@ class DroneAREDController:
                                 pass
                         return label, rel
                     else:
-                        print(f"[Pipeline]   -> EXACT DB HIT but EDIT MODE active -> forcing GUI for correction.")
+                        vprint(f"[Pipeline]   -> EXACT DB HIT but EDIT MODE active -> forcing GUI for correction.")
 
             # --- 2. FALLBACK: embedding similarity cache (existing behavior) ---
             if self.label_store is not None:
                 hit = self.label_store.lookup(emb)
                 if hit:
                     if is_control_label(hit[0]):
-                        print(f"[Pipeline]   -> Label store CACHE HIT is control sentinel '{hit[0]}' — treating as miss.")
+                        vprint(f"[Pipeline]   -> Label store CACHE HIT is control sentinel '{hit[0]}' — treating as miss.")
                     else:
                         self.stats["cache_hits"] = self.stats.get("cache_hits", 0) + 1
-                        print(f"[Pipeline]   -> Label store (embedding) CACHE HIT: '{hit[0]}' (relevant={hit[1]}). Returning without GUI.")
+                        vprint(f"[Pipeline]   -> Label store (embedding) CACHE HIT: '{hit[0]}' (relevant={hit[1]}). Returning without GUI.")
                         return hit
                 else:
-                    print(f"[Pipeline]   -> Label store (embedding) CACHE MISS.")
+                    vprint(f"[Pipeline]   -> Label store (embedding) CACHE MISS.")
 
             # --- 3. Real human labeling via GUI (only when A/RED asked or edit mode) ---
             self.stats["user_queries"] = self.stats.get("user_queries", 0) + 1
-            print(f"[Pipeline]   -> Requesting HUMAN label via GUI (actual human this session now {self.stats['user_queries']}; ared_queries already counted the decision)  meta={meta}")
+            vprint(f"[Pipeline]   -> Requesting HUMAN label via GUI (actual human this session now {self.stats['user_queries']}; ared_queries already counted the decision)  meta={meta}")
 
             # Ensure the tile object carries identity for the dialog / later saving
             safe_tile = tile_img
@@ -623,17 +689,17 @@ class DroneAREDController:
                 print("[Pipeline]   -> WARNING: label queue full; cancelling this query (no fake label).")
                 raise LabelCancelled("queue_full")
 
-            print("[Pipeline]   -> Waiting for GUI response (blocking worker thread)...")
+            vprint("[Pipeline]   -> Waiting for GUI response (blocking worker thread)...")
             result = req.wait(timeout=300)
             self._current_label_req = None
 
             # Cancel / skip / timeout: never persist and never return a fake class to A/RED.
             if getattr(req, "cancelled", False):
                 reason = getattr(req, "cancel_reason", None) or "stopped"
-                print(f"[Pipeline]   -> Label request CANCELLED ({reason}); not saving, not feeding A/RED.")
+                vprint(f"[Pipeline]   -> Label request CANCELLED ({reason}); not saving, not feeding A/RED.")
                 raise LabelCancelled(reason)
             if getattr(req, "skipped", False):
-                print("[Pipeline]   -> Label request SKIPPED; not saving, not feeding A/RED.")
+                vprint("[Pipeline]   -> Label request SKIPPED; not saving, not feeding A/RED.")
                 raise LabelCancelled("skipped")
             if result is None:
                 print("[Pipeline]   -> TIMEOUT waiting for label; not saving, not feeding A/RED.")
@@ -644,7 +710,7 @@ class DroneAREDController:
                 print(f"[Pipeline]   -> Refusing control/empty label '{label}'; not saving, not feeding A/RED.")
                 raise LabelCancelled(f"control_label:{label}")
 
-            print(f"[Pipeline]   -> Received label from GUI: '{label}' (relevant={rel})")
+            vprint(f"[Pipeline]   -> Received label from GUI: '{label}' (relevant={rel})")
 
             # Save the human decision to BOTH stores (only real labels reach here)
             # a) Exact DB (now stride-aware for overlap safety)
@@ -662,7 +728,7 @@ class DroneAREDController:
             if self.label_store is not None:
                 try:
                     self.label_store.add(emb, label, rel)
-                    print(f"[Pipeline]   -> Also added to embedding similarity cache.")
+                    vprint(f"[Pipeline]   -> Also added to embedding similarity cache.")
                 except Exception as e:
                     print(f"[Pipeline]   -> WARNING: failed to add to label_store: {e}")
 
@@ -690,8 +756,19 @@ class DroneAREDController:
                     break
                 self.stats["current_video"] = Path(vpath).name
                 self._process_one_video(vpath)
+                # Optional checkpoint at each video boundary
+                logger = getattr(self, "run_metrics_logger", None)
+                if logger and getattr(logger, "checkpoint_on_video_end", True) and not self._stop_event.is_set():
+                    self._maybe_metrics_checkpoint(reason="video_end")
 
-            self.stats["status"] = "finished"
+            if self._stop_event.is_set():
+                # stop() will finalize; avoid double finalize if already stopped
+                if self.stats.get("status") != "stopped":
+                    self.stats["status"] = "stopped"
+                    self._finalize_run_metrics(status="stopped")
+            else:
+                self.stats["status"] = "finished"
+                self._finalize_run_metrics(status="finished")
             print(f"[Pipeline] All videos finished. Final stats: {self.stats}")
             if self.on_stats:
                 self.on_stats(self.stats.copy())
@@ -700,6 +777,7 @@ class DroneAREDController:
             import traceback
             traceback.print_exc()
             self.stats["status"] = "error"
+            self._finalize_run_metrics(status="error")
             if self.on_stats:
                 try:
                     self.on_stats(self.stats.copy())
@@ -759,7 +837,7 @@ class DroneAREDController:
                     if frame_idx % frame_stride != 0:
                         continue
 
-                    print(f"[Pipeline] Processing frame {frame_idx} (stride={frame_stride})")
+                    vprint(f"[Pipeline] Processing frame {frame_idx} (stride={frame_stride})")
 
                     # Convert BGR (cv2) -> RGB
                     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -817,7 +895,7 @@ class DroneAREDController:
             embs = self.feature_extractor.extract_images(pil_images)
 
             for tile, emb in zip(tiles, embs):
-                print(f"[Pipeline->ARED] passing new tile global={tile.global_idx} (frame={tile.frame_idx}, r={tile.tile_row}, c={tile.tile_col}) to A_RED")
+                vprint(f"[Pipeline->ARED] passing new tile global={tile.global_idx} (frame={tile.frame_idx}, r={tile.tile_row}, c={tile.tile_col}) to A_RED")
                 # Rich identity for the exact TileAnnotationDB (primary) + backward compat for embedding cache
                 meta = {
                     "video_path": getattr(tile, 'video_path', '') or video_path,
@@ -850,9 +928,8 @@ class DroneAREDController:
                     # Cache hits still count fully (as user queries per spec).
                     # See drone_ared/metrics.py and the A/RED papers (IJSC_2026-1, SPIE_IVSP_2026).
 
-                # Always log finish of tile processing so we can see forward progress even when A/RED is not querying.
-                # This is key to confirm that "Waiting for next query" in the GUI just means A/RED chose not to ask for a label.
-                print(f"[Pipeline] Finished tile global={tile.global_idx} (frame={tile.frame_idx}, r={tile.tile_row}, c={tile.tile_col}). "
+                # High-volume progress (gated by Terminal logging checkbox)
+                vprint(f"[Pipeline] Finished tile global={tile.global_idx} (frame={tile.frame_idx}, r={tile.tile_row}, c={tile.tile_col}). "
                       f"ARED queried? {ared_queried}  label='{label}'  clusters={info.get('num_clusters', '?')} known_labels={info.get('num_known_labels', '?')}")
 
                 # "queried" here means A/RED decided it needed a label (cache or human).
@@ -863,13 +940,16 @@ class DroneAREDController:
                     self.stats["ared_clusters"] = self.ared_adapter.num_clusters
                     self.stats["ared_known_labels"] = self.ared_adapter.num_known_labels
 
+                # Running metrics every N tiles (default 5000) → runs/<run_id>/
+                self._maybe_metrics_checkpoint(reason="interval")
+
                 # Push stats to GUI occasionally
                 if self.on_stats and (self.stats["tiles_processed"] % 8 == 0):
                     self.on_stats(self.stats.copy())
 
                 # Progress heartbeat (uses reliable stats counter so it fires even for long non-query stretches)
                 if (self.stats["tiles_processed"] % 10 == 0) or ared_queried:
-                    print(f"[Pipeline] Progress: tiles_processed={self.stats['tiles_processed']}, "
+                    vprint(f"[Pipeline] Progress: tiles_processed={self.stats['tiles_processed']}, "
                           f"ared_clusters={self.stats.get('ared_clusters', 0)}, "
                           f"ared_queries (labels needed)={self.stats.get('ared_queries', 0)}, "
                           f"human_dialogs={self.stats.get('user_queries', 0)}, "
@@ -975,7 +1055,7 @@ class DroneAREDController:
                     cmd = self._label_only_nav_command
                     self._label_only_nav_command = None
                     self._label_only_navigation_event.clear()
-                    print(f"[Pipeline] Label Only: applying nav command {cmd} (cursor before: f{self._label_only_current_frame} t{self._label_only_current_tile_idx})")
+                    vprint(f"[Pipeline] Label Only: applying nav command {cmd} (cursor before: f{self._label_only_current_frame} t{self._label_only_current_tile_idx})")
 
                     if cmd.get("action") == "next":
                         self._advance_label_only_cursor(1, frame_stride, total_frames, tiles_per_frame)
@@ -985,7 +1065,7 @@ class DroneAREDController:
                         self._label_only_current_frame = max(0, min(cmd.get("frame", 0), total_frames-1))
                         self._label_only_current_tile_idx = 0
 
-                    print(f"[Pipeline] Label Only: nav applied, now at f{self._label_only_current_frame} t{self._label_only_current_tile_idx}")
+                    vprint(f"[Pipeline] Label Only: nav applied, now at f{self._label_only_current_frame} t{self._label_only_current_tile_idx}")
 
                     # Mark that the *next* tile we land on should be presented even if already
                     # labeled (so user can review/edit previous tiles via explicit nav).
