@@ -22,7 +22,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from . import metrics as ared_metrics
-from .metrics import summarize_for_checkpoint
+from .metrics import summarize_for_checkpoint, make_tile_key
+from .label_sentinels import is_persistable_label
 from .logutil import vprint
 
 if TYPE_CHECKING:
@@ -37,7 +38,14 @@ CHECKPOINT_CSV_FIELDS = [
     "ared_queries",
     "user_queries",
     "cache_hits",
+    # Cumulative rates (stream so far)
     "query_rate",
+    "relevant_rate",
+    # Section rates for the tiles since the previous checkpoint (size ≈ checkpoint_every)
+    "section_tiles",
+    "section_ared_queries",
+    "section_query_rate",
+    "section_relevant_rate",
     "query_precision",
     "relevant_recall",
     "f1_score",
@@ -180,8 +188,10 @@ class RunMetricsLogger:
                 f"[RunMetrics] checkpoint #{snap.get('checkpoint_index')} "
                 f"@ {snap.get('tiles_processed')} tiles  "
                 f"QP={snap.get('query_precision')} RR={snap.get('relevant_recall')} "
-                f"F1={snap.get('f1_score')}  queries={snap.get('ared_queries')}  "
-                f"({reason})"
+                f"F1={snap.get('f1_score')}  "
+                f"QR={snap.get('query_rate')} RelRate={snap.get('relevant_rate')}  "
+                f"secQR={snap.get('section_query_rate')} secRel={snap.get('section_relevant_rate')}  "
+                f"queries={snap.get('ared_queries')}  ({reason})"
             )
             vprint(line)
             return snap
@@ -359,18 +369,87 @@ class RunMetricsLogger:
             return (
                 f"Running @ {c.get('tiles_processed')} tiles: "
                 f"QP={c.get('query_precision')}  RR={c.get('relevant_recall')}  "
-                f"F1={c.get('f1_score')}  queries={c.get('ared_queries')}  "
-                f"frames={c.get('frames_read')}  classes={c.get('classes_discovered_x_of_y')}"
+                f"F1={c.get('f1_score')}  "
+                f"QR={c.get('query_rate')}  RelRate={c.get('relevant_rate')}  "
+                f"secQR={c.get('section_query_rate')}  secRel={c.get('section_relevant_rate')}  "
+                f"queries={c.get('ared_queries')}  frames={c.get('frames_read')}  "
+                f"classes={c.get('classes_discovered_x_of_y')}"
             )
         return (
             f"Running @ {c.get('tiles_processed')} tiles: "
             f"queries={c.get('ared_queries')} frames={c.get('frames_read')}  "
-            f"(QP/RR pending — need more DB labels)"
+            f"QR={c.get('query_rate')} secQR={c.get('section_query_rate')}  "
+            f"(QP/RR/RelRate pending — need more DB labels)"
         )
 
     # ------------------------------------------------------------------
     # Internals
     # ------------------------------------------------------------------
+    def _section_bounds(self, tiles_now: int, queries_now: int) -> Dict[str, Any]:
+        """Tiles / queries in the window since the previous checkpoint (or from stream start)."""
+        prev = self.checkpoints[-1] if self.checkpoints else None
+        tiles_prev = int(prev.get("tiles_processed") or 0) if prev else 0
+        queries_prev = int(prev.get("ared_queries") or 0) if prev else 0
+        section_tiles = max(0, tiles_now - tiles_prev)
+        section_queries = max(0, queries_now - queries_prev)
+        section_qr = (
+            round(section_queries / section_tiles, 4) if section_tiles > 0 else 0.0
+        )
+        return {
+            "section_tiles": section_tiles,
+            "section_ared_queries": section_queries,
+            "section_query_rate": section_qr,
+            "_tiles_prev": tiles_prev,
+        }
+
+    def _section_relevant_rate(
+        self,
+        controller: "DroneAREDController",
+        tiles_prev: int,
+        tiles_now: int,
+    ) -> Optional[float]:
+        """Relevant rate over only the tiles in (tiles_prev, tiles_now] — paper Relevant Rate for that section."""
+        if tiles_now <= tiles_prev:
+            return None
+        processed = list(getattr(controller, "processed_identities", None) or [])
+        if not processed:
+            return None
+        # processed list is append-order stream; index aligns with tiles_processed growth
+        lo = max(0, min(tiles_prev, len(processed)))
+        hi = max(lo, min(tiles_now, len(processed)))
+        section_keys = processed[lo:hi]
+        if not section_keys:
+            return None
+
+        videos = sorted({p[0] for p in section_keys if p and p[0]})
+        anns: List[Dict[str, Any]] = []
+        for v in videos:
+            anns.extend(self._load_annotations_for_video(controller, v))
+        if not anns:
+            return None
+
+        # Filter annotations to this section of the stream
+        keyset = set(section_keys)
+        section_anns = [a for a in anns if make_tile_key(a) in keyset]
+        if not section_anns:
+            # No labels in this window yet — relevant rate unknown for labeled fraction
+            return None
+
+        relevant_classes = {
+            str(a.get("label", "")) for a in section_anns if a.get("relevant")
+        }
+        # Paper relevant rate ≈ fraction of *streamed* points that are relevant-class.
+        # Denominator = section stream size (tiles in window), not only labeled count.
+        n_rel = sum(
+            1
+            for a in section_anns
+            if str(a.get("label", "")) in relevant_classes
+            and is_persistable_label(str(a.get("label", "")))
+        )
+        # Only count relevant among tiles we can identify; unlabeled stream tiles count as non-relevant for rate
+        denom = max(1, hi - lo)
+        return round(n_rel / denom, 4)
+
     def _build_snapshot(self, controller: "DroneAREDController", reason: str) -> Dict[str, Any]:
         stats = controller.stats or {}
         tiles = int(stats.get("tiles_processed", 0) or 0)
@@ -380,6 +459,9 @@ class RunMetricsLogger:
         cache_h = int(stats.get("cache_hits", 0) or 0)
         elapsed = round(time.time() - self._t0, 3)
 
+        section = self._section_bounds(tiles, queries)
+        tiles_prev = int(section.pop("_tiles_prev", 0))
+
         base: Dict[str, Any] = {
             "checkpoint_index": len(self.checkpoints) + 1,
             "reason": reason,
@@ -388,7 +470,14 @@ class RunMetricsLogger:
             "ared_queries": queries,
             "user_queries": user_q,
             "cache_hits": cache_h,
+            # Cumulative (stream so far)
             "query_rate": round(queries / max(1, tiles), 4) if tiles else 0.0,
+            "relevant_rate": None,
+            # Section (tiles since previous checkpoint)
+            "section_tiles": section["section_tiles"],
+            "section_ared_queries": section["section_ared_queries"],
+            "section_query_rate": section["section_query_rate"],
+            "section_relevant_rate": None,
             "query_precision": None,
             "relevant_recall": None,
             "f1_score": None,
@@ -409,6 +498,14 @@ class RunMetricsLogger:
             "note": None,
         }
 
+        # Section relevant rate (needs DB labels for tiles in this window)
+        try:
+            base["section_relevant_rate"] = self._section_relevant_rate(
+                controller, tiles_prev, tiles
+            )
+        except Exception as e:
+            vprint(f"[RunMetrics] section_relevant_rate failed: {e}")
+
         # Label-only: counters only
         if getattr(controller, "label_only_mode", False):
             base["note"] = "label_only_mode (no A/RED query decisions)"
@@ -427,11 +524,17 @@ class RunMetricsLogger:
                     "fp": summ.get("fp"),
                     "fn": summ.get("fn"),
                     "query_rate": summ.get("query_rate") if summ.get("query_rate") is not None else base["query_rate"],
+                    "relevant_rate": summ.get("relevant_rate"),
                     "total_relevant_tiles": summ.get("total_relevant_tiles"),
                     "total_relevant_tiles_queried": summ.get("total_relevant_tiles_queried"),
                     "classes_discovered_x_of_y": summ.get("classes_discovered_x_of_y"),
                     "n_classes_queried": summ.get("n_classes_queried"),
                     "n_unique_classes": summ.get("n_unique_classes"),
+                    "baseline_random_qp": summ.get("baseline_random_qp"),
+                    "baseline_random_rr": summ.get("baseline_random_rr"),
+                    "qp_improvement_ratio_vs_random": summ.get("qp_improvement_ratio_vs_random"),
+                    "rr_improvement_ratio_vs_random": summ.get("rr_improvement_ratio_vs_random"),
+                    "relevant_recall_strict": summ.get("relevant_recall_strict"),
                     "metrics_available": True,
                 })
             else:

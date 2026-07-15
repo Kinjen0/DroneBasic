@@ -98,13 +98,15 @@ def final_metrics_table(run: RunRecord) -> str:
         ("tp", "TP"),
         ("fp", "FP"),
         ("fn", "FN"),
-        ("query_rate", "Query rate"),
+        ("query_rate", "Query rate (cumulative)"),
+        ("relevant_rate", "Relevant rate (cumulative)"),
         ("n_actual_queries", "Actual queries"),
         ("total_points", "Total points (stream)"),
         ("total_relevant_tiles", "Relevant tiles"),
         ("total_relevant_tiles_queried", "Relevant tiles queried"),
         ("classes_discovered_x_of_y", "Classes queried x/y"),
         ("baseline_random_query_precision_approx", "Random baseline QP ≈"),
+        ("baseline_random_relevant_recall", "Random baseline RR (= QR)"),
         ("summary", "Summary"),
     ]
     fm = run.final_metrics or {}
@@ -119,8 +121,10 @@ def final_metrics_table(run: RunRecord) -> str:
 
     if run.checkpoints:
         lines += ["", f"### Checkpoints ({len(run.checkpoints)})", ""]
-        lines.append("| # | reason | tiles | frames | queries | QP | RR | F1 |")
-        lines.append("| --- | --- | --- | --- | --- | --- | --- | --- |")
+        lines.append(
+            "| # | reason | tiles | queries | QP | RR | F1 | QR | RelRate | secQR | secRel |"
+        )
+        lines.append("| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |")
         for c in run.checkpoints:
             lines.append(
                 "| "
@@ -129,11 +133,14 @@ def final_metrics_table(run: RunRecord) -> str:
                         _fmt(c.get("checkpoint_index"), 0),
                         str(c.get("reason") or ""),
                         _fmt(c.get("tiles_processed"), 0),
-                        _fmt(c.get("frames_read"), 0),
                         _fmt(c.get("ared_queries"), 0),
                         _fmt(c.get("query_precision")),
                         _fmt(c.get("relevant_recall")),
                         _fmt(c.get("f1_score")),
+                        _fmt(c.get("query_rate")),
+                        _fmt(c.get("relevant_rate")),
+                        _fmt(c.get("section_query_rate")),
+                        _fmt(c.get("section_relevant_rate")),
                     ]
                 )
                 + " |"

@@ -18,13 +18,21 @@ def _plt():
 def plot_run_curves(
     run: RunRecord,
     out_path: Union[str, Path],
-    metrics: Sequence[str] = ("query_precision", "relevant_recall", "f1_score"),
+    metrics: Sequence[str] = (
+        "query_precision",
+        "relevant_recall",
+        "f1_score",
+        "section_query_rate",
+        "section_relevant_rate",
+    ),
     title: Optional[str] = None,
     dpi: int = 140,
 ) -> Path:
     """
-    QP / RR / F1 (and optional extras) vs tiles processed for a single run.
-    Matches the cumulative streaming evaluation style in the A/RED papers.
+    QP / RR / F1 plus section query/relevant rates vs tiles processed.
+
+    Section rates are for the last checkpoint window (~N tiles only), not cumulative
+    stream rates (those stay in CSV/logs but are omitted here for readability).
     """
     plt = _plt()
     out_path = Path(out_path)
@@ -34,11 +42,20 @@ def plot_run_curves(
         "query_precision": "Query Precision (QP)",
         "relevant_recall": "Relevant Recall (RR)",
         "f1_score": "F1 score",
-        "query_rate": "Query rate",
+        "section_query_rate": "Query rate (section)",
+        "section_relevant_rate": "Relevant rate (section)",
         "ared_queries": "Cumulative queries",
     }
+    # Solid for quality metrics; dashed for section rates
+    metric_styles = {
+        "query_precision": {"linestyle": "-", "linewidth": 1.8},
+        "relevant_recall": {"linestyle": "-", "linewidth": 1.8},
+        "f1_score": {"linestyle": "-", "linewidth": 1.8},
+        "section_query_rate": {"linestyle": "--", "linewidth": 1.6},
+        "section_relevant_rate": {"linestyle": "--", "linewidth": 1.6},
+    }
 
-    fig, axes = plt.subplots(2, 1, figsize=(9, 7), sharex=True, gridspec_kw={"height_ratios": [2.2, 1.2]})
+    fig, axes = plt.subplots(2, 1, figsize=(9.5, 7.5), sharex=True, gridspec_kw={"height_ratios": [2.4, 1.2]})
     ax0, ax1 = axes
 
     any_line = False
@@ -48,41 +65,68 @@ def plot_run_curves(
             continue
         xs = [t for t, _ in series]
         ys = [v for _, v in series]
-        ax0.plot(xs, ys, marker="o", markersize=3, linewidth=1.5, label=metric_labels.get(m, m))
+        style = metric_styles.get(m, {"linestyle": "-", "linewidth": 1.5})
+        ax0.plot(
+            xs,
+            ys,
+            marker="o",
+            markersize=3,
+            label=metric_labels.get(m, m),
+            **style,
+        )
         any_line = True
 
     if not any_line:
         ax0.text(0.5, 0.5, "No metric checkpoints with QP/RR yet\n(need DB labels during run)",
                  ha="center", va="center", transform=ax0.transAxes, fontsize=11, color="#666")
     else:
-        ax0.legend(loc="best", fontsize=9)
+        ax0.legend(loc="best", fontsize=8, ncol=2)
         ax0.set_ylim(-0.02, 1.05)
 
-    ax0.set_ylabel("Score")
+    ax0.set_ylabel("Score / rate")
     ax0.set_title(title or f"Running metrics — {run.short_label()}")
     ax0.grid(True, alpha=0.3)
     ax0.axhline(0, color="#ccc", linewidth=0.5)
     ax0.axhline(1, color="#ccc", linewidth=0.5)
 
-    # Lower panel: query burden
+    # Lower panel: cumulative queries + section query rate (right axis if available)
     q_series = run.checkpoint_series("ared_queries")
-    t_series = run.checkpoint_series("tiles_processed")  # always present if any ckpt
     if q_series:
         ax1.plot([t for t, _ in q_series], [v for _, v in q_series],
-                 color="#d62728", marker="s", markersize=3, linewidth=1.5, label="A/RED queries")
-    # Also plot frames if available
-    f_series = run.checkpoint_series("frames_read")
-    if f_series:
-        ax1_t = ax1.twinx()
-        ax1_t.plot([t for t, _ in f_series], [v for _, v in f_series],
-                   color="#1f77b4", linestyle="--", linewidth=1.2, alpha=0.7, label="Frames")
-        ax1_t.set_ylabel("Frames read", color="#1f77b4")
-        ax1_t.tick_params(axis="y", labelcolor="#1f77b4")
+                 color="#d62728", marker="s", markersize=3, linewidth=1.5, label="A/RED queries (cumul.)")
+    sec_qr = run.checkpoint_series("section_query_rate")
+    if sec_qr:
+        ax1b = ax1.twinx()
+        ax1b.plot(
+            [t for t, _ in sec_qr],
+            [v for _, v in sec_qr],
+            color="#ff7f0e",
+            linestyle=":",
+            marker="^",
+            markersize=3,
+            linewidth=1.4,
+            label="Section query rate",
+        )
+        ax1b.set_ylabel("Section QR", color="#ff7f0e")
+        ax1b.tick_params(axis="y", labelcolor="#ff7f0e")
+        ax1b.set_ylim(-0.02, max(1.05, max((v for _, v in sec_qr), default=0.1) * 1.15))
+        # Combined legend
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax1b.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=8)
+    else:
+        f_series = run.checkpoint_series("frames_read")
+        if f_series:
+            ax1_t = ax1.twinx()
+            ax1_t.plot([t for t, _ in f_series], [v for _, v in f_series],
+                       color="#1f77b4", linestyle="--", linewidth=1.2, alpha=0.7, label="Frames")
+            ax1_t.set_ylabel("Frames read", color="#1f77b4")
+            ax1_t.tick_params(axis="y", labelcolor="#1f77b4")
+        ax1.legend(loc="upper left", fontsize=8)
 
     ax1.set_xlabel("Tiles processed")
     ax1.set_ylabel("Queries")
     ax1.grid(True, alpha=0.3)
-    ax1.legend(loc="upper left", fontsize=8)
 
     # Param footer
     rp = run.run_params or {}
@@ -116,7 +160,10 @@ def plot_compare_metric(
         "query_precision": "Query Precision (QP)",
         "relevant_recall": "Relevant Recall (RR)",
         "f1_score": "F1 score",
-        "query_rate": "Query rate",
+        "query_rate": "Query rate (cumul.)",
+        "relevant_rate": "Relevant rate (cumul.)",
+        "section_query_rate": "Query rate (section)",
+        "section_relevant_rate": "Relevant rate (section)",
     }
 
     fig, ax = plt.subplots(figsize=(9, 5))

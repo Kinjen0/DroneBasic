@@ -123,6 +123,8 @@ def cmd_report(args) -> int:
             ("relevant_recall", "Relevant Recall comparison"),
             ("query_precision", "Query Precision comparison"),
             ("f1_score", "F1 comparison"),
+            ("section_query_rate", "Section query rate comparison"),
+            ("section_relevant_rate", "Section relevant rate comparison"),
         ):
             p = plot_compare_metric(
                 runs, metric=metric, out_path=fig_dir / f"compare_{metric}.png", title=title
@@ -198,7 +200,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     sp.add_argument(
         "--metric",
         default="relevant_recall",
-        choices=["query_precision", "relevant_recall", "f1_score", "query_rate", "ared_queries"],
+        choices=[
+            "query_precision",
+            "relevant_recall",
+            "f1_score",
+            "query_rate",
+            "relevant_rate",
+            "section_query_rate",
+            "section_relevant_rate",
+            "ared_queries",
+        ],
     )
     sp.add_argument("--out", default=None, help="Output PNG path")
     sp.add_argument("--also-burden", action="store_true", help="Also write query-burden bars")
