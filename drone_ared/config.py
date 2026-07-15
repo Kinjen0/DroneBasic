@@ -34,8 +34,8 @@ class TilingConfig:
     - You can set stride directly, or use the GUI overlap controls (overlap_px = tile - stride).
     - Default (stride == tile size) = classic non-overlapping grid.
     """
-    tile_width: int = 256
-    tile_height: int = 256
+    tile_width: int = 240
+    tile_height: int = 240
     # Stride: if None, non-overlapping (stride == tile size). Overlap if smaller.
     # stride_x/y are the authoritative runtime values used by GridTiler.
     stride_x: Optional[int] = None
@@ -43,10 +43,10 @@ class TilingConfig:
     # Optional convenience fields for overlap in pixels (tile_size - stride).
     # These are primarily for UI / documentation. When > 0 the GUI may use them
     # to compute stride = max(1, tile - overlap). The pipeline always uses stride_*.
-    overlap_x: int = 0
-    overlap_y: int = 0
+    overlap_x: int = 120
+    overlap_y: int = 120
     # Optional: process only every Nth frame (1 = every frame). Higher = faster, fewer tiles.
-    frame_stride: int = 5
+    frame_stride: int = 15
     # Future: support "adaptive" tiling, saliency-based, multi-scale, etc.
     tiling_mode: str = "grid"   # "grid", "sliding", "pyramid" (future)
 
