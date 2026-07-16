@@ -128,9 +128,16 @@ class AREDConfig:
 
 @dataclass
 class LabelCacheConfig:
-    """Settings for the persistent 'I have seen a tile like this before' store (embedding similarity)."""
-    enabled: bool = True
-    db_path: str = "drone_ared_labels.pkl"   # embedding similarity cache
+    """Embedding-similarity auto-label store (NOT the annotation SQLite DB).
+
+    When enabled, DINO embeddings close to past human labels (stored in the .pkl)
+    can answer A/RED queries without the GUI — even if the tile annotation .db is
+    empty or brand new. Disable for cold-start / clean-metrics experiments.
+    """
+    # Default OFF so a new annotation DB is not silently "contaminated" by old .pkl labels.
+    # Re-enable in the GUI when you want cross-run similarity auto-labeling.
+    enabled: bool = False
+    db_path: str = "drone_ared_labels.pkl"   # embedding similarity cache (pickle)
     auto_label_threshold: float = 0.15
     rebuild_interval: int = 32
     distance_metric: str = "l2"

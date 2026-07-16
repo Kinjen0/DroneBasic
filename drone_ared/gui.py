@@ -932,7 +932,26 @@ class MainWindow:
         self._add_param_row(param_frame, "Buffer size", "buf_size", self.config.ared.l_buf_size)
         self._add_param_row(param_frame, "Cache threshold (L2)", "cache_thresh", self.config.label_cache.auto_label_threshold, is_float=True)
         self._add_param_row(param_frame, "DINO model name", "dino_model", self.config.features.model_name, is_str=True)
-        ttk.Checkbutton(param_frame, text="Use label cache (similarity)", variable=tk.BooleanVar(value=self.config.label_cache.enabled)).pack(anchor="w", pady=int(2*s))
+
+        # Embedding similarity cache (drone_ared_labels.pkl) — SEPARATE from the annotation SQLite DB.
+        # If enabled, similar DINO embeddings from PAST runs can auto-answer A/RED queries even
+        # when the annotation DB is empty/new. Uncheck for clean cold-start experiments.
+        self.label_cache_enabled_var = tk.BooleanVar(value=bool(self.config.label_cache.enabled))
+        ttk.Checkbutton(
+            param_frame,
+            text="Use embedding label cache (.pkl similarity — NOT the annotation DB)",
+            variable=self.label_cache_enabled_var,
+        ).pack(anchor="w", pady=int(2*s))
+        self._add_param_row(
+            param_frame,
+            "Embedding cache path (.pkl)",
+            "label_cache_path",
+            getattr(self.config.label_cache, "db_path", "drone_ared_labels.pkl"),
+            is_str=True,
+        )
+        ttk.Button(param_frame, text="Clear embedding cache (this session)", command=self._clear_embedding_cache).pack(
+            fill="x", pady=int(1*s)
+        )
 
         # NEW: Exact tile annotation DB controls
         ttk.Separator(param_frame, orient="horizontal").pack(fill="x", pady=int(4*s))
@@ -1157,6 +1176,13 @@ class MainWindow:
             self.config.ared.l_buf_size = int(getattr(self, "_buf_size_var").get())
             self.config.label_cache.auto_label_threshold = float(getattr(self, "_cache_thresh_var").get())
             self.config.features.model_name = getattr(self, "_dino_model_var").get()
+            # Embedding similarity cache (.pkl) — independent of annotation SQLite DB
+            if hasattr(self, "label_cache_enabled_var"):
+                self.config.label_cache.enabled = bool(self.label_cache_enabled_var.get())
+            if hasattr(self, "_label_cache_path_var"):
+                pth = str(getattr(self, "_label_cache_path_var").get() or "").strip()
+                if pth:
+                    self.config.label_cache.db_path = pth
 
             # NEW exact annotation DB
             self.config.tile_annotations.db_path = getattr(self, "_tile_ann_db_var").get()
@@ -1216,15 +1242,26 @@ class MainWindow:
             except Exception:
                 pass
 
-        # Prepare label store (embedding similarity) — used for auto-labeling, NOT for class list names
+        # Prepare embedding similarity cache (.pkl) — OPTIONAL auto-answer for A/RED queries.
+        # This is NOT the annotation SQLite DB. A new empty .db does NOT clear this file.
+        # Disable for clean cold-start / metrics runs against a fresh annotation DB.
         if self.config.label_cache.enabled:
             self.label_store = PersistentLabelStore(
                 db_path=self.config.label_cache.db_path,
                 auto_label_threshold=self.config.label_cache.auto_label_threshold,
             )
             self.controller.set_label_store(self.label_store)
+            n_cached = len(self.label_store)
+            if n_cached > 0:
+                print(
+                    f"[GUI] Embedding label cache LOADED: {n_cached} entries from "
+                    f"{self.config.label_cache.db_path} (can auto-label similar tiles "
+                    f"even if the annotation DB is empty). Uncheck 'Use embedding label cache' to disable."
+                )
         else:
             self.label_store = None
+            self.controller.set_label_store(None)
+            print("[GUI] Embedding label cache DISABLED — only exact annotation DB + human GUI will answer queries.")
 
         # Prepare exact tile annotation DB (NEW - primary for persistent exact labels + editing)
         if getattr(self.config.tile_annotations, 'enabled', True):
@@ -1705,9 +1742,75 @@ class MainWindow:
             # Creating by opening will make the tables
             db = TileAnnotationDB(db_path=path)
             self._set_active_tile_db(db, path)
-            messagebox.showinfo("New DB", f"Created and switched to new DB: {Path(path).name}")
+
+            # Critical: annotation DB and embedding .pkl cache are independent.
+            # A brand-new empty .db does NOT prevent auto-labels from drone_ared_labels.pkl.
+            pkl = getattr(self.config.label_cache, "db_path", "drone_ared_labels.pkl")
+            cache_on = bool(getattr(self, "label_cache_enabled_var", None) and self.label_cache_enabled_var.get())
+            extra = (
+                f"\n\nNOTE: The embedding similarity cache ({pkl}) is SEPARATE from this DB.\n"
+                f"If it stays enabled, A/RED may still auto-label tiles as 'grass' etc. from past runs.\n\n"
+                f"Disable embedding cache for this session now?"
+            )
+            if cache_on:
+                disable = messagebox.askyesno(
+                    "New DB created",
+                    f"Created and switched to new DB: {Path(path).name}{extra}",
+                )
+                if disable:
+                    self.label_cache_enabled_var.set(False)
+                    self.config.label_cache.enabled = False
+                    self._clear_embedding_cache(silent=True)
+                    messagebox.showinfo(
+                        "Embedding cache off",
+                        "Embedding label cache disabled and cleared for this session.\n"
+                        "A/RED will only use this empty annotation DB + human labels.",
+                    )
+            else:
+                messagebox.showinfo("New DB", f"Created and switched to new DB: {Path(path).name}")
         except Exception as e:
             messagebox.showerror("New DB", str(e))
+
+    def _clear_embedding_cache(self, silent: bool = False):
+        """Drop in-memory embedding cache and detach from controller/adapter (session only).
+
+        Does not delete the .pkl file on disk unless the user confirms (when not silent).
+        """
+        self.label_store = None
+        try:
+            self.controller.set_label_store(None)
+        except Exception:
+            pass
+        if getattr(self.controller, "ared_adapter", None) is not None:
+            try:
+                self.controller.ared_adapter.set_label_store(None)
+            except Exception:
+                pass
+
+        if silent:
+            return
+
+        pkl = Path(getattr(self.config.label_cache, "db_path", "drone_ared_labels.pkl"))
+        delete = False
+        if pkl.is_file():
+            delete = messagebox.askyesno(
+                "Clear embedding cache",
+                f"Embedding cache cleared for this session.\n\n"
+                f"Also permanently delete the file on disk?\n  {pkl}\n\n"
+                f"(This does NOT affect annotation .db files.)",
+            )
+        if delete:
+            try:
+                pkl.unlink()
+                messagebox.showinfo("Cleared", f"Deleted {pkl}")
+            except Exception as e:
+                messagebox.showerror("Delete failed", str(e))
+        elif not silent:
+            messagebox.showinfo(
+                "Cleared",
+                "Session embedding cache cleared (controller will not auto-label from .pkl until you re-enable and Start).\n"
+                "Disk .pkl file left in place.",
+            )
 
     def _clone_tile_annotations(self):
         """Clone the current DB to a new file and switch to the clone."""
