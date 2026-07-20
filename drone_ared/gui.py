@@ -830,6 +830,7 @@ class MainWindow:
         file_menu.add_separator()
         file_menu.add_command(label="Save ARED Model State", command=self._save_ared_state)
         file_menu.add_command(label="Load ARED Model State", command=self._load_ared_state)
+        file_menu.add_command(label="Merge ARED Models...", command=self._merge_ared_models)
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self._on_closing)
         menubar.add_cascade(label="File", menu=file_menu)
@@ -901,7 +902,8 @@ class MainWindow:
 
         # Quick model controls
         ttk.Button(ctrl, text="Save ARED Model", command=self._save_ared_state).pack(side="left", padx=int(8*s))
-        ttk.Button(ctrl, text="Load ARED Model", command=self._load_ared_state).pack(side="left")
+        ttk.Button(ctrl, text="Load ARED Model", command=self._load_ared_state).pack(side="left", padx=int(2*s))
+        ttk.Button(ctrl, text="Merge Models", command=self._merge_ared_models).pack(side="left", padx=int(2*s))
 
         # Status line
         self.status_var = tk.StringVar(value="Ready. Load videos and press Start.")
@@ -1969,6 +1971,227 @@ class MainWindow:
             self.controller.stats["ared_known_labels"] = self.controller.ared_adapter.num_known_labels
             self._update_stats_display(self.controller.stats)
         messagebox.showinfo("ARED State", "Model state loaded and replayed.")
+
+    def _merge_ared_models(self):
+        """
+        Dialog to merge two A_RED model pickles (or current session + a file).
+
+        Strategies (see drone_ared.model_merge):
+          - squish: enlarge buffer, force-union all labeled points
+          - ingest: rebuild A, stream B through live A_RED (query-aware)
+          - interleave: fresh model, alternate A/B points (query-aware)
+        """
+        # Refuse while the streaming worker is active — merge rebuilds adapters.
+        worker = getattr(self.controller, "_worker_thread", None)
+        if worker is not None and worker.is_alive():
+            messagebox.showwarning(
+                "Merge ARED Models",
+                "Stop the current run before merging models.",
+            )
+            return
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Merge ARED Models")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        s = getattr(self, "ui_scale", 1.0) or 1.0
+        pad = int(8 * s)
+
+        path_a_var = tk.StringVar(value="")
+        path_b_var = tk.StringVar(value="")
+        out_var = tk.StringVar(value="")
+        use_session_var = tk.BooleanVar(
+            value=bool(getattr(self.controller, "ared_adapter", None))
+        )
+        apply_var = tk.BooleanVar(value=True)
+        strategy_var = tk.StringVar(value="squish")
+
+        frm = ttk.Frame(dlg, padding=pad)
+        frm.pack(fill="both", expand=True)
+
+        ttk.Label(
+            frm,
+            text=(
+                "Merge two saved A_RED models.\n"
+                "A is the base model; B is merged into / with A.\n"
+                "Same feature extractor / embedding dim required."
+            ),
+            justify="left",
+        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, pad))
+
+        # --- Model A ---
+        ttk.Label(frm, text="Model A (base):").grid(row=1, column=0, sticky="w")
+        ent_a = ttk.Entry(frm, textvariable=path_a_var, width=48)
+        ent_a.grid(row=1, column=1, sticky="ew", padx=pad)
+        def _browse_a():
+            p = filedialog.askopenfilename(
+                parent=dlg, title="Select model A", filetypes=[("Pickle", "*.pkl")]
+            )
+            if p:
+                path_a_var.set(p)
+                use_session_var.set(False)
+        ttk.Button(frm, text="Browse…", command=_browse_a).grid(row=1, column=2)
+
+        session_cb = ttk.Checkbutton(
+            frm,
+            text="Use current session as Model A",
+            variable=use_session_var,
+        )
+        session_cb.grid(row=2, column=1, sticky="w", pady=(0, pad))
+        if not getattr(self.controller, "ared_adapter", None):
+            session_cb.state(["disabled"])
+            use_session_var.set(False)
+
+        # --- Model B ---
+        ttk.Label(frm, text="Model B:").grid(row=3, column=0, sticky="w")
+        ent_b = ttk.Entry(frm, textvariable=path_b_var, width=48)
+        ent_b.grid(row=3, column=1, sticky="ew", padx=pad)
+        def _browse_b():
+            p = filedialog.askopenfilename(
+                parent=dlg, title="Select model B", filetypes=[("Pickle", "*.pkl")]
+            )
+            if p:
+                path_b_var.set(p)
+        ttk.Button(frm, text="Browse…", command=_browse_b).grid(row=3, column=2)
+
+        # --- Strategy ---
+        strat_frame = ttk.LabelFrame(frm, text="Merge strategy")
+        strat_frame.grid(row=4, column=0, columnspan=3, sticky="ew", pady=pad)
+        strategies = [
+            ("squish", "Squish — double buffer, keep all points from both"),
+            ("ingest", "Ingest — rebuild A, stream B through A_RED (query-aware)"),
+            ("interleave", "Interleave — alternate A/B into a fresh model"),
+        ]
+        for i, (val, label) in enumerate(strategies):
+            ttk.Radiobutton(
+                strat_frame, text=label, value=val, variable=strategy_var
+            ).grid(row=i, column=0, sticky="w", padx=pad, pady=2)
+
+        # --- Output / apply ---
+        ttk.Label(frm, text="Save merged to (optional):").grid(row=5, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=out_var, width=48).grid(row=5, column=1, sticky="ew", padx=pad)
+        def _browse_out():
+            p = filedialog.asksaveasfilename(
+                parent=dlg,
+                defaultextension=".pkl",
+                title="Save merged model",
+                filetypes=[("Pickle", "*.pkl")],
+            )
+            if p:
+                out_var.set(p)
+        ttk.Button(frm, text="Browse…", command=_browse_out).grid(row=5, column=2)
+
+        ttk.Checkbutton(
+            frm,
+            text="Apply merged model to current session",
+            variable=apply_var,
+        ).grid(row=6, column=1, sticky="w", pady=pad)
+
+        frm.columnconfigure(1, weight=1)
+
+        btn_row = ttk.Frame(frm)
+        btn_row.grid(row=7, column=0, columnspan=3, sticky="e", pady=(pad, 0))
+
+        def _do_merge():
+            from .model_merge import AREDModelMerger, load_ared_state
+
+            strategy = strategy_var.get().strip().lower()
+            path_b = path_b_var.get().strip()
+            if not path_b:
+                messagebox.showerror("Merge ARED Models", "Please select Model B.", parent=dlg)
+                return
+
+            try:
+                other = load_ared_state(path_b)
+            except Exception as e:
+                messagebox.showerror(
+                    "Merge ARED Models", f"Failed to load Model B:\n{e}", parent=dlg
+                )
+                return
+
+            try:
+                if use_session_var.get():
+                    if not self.controller.ared_adapter:
+                        messagebox.showerror(
+                            "Merge ARED Models",
+                            "No active session model to use as A.",
+                            parent=dlg,
+                        )
+                        return
+                    base = self.controller.ared_adapter.to_state()
+                else:
+                    path_a = path_a_var.get().strip()
+                    if not path_a:
+                        messagebox.showerror(
+                            "Merge ARED Models",
+                            "Please select Model A, or enable 'Use current session'.",
+                            parent=dlg,
+                        )
+                        return
+                    base = load_ared_state(path_a)
+            except Exception as e:
+                messagebox.showerror(
+                    "Merge ARED Models", f"Failed to load Model A:\n{e}", parent=dlg
+                )
+                return
+
+            try:
+                # Prefer current ARED config as template (merge/forgetting flags, etc.)
+                template = getattr(self.config, "ared", None)
+                merger = AREDModelMerger(template=template)
+                result = merger.merge(base, other, strategy=strategy)
+            except Exception as e:
+                messagebox.showerror(
+                    "Merge ARED Models", f"Merge failed:\n{e}", parent=dlg
+                )
+                return
+
+            out_path = out_var.get().strip()
+            if out_path:
+                try:
+                    result.adapter.save_state(out_path)
+                except Exception as e:
+                    messagebox.showerror(
+                        "Merge ARED Models",
+                        f"Merged OK but failed to save:\n{e}",
+                        parent=dlg,
+                    )
+                    return
+
+            if apply_var.get():
+                # Attach label store / FE so the session stays usable after merge.
+                if self.label_store:
+                    result.adapter.set_label_store(self.label_store)
+                fe = getattr(self.controller, "_last_feature_extractor", None)
+                if fe is not None:
+                    result.adapter.set_feature_extractor(fe)
+                # Restore provider if the controller already had a labeling hook.
+                old = getattr(self.controller, "ared_adapter", None)
+                if old is not None and getattr(old, "_label_provider", None):
+                    result.adapter.set_label_provider(old._label_provider)
+                self.controller.ared_adapter = result.adapter
+                self._refresh_class_list()
+                self.controller.stats["ared_clusters"] = result.adapter.num_clusters
+                self.controller.stats["ared_known_labels"] = result.adapter.num_known_labels
+                self._update_stats_display(self.controller.stats)
+                self.status_var.set(
+                    f"Merged models ({result.strategy_name}): "
+                    f"{result.points_accepted} buffer pts, "
+                    f"{result.summary.get('num_clusters', '?')} clusters."
+                )
+
+            messagebox.showinfo("Merge ARED Models", result.pretty(), parent=dlg)
+            dlg.destroy()
+
+        ttk.Button(btn_row, text="Cancel", command=dlg.destroy).pack(side="right", padx=pad)
+        ttk.Button(btn_row, text="Merge", command=_do_merge).pack(side="right")
+
+        # Reasonable default size
+        try:
+            dlg.update_idletasks()
+            dlg.minsize(int(520 * s), int(360 * s))
+        except Exception:
+            pass
 
     def _label_lookup_from_store(self, emb):
         if self.label_store:

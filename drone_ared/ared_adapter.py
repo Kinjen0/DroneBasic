@@ -179,13 +179,23 @@ def _make_large_dummy_oracle(max_classes: int = 300) -> _OriginalOracle:
 
 @dataclass
 class AREDState:
-    """Serializable snapshot for 'Save ARED Model' feature."""
+    """Serializable snapshot for 'Save ARED Model' feature.
+
+    Cluster structure is *not* pickled. On load we rebuild by replaying
+    ``labeled_points`` through A/RED (same path as a warm-start).
+
+    Optional fields below are backward-compatible: older pickles without them
+    still load (defaults apply).
+    """
     kappa: float
     qs_var: int
     k_comp_pts: int
     l_buf_size: int
     labeled_points: List[Dict[str, Any]] = field(default_factory=list)  # each: {emb, label, relevant}
-    # We store only what is needed to replay. Cluster keys are re-created on replay.
+    # Optional metadata (populated on newer saves; safe to ignore when missing)
+    emb_dim: Optional[int] = None
+    smart_forgetting_var: Optional[Tuple[int, float]] = None
+    merge_meta: Optional[Dict[str, Any]] = None  # provenance after a model merge
 
 
 class AREDAdapter:
@@ -352,6 +362,27 @@ class AREDAdapter:
 
                 is_peek = (call_num == 1 and self.num_points_processed > 0)
 
+                # Model-merge donor path (ingest / interleave strategies):
+                # A/RED still decides whether to query. On a *real* query we answer with
+                # the donor model's saved (label, relevant). Peeks stay provisional so we
+                # never force a label into the buffer without an A/RED query decision.
+                if meta and meta.get("merge_donor") and not is_peek:
+                    label = meta.get("label", f"donor_{_abs_index}")
+                    rel = bool(meta.get("relevant", False))
+                    if is_control_label(label):
+                        raise LabelCancelled(f"merge_donor_control_label:{label}")
+                    was_queried = True
+                    obtained_label = label
+                    obtained_rel = rel
+                    self.oracle.y[_abs_index] = [label, rel]  # type: ignore
+                    self.discovered_labels.add(label)
+                    self.query_counts[label] = self.query_counts.get(label, 0) + 1
+                    vprint(
+                        f"[ARED]   -> MERGE_DONOR real query: label '{label}' "
+                        f"(relevant={rel}) for abs_idx={_abs_index}"
+                    )
+                    return label, rel
+
                 # Mark that A/RED decided this point needs a label query (for "user labels needed"
                 # and for QP/RR). This must be counted EVEN IF the cache or exact DB satisfies it.
                 # The cache is only for performance/testing convenience; the query decision itself
@@ -443,6 +474,15 @@ class AREDAdapter:
             self.oracle.answer_query = _interactive_answer  # type: ignore
 
             cancelled_reason: Optional[str] = None
+            # Track buffer occupancy so replay can force-insert if A_RED skipped
+            # the query branch (non-anomalous / not near-relevant). Saved models only
+            # contain previously labeled points; warm-start must restore all of them.
+            buf_count_before = 0
+            try:
+                buf_count_before = int(self.ared.l_buf.data_circular_buffer.count)
+            except Exception:
+                buf_count_before = 0
+
             try:
                 if self.num_points_processed == 0:
                     self.ared.process_first_point(emb)
@@ -480,6 +520,40 @@ class AREDAdapter:
                     "num_clusters": len(self.ared.subspace_partition.cluster_dict),
                     "num_known_labels": len(self.ared.subspace_partition.set_of_known_labels),
                 }
+
+            # Replay warm-start: if A_RED did not take the query branch, the labeled
+            # point never entered l_buf. Force-insert via add_labeled_variant so
+            # save/load and squish-merge restore the full labeled multiset.
+            # (Does not change live streaming — only meta["replay"] paths.)
+            if (
+                meta
+                and meta.get("replay")
+                and obtained_label is not None
+                and is_persistable_label(obtained_label)
+            ):
+                try:
+                    buf_count_after = int(self.ared.l_buf.data_circular_buffer.count)
+                except Exception:
+                    buf_count_after = buf_count_before
+                if buf_count_after <= buf_count_before:
+                    try:
+                        if hasattr(self.ared, "add_labeled_variant"):
+                            self.ared.add_labeled_variant(
+                                emb, obtained_label, bool(obtained_rel)
+                            )
+                            vprint(
+                                f"[ARED]   -> REPLAY force-insert via add_labeled_variant "
+                                f"label='{obtained_label}' (A_RED skipped query branch)"
+                            )
+                        else:
+                            vprint(
+                                "[ARED]   -> REPLAY warning: point not in buffer and "
+                                "add_labeled_variant unavailable"
+                            )
+                    except Exception as e:
+                        print(
+                            f"[AREDAdapter] Replay force-insert failed (non-fatal): {e}"
+                        )
 
             # Back-fill the label we (or ARED) decided for this abs_idx so later peeks are happy
             if obtained_label is not None and is_persistable_label(obtained_label):
@@ -549,12 +623,14 @@ class AREDAdapter:
     # ------------------------------------------------------------------
     # Model save / load (replay based - robust & no pickle of ARED internals)
     # ------------------------------------------------------------------
-    def save_state(self, path: str | Path) -> None:
+    def export_labeled_points(self) -> List[Dict[str, Any]]:
         """
-        Capture enough state to recreate an equivalent ARED on similar data.
-        We export the *labeled* points that are currently in the live buffer.
+        Walk the live labeled buffer and return a list of
+        ``{emb, label, relevant}`` dicts (oldest → newest).
+
+        Used by save_state and by model-merge strategies. Does not mutate ARED.
         """
-        labeled_points = []
+        labeled_points: List[Dict[str, Any]] = []
         try:
             lock = getattr(self, "_lock", None)
             ctx = lock if lock is not None else contextlib.nullcontext()
@@ -566,46 +642,66 @@ class AREDAdapter:
                     rel = l_buf.relevance_circular_buffer.get(i)
                     if emb is not None:
                         labeled_points.append({
-                            "emb": np.asarray(emb, dtype=np.float32),
+                            "emb": np.asarray(emb, dtype=np.float32).copy(),
                             "label": str(label),
                             "relevant": bool(rel),
                         })
         except Exception as e:
-            print(f"[AREDAdapter] Warning during save_state buffer walk: {e}")
+            print(f"[AREDAdapter] Warning during export_labeled_points buffer walk: {e}")
+        return labeled_points
 
-        state = AREDState(
-            kappa=self.ared.kappa,
-            qs_var=self.ared.QS_VAR,
-            k_comp_pts=self.ared.K_COMP_PTS,
-            l_buf_size=self.ared.l_buf.buffer_size,
+    def to_state(self) -> AREDState:
+        """Build an in-memory ``AREDState`` snapshot of the current adapter."""
+        labeled_points = self.export_labeled_points()
+        emb_dim: Optional[int] = None
+        if labeled_points:
+            try:
+                emb_dim = int(np.asarray(labeled_points[0]["emb"]).reshape(-1).shape[0])
+            except Exception:
+                emb_dim = None
+        sf = getattr(self.config, "smart_forgetting_var", None)
+        return AREDState(
+            kappa=float(self.ared.kappa),
+            qs_var=int(self.ared.QS_VAR),
+            k_comp_pts=int(self.ared.K_COMP_PTS),
+            l_buf_size=int(self.ared.l_buf.buffer_size),
             labeled_points=labeled_points,
+            emb_dim=emb_dim,
+            smart_forgetting_var=tuple(sf) if sf is not None else None,
+            merge_meta=None,
         )
+
+    def save_state(self, path: str | Path) -> None:
+        """
+        Capture enough state to recreate an equivalent ARED on similar data.
+        We export the *labeled* points that are currently in the live buffer.
+        """
+        state = self.to_state()
         with open(path, "wb") as f:
             pickle.dump(state, f)
-        print(f"[AREDAdapter] Saved ARED state with {len(labeled_points)} labeled points -> {path}")
+        print(
+            f"[AREDAdapter] Saved ARED state with {len(state.labeled_points)} "
+            f"labeled points -> {path}"
+        )
 
-    def load_state(self, path: str | Path, label_lookup: Optional[Callable[[np.ndarray], Tuple[str, bool]]] = None) -> None:
+    def rebuild_from_state(self, state: AREDState) -> None:
         """
-        Create a fresh ARED and replay previously labeled points.
-        If a PersistentLabelStore is attached (via set_label_store), it will be
-        consulted automatically for every replayed point (and new points later).
+        Create a fresh ARED and replay previously labeled points from ``state``.
 
-        This implements the "A_RED model saving" requirement: warm-start the
-        internal clusters without forcing the user to re-label everything.
+        Preserves label store / provider / feature extractor attachments across
+        the re-init. Query counts reset (warm-start is for clustering, not
+        "this run" metrics).
         """
-        with open(path, "rb") as f:
-            state: AREDState = pickle.load(f)
-
         # Preserve attachments across re-init
         old_store = getattr(self, "_label_store", None)
         old_provider = getattr(self, "_label_provider", None)
         old_fe = getattr(self, "_feature_extractor", None)
 
-        # Reset query counts for the new run (the loaded state is a warm-start for clustering,
-        # but A/RED query counts for "this run" should start fresh).
-        self.query_counts = {}
+        # Prefer saved smart-forgetting when present; else keep current config.
+        sf = getattr(state, "smart_forgetting_var", None)
+        if sf is None:
+            sf = getattr(self.config, "smart_forgetting_var", (3, 0.01))
 
-        # Re-create adapter with (approximately) same hyperparams
         new_cfg = type(self.config)(  # type: ignore
             kappa=state.kappa,
             l_buf_size=state.l_buf_size,
@@ -614,39 +710,89 @@ class AREDAdapter:
             data_aug_var=getattr(self.config, "data_aug_var", (0, (0, 0))),
             nghbhood_merge=getattr(self.config, "nghbhood_merge", True),
             singleton_merge=getattr(self.config, "singleton_merge", True),
-            smart_forgetting_var=getattr(self.config, "smart_forgetting_var", (3, 0.01)),
+            smart_forgetting_var=sf,
             verbose_flags=getattr(self.config, "verbose_flags", [0]),
             data_augmentation_enabled=getattr(self.config, "data_augmentation_enabled", False),
             augmentation_rotations=getattr(self.config, "augmentation_rotations", [90, 180, 270]),
         )
 
-        # Fresh instance
-        self.__init__(new_cfg)  # re-runs construction + patches
+        # Fresh instance (re-runs construction + open-world patches)
+        self.__init__(new_cfg)
 
         if old_store:
             self.set_label_store(old_store)
-        # Do not restore provider yet if we want to avoid it during replay;
-        # the "replay" special case in _interactive_answer protects us anyway.
-        # Restore after so that subsequent real processing uses it.
         if old_provider:
             self.set_label_provider(old_provider)
-
         if old_fe:
             self.set_feature_extractor(old_fe)
 
-        # If we have a label store attached, the process() method will use it
-        # automatically. We can still feed the old points so clusters are rebuilt.
-        print(f"[AREDAdapter] Replaying {len(state.labeled_points)} points from saved state...")
+        points = list(getattr(state, "labeled_points", None) or [])
+        print(f"[AREDAdapter] Replaying {len(points)} points from state...")
 
-        for item in state.labeled_points:
+        for item in points:
             self.process(
                 item["emb"],
                 tile_image=None,
-                meta={"replay": True, "label": item["label"], "relevant": item["relevant"]}
+                meta={
+                    "replay": True,
+                    "label": item["label"],
+                    "relevant": item["relevant"],
+                },
             )
 
-        print(f"[AREDAdapter] Loaded & replayed ARED state from {path}. "
-              f"Current known labels: {self.get_known_labels()}")
+        print(
+            f"[AREDAdapter] Rebuilt ARED from state. "
+            f"Current known labels: {self.get_known_labels()}"
+        )
+
+    def load_state(
+        self,
+        path: str | Path,
+        label_lookup: Optional[Callable[[np.ndarray], Tuple[str, bool]]] = None,
+    ) -> None:
+        """
+        Load a pickled ``AREDState`` and rebuild via replay.
+
+        ``label_lookup`` is accepted for API compatibility with older callers;
+        replay uses ``meta["replay"]`` and does not require the lookup.
+        """
+        del label_lookup  # unused; kept for backward-compatible signature
+        with open(path, "rb") as f:
+            state: AREDState = pickle.load(f)
+        self.rebuild_from_state(state)
+        print(f"[AREDAdapter] Loaded & replayed ARED state from {path}.")
+
+    # ------------------------------------------------------------------
+    # Model merge (delegates to model_merge; keeps adapter as the façade)
+    # ------------------------------------------------------------------
+    def merge_with_state(
+        self,
+        other: "AREDState",
+        strategy: str = "squish",
+        **opts: Any,
+    ):
+        """
+        Merge this adapter's current model (as base A) with another ``AREDState``.
+
+        Returns a ``MergeResult`` (see ``drone_ared.model_merge``). Does not
+        mutate this adapter unless the caller replaces it with ``result.adapter``.
+        """
+        from .model_merge import AREDModelMerger
+
+        base = self.to_state()
+        return AREDModelMerger().merge(base, other, strategy=strategy, **opts)
+
+    def merge_with_file(
+        self,
+        path: str | Path,
+        strategy: str = "squish",
+        **opts: Any,
+    ):
+        """Merge this adapter (base A) with a saved model pickle (B)."""
+        from .model_merge import load_ared_state
+
+        other = load_ared_state(path)
+        return self.merge_with_state(other, strategy=strategy, **opts)
 
     # ------------------------------------------------------------------
     # Convenience for GUI / inspection

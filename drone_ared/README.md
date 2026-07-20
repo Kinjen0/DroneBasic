@@ -34,7 +34,37 @@ python run_drone_ared.py
 - Text entry + "Relevant" checkbox for creating brand new classes.
 - Keyboard friendly (Return, Escape, filter box).
 - "Save ARED Model" / "Load ARED Model" buttons + menu items (optional, off by default).
+- **Merge ARED Models** (File menu + toolbar): combine two saved models with one of three strategies.
 - Live stats, class list, pause/resume, etc.
+
+## Model merging
+
+Saved A_RED models are pickles of labeled buffer points + hyperparams
+(`AREDState`). Merging never edits `A_REDimplementation/`; it rebuilds via
+`AREDAdapter.process` (same idea as Load).
+
+| Strategy | Behavior |
+|----------|----------|
+| **Squish** | Enlarge buffer (≈ 2×), force-replay **all** points from A then B. True buffer union. |
+| **Ingest** | Rebuild A, then stream B through live A_RED. B’s label is used **only if** A_RED queries. Smart forgetting applies when the buffer is full. |
+| **Interleave** | Fresh model; alternate points from A and B (query-aware, like ingest). |
+
+Notes:
+
+- **Order matters** (A-then-B ≠ B-then-A). A is always the “base” for hyperparams.
+- Models must share the **same embedding dimension** (same DINO / tile setup).
+- GUI: stop any running stream first → **File → Merge ARED Models…** (or **Merge Models** button).
+- Programmatic:
+
+```python
+from drone_ared.model_merge import AREDModelMerger
+
+result = AREDModelMerger().merge_files("model_a.pkl", "model_b.pkl", strategy="squish")
+print(result.pretty())
+result.adapter.save_state("merged.pkl")
+```
+
+Headless tests: `python -m unittest drone_ared.tests.test_model_merge -v`
 
 ## Expandability
 
@@ -55,6 +85,7 @@ All labels are stored with exact (video, frame, tile position, size). The system
   - `feature_extractor.py` — swap DINOv3, add projector, etc.
   - `label_store.py` — replace with FAISS / sqlite-vss
   - `ared_adapter.py` — the only place that knows about the original A_RED
+  - `model_merge.py` — Strategy-pattern merge modes (squish / ingest / interleave)
   - `gui.py` — add panels, export buttons, etc.
 - `PipelineConfig` is a tree of dataclasses → easy to persist or expose more controls.
 
