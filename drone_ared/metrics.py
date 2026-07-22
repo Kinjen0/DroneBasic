@@ -24,6 +24,7 @@ Random baseline: QP_RDM ≈ Relevant_Rate (fraction of points from relevant clas
 from __future__ import annotations
 from typing import List, Dict, Tuple, Set, Any, Optional
 from collections import defaultdict
+import os
 import random
 
 from .label_sentinels import is_control_label, is_persistable_label
@@ -33,12 +34,42 @@ from .label_sentinels import is_control_label, is_persistable_label
 # Stable tile identity
 # -----------------------------------------------------------------------------
 
+def normalize_video_key(video: Any) -> str:
+    """
+    Portable video identity for metrics keys: **filename only**.
+
+    Matches ``TileAnnotationDB._normalize_video_path`` so live pipeline keys
+    (often absolute paths) join correctly with DB annotations (basename).
+    """
+    if video is None:
+        return ""
+    try:
+        s = str(video).strip().replace("\\", "/")
+        name = os.path.basename(s)
+        return name if name else s
+    except Exception:
+        return str(video) if video is not None else ""
+
+
+def normalize_tile_key(key: Tuple) -> Tuple:
+    """Normalize the video component of a tile-key tuple to basename."""
+    if not key:
+        return key
+    try:
+        parts = list(key)
+        if parts:
+            parts[0] = normalize_video_key(parts[0])
+        return tuple(parts)
+    except Exception:
+        return key
+
+
 def make_tile_key(ann: Dict[str, Any]) -> Tuple:
     """
     Create a stable hashable key for a tile from annotation or meta dict.
-    Matches the identity used in TileAnnotationDB and Tile objects.
+    Matches the identity used in TileAnnotationDB (filename-only video key).
     """
-    v = ann.get("video_path") or ann.get("video") or ""
+    v = normalize_video_key(ann.get("video_path") or ann.get("video") or "")
     f = int(ann.get("abs_frame", ann.get("frame", -1)))
     r = int(ann.get("tile_row", ann.get("row", -1)))
     c = int(ann.get("tile_col", ann.get("col", -1)))
@@ -130,7 +161,9 @@ def compute_query_metrics(
     if total_points is None:
         total_points = len(should_query) or 1
 
-    actual_set = set(actual_queried)
+    # Normalize so full-path pipeline keys match basename DB / should keys.
+    actual_set = {normalize_tile_key(k) for k in (actual_queried or [])}
+    should_query = {normalize_tile_key(k): v for k, v in (should_query or {}).items()}
 
     tp = fp = fn = 0
     relevant_tp = relevant_fn = 0   # for recall over relevant points only
@@ -265,8 +298,11 @@ def evaluate_from_annotations_and_queries(
          "annotation_db": "drone_tile_annotations.db", "dino_model": "...", ...}
         These are attached to the result and surfaced in the detailed audit.
     """
+    # Normalize all identities to filename-only video keys so absolute paths from the
+    # live pipeline match basename keys stored in the annotation DB.
+    actual_queried_keys = [normalize_tile_key(k) for k in (actual_queried_keys or [])]
     if processed_keys:
-        proc_set = set(processed_keys)
+        proc_set = {normalize_tile_key(k) for k in processed_keys}
         annotations = [a for a in annotations if make_tile_key(a) in proc_set]
 
     should = compute_should_query_from_annotations(annotations)
@@ -544,11 +580,14 @@ def summarize_for_checkpoint(result: Dict[str, Any]) -> Dict[str, Any]:
 # -----------------------------------------------------------------------------
 
 def tile_identity_from_meta(meta: Dict[str, Any], tile: Any = None) -> Optional[Tuple]:
-    """Create a stable key from the meta dict passed around the pipeline."""
+    """Create a stable key from the meta dict passed around the pipeline.
+
+    Video component is normalized to filename only (same as the annotation DB).
+    """
     if not meta:
         return None
     try:
-        v = meta.get("video_path") or meta.get("video") or ""
+        v = normalize_video_key(meta.get("video_path") or meta.get("video") or "")
         f = int(meta.get("abs_frame", meta.get("frame", -1)))
         r = int(meta.get("row", meta.get("tile_row", -1)))
         c = int(meta.get("col", meta.get("tile_col", -1)))

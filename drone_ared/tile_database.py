@@ -4,7 +4,8 @@ TileAnnotationDB
 Exact-identity persistent store for human-provided tile labels.
 
 Primary key is the combination of:
-- video_path (stable identifier for the source video)
+- video_path (stored as the **video filename only**, e.g. ``DJI_0018.MP4``, so DBs
+  can be shared across machines without depending on absolute directory paths)
 - abs_frame (absolute 0-based frame index from start of the *video file*, independent of stride)
 - tile_row, tile_col (position in the grid for that frame)
 - tile_width, tile_height (exact resolution of the crop)
@@ -14,6 +15,7 @@ This allows:
 - Editing / correcting past labels.
 - Growing a high-quality database of labeled examples over time (multiple videos, multiple passes).
 - "Edit mode" vs normal: in normal runs, known identities are auto-supplied without bothering the user.
+- Sharing annotation DBs between users/systems that keep the same video filenames.
 
 We deliberately do *not* store the pixel data of tiles (storage cost). When review/editing is needed,
 we re-decode the specific frame from the original video file and re-crop the tile on demand.
@@ -25,6 +27,7 @@ Storage: sqlite3 (stdlib) + optional embedding bytes. Very lightweight per entry
 """
 
 from __future__ import annotations
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -57,6 +60,12 @@ class TileAnnotationDB:
         self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL;")  # better concurrency / durability for edits
         self._create_tables()
+
+        # Older DBs stored absolute paths; rewrite keys to filename-only once.
+        try:
+            self._migrate_video_paths_to_basename()
+        except Exception as e:
+            print(f"[TileDB] Note: video-path basename migration skipped: {e}")
 
         # Remove any historically poisoned control-sentinel rows (e.g. __STOPPED__)
         # so they cannot auto-answer future A/RED queries via exact DB hit.
@@ -494,7 +503,9 @@ class TileAnnotationDB:
             WHERE video_path=? AND abs_frame=? AND tile_row=? AND tile_col=?
                   AND tile_width=? AND tile_height=?
         """
-        params = list(key.to_tuple()[:6])
+        # Use normalized filename key (not the raw path from to_tuple).
+        t = key.to_tuple()
+        params = [vpath, t[1], t[2], t[3], t[4], t[5]]
         if key.stride_x is not None or key.stride_y is not None:
             sql += " AND ( (stride_x IS NULL AND stride_y IS NULL) OR (stride_x=? AND stride_y=?) )"
             params.extend([key.stride_x, key.stride_y])
@@ -641,11 +652,55 @@ class TileAnnotationDB:
     # ------------------------------------------------------------------
 
     def _normalize_video_path(self, path: str) -> str:
-        """Use absolute path for stability across runs (user must keep videos in consistent locations)."""
+        """
+        Stable video identity for DB keys: **filename only** (not full path).
+
+        Using the basename (e.g. ``DJI_0018.MP4``) lets annotation DBs be shared
+        across machines/users as long as video *filenames* match. Callers may still
+        pass absolute paths when opening files; only the DB key is normalized here.
+        """
+        if path is None:
+            return ""
         try:
-            return str(Path(path).resolve())
+            # Normalize mixed Windows/Unix separators, then take the final component.
+            s = str(path).strip().replace("\\", "/")
+            name = os.path.basename(s)
+            return name if name else s
         except Exception:
             return str(path)
+
+    def _migrate_video_paths_to_basename(self) -> None:
+        """One-time rewrite of legacy absolute/relative path keys → filename only.
+
+        Safe to call every open: rows already stored as bare filenames are skipped.
+        If two different full paths collapse to the same basename and would violate
+        the primary key, those rows are left unchanged and a warning is printed.
+        """
+        cur = self.conn.cursor()
+        cur.execute("SELECT DISTINCT video_path FROM annotations")
+        distinct = [r[0] for r in cur.fetchall() if r and r[0]]
+        migrated_rows = 0
+        for vp in distinct:
+            base = self._normalize_video_path(vp)
+            if not base or base == vp:
+                continue
+            try:
+                cur.execute(
+                    "UPDATE annotations SET video_path=? WHERE video_path=?",
+                    (base, vp),
+                )
+                migrated_rows += int(cur.rowcount or 0)
+            except sqlite3.IntegrityError:
+                print(
+                    f"[TileDB] Basename migration skipped for conflict: "
+                    f"{vp!r} -> {base!r}"
+                )
+        if migrated_rows:
+            self.conn.commit()
+            print(
+                f"[TileDB] Migrated {migrated_rows} annotation row(s) "
+                f"to filename-only video keys (portable across systems)."
+            )
 
     def close(self):
         try:
@@ -701,13 +756,99 @@ class TileAnnotationDB:
 
 
 # ------------------------------------------------------------------
+# Resolve filename-only DB keys → openable video paths (for review UIs)
+# ------------------------------------------------------------------
+
+def resolve_video_file(
+    name_or_path: str,
+    *,
+    search_paths: Optional[List[str | Path]] = None,
+    search_dirs: Optional[List[str | Path]] = None,
+) -> Optional[str]:
+    """
+    Map a DB video key (often just a filename like ``DJI_0018.MP4``) to a real
+    filesystem path that ``cv2.VideoCapture`` can open.
+
+    Search order:
+      1. ``name_or_path`` itself if it already exists on disk
+      2. Any path in ``search_paths`` whose basename matches
+      3. ``basename`` joined under each directory in ``search_dirs``
+
+    Returns an absolute path string, or None if nothing is found.
+    """
+    if not name_or_path:
+        return None
+
+    raw = str(name_or_path).strip()
+    if not raw:
+        return None
+
+    # 1) Already a usable path?
+    try:
+        p = Path(raw)
+        if p.is_file():
+            return str(p.resolve())
+    except Exception:
+        pass
+
+    # Basename used as the portable DB key
+    try:
+        base = os.path.basename(raw.replace("\\", "/"))
+    except Exception:
+        base = raw
+    if not base:
+        return None
+
+    # 2) Known full paths (e.g. videos loaded in the main GUI this session)
+    for cand in search_paths or []:
+        try:
+            cp = Path(cand)
+            if cp.is_file() and cp.name == base:
+                return str(cp.resolve())
+            # Also accept exact string match after normalize
+            if os.path.basename(str(cand).replace("\\", "/")) == base and cp.is_file():
+                return str(cp.resolve())
+        except Exception:
+            continue
+
+    # 3) Look under candidate directories
+    seen_dirs = set()
+    for d in search_dirs or []:
+        try:
+            dp = Path(d)
+            if not dp.is_dir():
+                continue
+            key = str(dp.resolve())
+            if key in seen_dirs:
+                continue
+            seen_dirs.add(key)
+            hit = dp / base
+            if hit.is_file():
+                return str(hit.resolve())
+        except Exception:
+            continue
+
+    return None
+
+
+# ------------------------------------------------------------------
 # Small helper to re-materialize a tile image from source video (no stored pixels)
 # ------------------------------------------------------------------
 
-def extract_tile_from_video(video_path: str, abs_frame: int, bbox: Tuple[int, int, int, int]) -> Optional["Image.Image"]:
+def extract_tile_from_video(
+    video_path: str,
+    abs_frame: int,
+    bbox: Tuple[int, int, int, int],
+    *,
+    search_paths: Optional[List[str | Path]] = None,
+    search_dirs: Optional[List[str | Path]] = None,
+) -> Optional["Image.Image"]:
     """
     Re-decode a specific frame from the video file and return the exact tile crop as PIL Image.
     Used for review/edit UI so we never need to store the actual image data.
+
+    ``video_path`` may be a full path or a filename-only DB key. When it is only a
+    name, pass ``search_paths`` / ``search_dirs`` (or rely on callers to resolve first).
 
     Returns None if seek/read fails (common on some video containers or very large seeks).
     Note: frame-accurate seeking is not guaranteed for all compressed videos, but is usually
@@ -719,7 +860,16 @@ def extract_tile_from_video(video_path: str, abs_frame: int, bbox: Tuple[int, in
     except ImportError:
         return None
 
-    cap = cv2.VideoCapture(video_path)
+    openable = resolve_video_file(
+        video_path, search_paths=search_paths, search_dirs=search_dirs
+    )
+    if openable is None:
+        # Last resort: try the raw string (legacy full-path DBs / cwd-relative names)
+        openable = str(video_path) if video_path else None
+    if not openable:
+        return None
+
+    cap = cv2.VideoCapture(openable)
     if not cap.isOpened():
         return None
 

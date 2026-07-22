@@ -31,7 +31,7 @@ from .config import PipelineConfig, GUIConfig
 from .pipeline import DroneAREDController, LabelRequest
 from .label_store import PersistentLabelStore
 from .ared_adapter import AREDAdapter
-from .tile_database import TileAnnotationDB, extract_tile_from_video
+from .tile_database import TileAnnotationDB, extract_tile_from_video, resolve_video_file
 from .annotation_manager import AnnotationManager
 from .annotation_domain import TileKey, AnnotationFilter
 from .tile_database import TileAnnotationDB
@@ -2581,6 +2581,34 @@ class LabelReviewWindow(tk.Toplevel):
         self.status_var = tk.StringVar(value="")
         ttk.Label(right, textvariable=self.status_var, relief="sunken").pack(fill="x", side="bottom", pady=4)
 
+    def _video_search_context(self) -> Tuple[List[str], List[str]]:
+        """Known full paths + dirs used to resolve filename-only DB keys to openable files."""
+        paths: List[str] = []
+        dirs: List[str] = []
+        try:
+            parent = getattr(self, "master", None)
+            cfg = getattr(parent, "config", None) if parent is not None else None
+            for p in list(getattr(cfg, "video_paths", None) or []):
+                paths.append(str(p))
+                try:
+                    dirs.append(str(Path(p).parent))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            if getattr(self, "tile_db", None) is not None:
+                dirs.append(str(Path(self.tile_db.db_path).parent))
+        except Exception:
+            pass
+        for d in ("Videos", "videos", "."):
+            dirs.append(str(Path(d).resolve()) if Path(d).exists() else d)
+        return paths, dirs
+
+    def _resolve_video_for_open(self, name_or_path: str) -> Optional[str]:
+        paths, dirs = self._video_search_context()
+        return resolve_video_file(name_or_path, search_paths=paths, search_dirs=dirs)
+
     def _load_videos(self):
         vids = self.tile_db.list_videos()
         self.video_combo['values'] = vids
@@ -2592,6 +2620,8 @@ class LabelReviewWindow(tk.Toplevel):
         v = self.video_var.get()
         if not v:
             return
+        # DB keys are filenames; cache an openable path for tile re-extraction.
+        self._openable_video = self._resolve_video_for_open(v)
         tw = th = sx = sy = None
         try:
             parent = getattr(self, 'master', None)
@@ -2635,7 +2665,19 @@ class LabelReviewWindow(tk.Toplevel):
         tw, th = ann["tile_width"], ann["tile_height"]
         bbox = (cx, cy, cx + tw, cy + th)
 
-        img = extract_tile_from_video(ann["video_path"], ann["abs_frame"], bbox)
+        # Prefer session-resolved openable path (filename-only DB keys need this).
+        openable = getattr(self, "_openable_video", None)
+        if not openable:
+            openable = self._resolve_video_for_open(ann.get("video_path") or "")
+            self._openable_video = openable
+        paths, dirs = self._video_search_context()
+        img = extract_tile_from_video(
+            openable or ann["video_path"],
+            ann["abs_frame"],
+            bbox,
+            search_paths=paths,
+            search_dirs=dirs,
+        )
         self.current_img = img
 
         self.label_var.set(ann["label"])
@@ -2644,7 +2686,13 @@ class LabelReviewWindow(tk.Toplevel):
         name = Path(ann["video_path"]).name
         self.info_var.set(f"{name}  frame={ann['abs_frame']}  pos=({ann['tile_row']},{ann['tile_col']})  size={tw}x{th}")
         self._display_image()
-        self.status_var.set("Loaded. Edit above and click Save Change.")
+        if img is None and not openable:
+            self.status_var.set(
+                f"Could not find video file for '{name}'. "
+                f"Load it in the main window or place it under Videos/."
+            )
+        else:
+            self.status_var.set("Loaded. Edit above and click Save Change.")
 
     def _display_image(self):
         if not self.current_img:
@@ -3153,6 +3201,66 @@ class MultiFrameLabelBrowser(tk.Toplevel):
                 pass
         self._viewport_update_pending = self.after(delay_ms, self._update_visible_cards)
 
+    def _video_search_context(self) -> Tuple[List[str], List[str]]:
+        """Gather known video paths + directories so filename-only DB keys can be opened."""
+        paths: List[str] = []
+        dirs: List[str] = []
+
+        def _add_path(p: str):
+            if not p:
+                return
+            paths.append(str(p))
+            try:
+                parent = str(Path(p).parent)
+                if parent:
+                    dirs.append(parent)
+            except Exception:
+                pass
+
+        try:
+            if self.main_window is not None and hasattr(self.main_window, "config"):
+                for p in list(getattr(self.main_window.config, "video_paths", None) or []):
+                    _add_path(str(p))
+        except Exception:
+            pass
+        try:
+            if self.controller is not None and hasattr(self.controller, "config"):
+                for p in list(getattr(self.controller.config, "video_paths", None) or []):
+                    _add_path(str(p))
+        except Exception:
+            pass
+        # Remember paths the user picked via "Browse any video file"
+        for p in list(getattr(self, "_known_video_paths", None) or []):
+            _add_path(str(p))
+
+        try:
+            if self.tile_db is not None:
+                dirs.append(str(Path(self.tile_db.db_path).parent))
+        except Exception:
+            pass
+        # Common project locations
+        for d in ("Videos", "videos", "."):
+            try:
+                dp = Path(d)
+                if dp.is_dir():
+                    dirs.append(str(dp.resolve()))
+            except Exception:
+                pass
+        return paths, dirs
+
+    def _resolve_video_for_open(self, name_or_path: str) -> Optional[str]:
+        paths, dirs = self._video_search_context()
+        hit = resolve_video_file(name_or_path, search_paths=paths, search_dirs=dirs)
+        if hit:
+            # Cache for later resolve / browse sessions
+            known = getattr(self, "_known_video_paths", None)
+            if known is None:
+                self._known_video_paths = []
+                known = self._known_video_paths
+            if hit not in known:
+                known.append(hit)
+        return hit
+
     def _load_videos(self):
         vids = self.tile_db.list_videos()
         self.video_combo['values'] = vids
@@ -3173,35 +3281,67 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         )
         if not path:
             return
+        # Remember full path; show basename in the combo when it matches a DB key.
+        known = getattr(self, "_known_video_paths", None)
+        if known is None:
+            self._known_video_paths = []
+            known = self._known_video_paths
+        if path not in known:
+            known.append(path)
         self.current_video = path
-        self.video_var.set(path)  # show the full path temporarily
-        # Treat as having no annotations initially
-        self.frame_to_anns = {}
-        # Force load which will compute strided frames using video metadata + stride
+        base = Path(path).name
+        # Prefer selecting the DB key (filename) if annotations exist under it
+        try:
+            db_vids = list(self.tile_db.list_videos() or [])
+        except Exception:
+            db_vids = []
+        if base in db_vids:
+            # Ensure combo can show it
+            vals = list(self.video_combo["values"] or [])
+            if base not in vals:
+                vals = [base] + vals
+                self.video_combo["values"] = vals
+            self.video_var.set(base)
+        else:
+            vals = list(self.video_combo["values"] or [])
+            if path not in vals and base not in vals:
+                vals = [path] + vals
+                self.video_combo["values"] = vals
+            self.video_var.set(path)
         self._load_annotations_for_video()
 
     def _load_annotations_for_video(self):
         v = self.video_var.get()
         if not v:
             return
-        self.current_video = v
+
+        # Resolve filename-only DB keys to a real openable path (cv2 needs a file on disk).
+        openable = self._resolve_video_for_open(v)
+        if openable is None and Path(v).is_file():
+            openable = str(Path(v).resolve())
+        self.current_video = openable or v  # openable for decode; v still used for DB (basename OK)
 
         # Always go through the helper so we read the live entry boxes the user just typed.
         tw, th = self._get_live_tile_size()
 
         # Debug so user can see what size the browser actually decided to use
         try:
-            print(f"[MultiFrameBrowser] Using tile size for annotations: {tw}x{th} (from live boxes if present)")
+            print(
+                f"[MultiFrameBrowser] Using tile size for annotations: {tw}x{th} "
+                f"(from live boxes if present); video_key={v!r} openable={openable!r}"
+            )
         except Exception:
             pass
 
         # Live stride from main window controls (critical for overlap)
         sx, sy = self._get_live_stride(tw, th)
+        # DB lookups always go through normalize → basename; full path or name both work.
+        db_key = v
         if self.annotation_manager:
-            self.annotation_manager.set_scope(video_path=v, tile_size=(tw, th) if tw else None, stride=(sx, sy) if (sx or sy) else None)
-            anns = self.annotation_manager.get_annotations(video=v, use_scope=True)
+            self.annotation_manager.set_scope(video_path=db_key, tile_size=(tw, th) if tw else None, stride=(sx, sy) if (sx or sy) else None)
+            anns = self.annotation_manager.get_annotations(video=db_key, use_scope=True)
         else:
-            anns = self.tile_db.get_annotations_for_video(v, tile_width=tw, tile_height=th,
+            anns = self.tile_db.get_annotations_for_video(db_key, tile_width=tw, tile_height=th,
                                                              stride_x=sx, stride_y=sy)
         self.frame_to_anns = {}
         for a in anns:
@@ -3227,14 +3367,15 @@ class MultiFrameLabelBrowser(tk.Toplevel):
 
         # Get total frames from video so we can show EVERY frame according to stride (not just annotated ones)
         total_frames = 0
-        try:
-            import cv2
-            cap = cv2.VideoCapture(v)
-            if cap.isOpened():
-                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-            cap.release()
-        except Exception:
-            total_frames = 0
+        if openable:
+            try:
+                import cv2
+                cap = cv2.VideoCapture(openable)
+                if cap.isOpened():
+                    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+                cap.release()
+            except Exception:
+                total_frames = 0
 
         if total_frames > 0:
             candidate_frames = list(range(0, total_frames, stride))
@@ -3280,10 +3421,19 @@ class MultiFrameLabelBrowser(tk.Toplevel):
                 pass
 
         shown = min(self._displayed_count, len(self.sorted_frames))
-        self.browser_status_var.set(
-            f"Loaded {len(self.sorted_frames)} frames (stride={stride}, total~{total_frames}) from {Path(v).name}. "
-            f"Virtualized: scroll freely. Only ~viewport cards materialized to avoid flicker/crashes."
-        )
+        if openable:
+            self.browser_status_var.set(
+                f"Loaded {len(self.sorted_frames)} frames (stride={stride}, total~{total_frames}) "
+                f"from {Path(openable).name}. "
+                f"Virtualized: scroll freely. Only ~viewport cards materialized to avoid flicker/crashes."
+            )
+        else:
+            self.browser_status_var.set(
+                f"Could not find video file for '{Path(v).name}' on disk — showing "
+                f"{len(self.sorted_frames)} labeled frame(s) only (no thumbnails). "
+                f"Use 'Browse any video file' or Load Videos in the main window "
+                f"(same filename), or place the file under Videos/."
+            )
         self._refresh_frame_strip()
 
         if self.sorted_frames:
@@ -4461,7 +4611,17 @@ class MultiFrameLabelBrowser(tk.Toplevel):
                 ann.get("crop_x", ann["tile_col"]*ann["tile_width"]) + ann["tile_width"],
                 ann.get("crop_y", ann["tile_row"]*ann["tile_height"]) + ann["tile_height"])
 
-        img = extract_tile_from_video(ann["video_path"], ann["abs_frame"], bbox)
+        paths, dirs = self._video_search_context()
+        openable = self.current_video if (self.current_video and Path(self.current_video).is_file()) else None
+        if not openable:
+            openable = self._resolve_video_for_open(ann.get("video_path") or "")
+        img = extract_tile_from_video(
+            openable or ann["video_path"],
+            ann["abs_frame"],
+            bbox,
+            search_paths=paths,
+            search_dirs=dirs,
+        )
 
         # Simple editor (reuse spirit of review, but quick)
         ed = tk.Toplevel(self)
