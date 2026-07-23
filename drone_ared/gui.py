@@ -1583,10 +1583,24 @@ class MainWindow:
                          + (", ".join(known_start) if known_start else "(none — cold start)"))
             counting = audit.get("FIRSTS_COUNTING_AS_SHOULD_NAMES") or result.get("firsts_counting_as_should") or []
             skipped = audit.get("FIRSTS_SKIPPED_ALREADY_KNOWN_TO_ARED") or result.get("firsts_skipped_known_classes") or []
+            novel = audit.get("EVAL_VIDEO_CLASSES_NOVEL_TO_MODEL") or []
+            covered = audit.get("EVAL_VIDEO_CLASSES_ALREADY_IN_MODEL") or []
             lines.append(f"   Firsts COUNTED as should-query ({audit.get('N_FIRST_OF_CLASS_COUNTING_AS_SHOULD', len(counting))}): "
                          + (", ".join(counting) if counting else "(none)"))
+            if counting:
+                lines.append("      ↳ Novel to the loaded/merged model (in eval labels, not in model at Start).")
+                lines.append("        Expected A_RED firsts — not a merge failure unless those classes")
+                lines.append("        were supposed to be inside one of the merged source models.")
             lines.append(f"   Firsts SKIPPED already-known ({len(skipped)}): "
                          + (", ".join(skipped) if skipped else "(none)"))
+            lines.append(f"   Eval-video classes already in model: "
+                         + (", ".join(covered) if covered else "(none)"))
+            lines.append(f"   Eval-video classes novel to model: "
+                         + (", ".join(novel) if novel else "(none)"))
+            buf_counts = (result.get("run_params") or {}).get("ared_buffer_counts_at_run_start") or {}
+            if buf_counts:
+                lines.append(f"   Model buffer at Start ({sum(buf_counts.values())} pts): "
+                             + ", ".join(f"{k}={v}" for k, v in sorted(buf_counts.items(), key=lambda kv: kv[0].casefold())))
             lines.append("   All first-seen frames (for reference):")
             counting_set = set(counting)
             skipped_set = set(skipped)

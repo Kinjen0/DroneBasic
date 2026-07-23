@@ -813,6 +813,49 @@ class AREDAdapter:
     def get_known_labels(self) -> List[str]:
         return sorted(self.ared.subspace_partition.set_of_known_labels)
 
+    def get_model_label_inventory(self) -> Dict[str, Any]:
+        """
+        Full inventory of labels the live model actually "knows".
+
+        Union of:
+          - subspace_partition.set_of_known_labels (A_RED's official set)
+          - labels currently sitting in the labeled buffer
+          - labels on live clusters
+
+        Used for warm-start metrics (skip first-occurrence for these classes)
+        and for merge diagnostics — buffer and set_of_known can briefly diverge
+        after some replay paths, so the union is the safe source of truth.
+        """
+        known: set = set()
+        try:
+            known |= set(self.ared.subspace_partition.set_of_known_labels or set())
+        except Exception:
+            pass
+        try:
+            for cl in self.ared.subspace_partition.cluster_dict.values():
+                if getattr(cl, "label", None) is not None:
+                    known.add(str(cl.label))
+        except Exception:
+            pass
+        buffer_counts: Dict[str, int] = {}
+        try:
+            for p in self.export_labeled_points():
+                lab = str(p.get("label", "")).strip()
+                if not lab or not is_persistable_label(lab):
+                    continue
+                known.add(lab)
+                buffer_counts[lab] = buffer_counts.get(lab, 0) + 1
+        except Exception:
+            pass
+        # Drop control sentinels if any slipped in
+        known = {k for k in known if is_persistable_label(str(k))}
+        return {
+            "labels": sorted(known, key=lambda s: str(s).casefold()),
+            "buffer_counts": dict(sorted(buffer_counts.items(), key=lambda kv: kv[0].casefold())),
+            "n_buffer_points": sum(buffer_counts.values()),
+            "n_labels": len(known),
+        }
+
     def get_query_counts(self) -> Dict[str, int]:
         """Return per-class counts of A/RED queries (real decisions) this run.
 

@@ -647,6 +647,12 @@ def evaluate_from_annotations_and_queries(
         f"Firsts COUNTED as should-query ({len(firsts_counting_names)}): "
         + (", ".join(firsts_counting_names) if firsts_counting_names else "(none)")
     )
+    if firsts_counting_names:
+        rr_class_report_lines.append(
+            "  ↳ These classes appear in the *evaluation video labels* but were "
+            "NOT in the A_RED model at Start (not in loaded/merged buffer). "
+            "A_RED is expected to treat them as new — counting them as firsts is correct."
+        )
     rr_class_report_lines.append(
         f"Firsts SKIPPED (already known) ({len(firsts_skipped_as_known)}): "
         + (", ".join(firsts_skipped_as_known) if firsts_skipped_as_known else "(none)")
@@ -654,6 +660,25 @@ def evaluate_from_annotations_and_queries(
     rr_class_report_lines.append(
         f"Relevant-designated classes ({len(relevant_classes)}): "
         + (", ".join(sorted(relevant_classes, key=str.casefold)) if relevant_classes else "(none)")
+    )
+    # Classes in the eval video that the model already knew (good merge coverage)
+    video_labs = set(all_class_names)
+    model_labs_disp = set(known_display)
+    novel_in_video = sorted(
+        [lab for lab in video_labs if _norm_class_label(lab) not in known_norm],
+        key=str.casefold,
+    )
+    covered_in_video = sorted(
+        [lab for lab in video_labs if _norm_class_label(lab) in known_norm],
+        key=str.casefold,
+    )
+    rr_class_report_lines.append(
+        f"Eval-video classes already in model ({len(covered_in_video)}): "
+        + (", ".join(covered_in_video) if covered_in_video else "(none)")
+    )
+    rr_class_report_lines.append(
+        f"Eval-video classes NOVEL to model ({len(novel_in_video)}): "
+        + (", ".join(novel_in_video) if novel_in_video else "(none)")
     )
     rr_class_report_lines.append("--- Per-class contribution to RR (should-query positives) ---")
     for lab in all_class_names:
@@ -740,8 +765,17 @@ def evaluate_from_annotations_and_queries(
         # Explicit names — this is what "3 class firsts" refers to under skip_known
         "FIRSTS_COUNTING_AS_SHOULD": firsts_counting,  # {class: first_frame}
         "FIRSTS_COUNTING_AS_SHOULD_NAMES": firsts_counting_names,
+        "FIRSTS_COUNTING_EXPLANATION": (
+            "Classes whose first tile in this eval still counts as a should-query positive. "
+            "Under skip_known/auto these are classes present in the evaluation labels but "
+            "absent from the A_RED model (loaded or merged) at run start — A_RED has never "
+            "seen them, so a first-occurrence query is expected. They are NOT a merge bug "
+            "unless those class names were supposed to be inside the merged model buffer."
+        ),
         "FIRSTS_SKIPPED_ALREADY_KNOWN_TO_ARED": firsts_skipped_as_known,
         "KNOWN_CLASSES_AT_RUN_START": sorted(known_display, key=str.casefold),
+        "EVAL_VIDEO_CLASSES_ALREADY_IN_MODEL": covered_in_video,
+        "EVAL_VIDEO_CLASSES_NOVEL_TO_MODEL": novel_in_video,
         "FIRST_OCCURRENCE_MODE": effective_first_mode,
         "FIRST_OCCURRENCE_MODE_REQUESTED": first_occurrence_mode,
         "N_SHOULD_QUERY_TOTAL": metrics["n_should_query"],

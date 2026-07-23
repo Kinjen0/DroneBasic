@@ -222,22 +222,34 @@ class DroneAREDController:
         create_ared = (self.ared_adapter is None)
         self._init_components(create_ared=create_ared)
 
-        # Snapshot known labels *after* adapter is ready (warm-start model) but *before*
-        # streaming discovers new classes. Used by metrics first-occurrence adjustment.
+        # Snapshot known labels *after* adapter is ready (warm-start / merged model)
+        # but *before* streaming discovers new classes. Used by metrics first-occurrence
+        # adjustment. Prefer full inventory (set ∪ buffer ∪ clusters) so merge/replay
+        # never under-reports what the model already contains.
         self.ared_known_labels_at_run_start = set()
+        self.ared_label_inventory_at_run_start: Dict[str, Any] = {}
         if self.ared_adapter is not None:
             try:
-                self.ared_known_labels_at_run_start = set(
-                    self.ared_adapter.get_known_labels() or []
-                )
+                inv = self.ared_adapter.get_model_label_inventory()
+                self.ared_label_inventory_at_run_start = inv
+                self.ared_known_labels_at_run_start = set(inv.get("labels") or [])
             except Exception:
-                self.ared_known_labels_at_run_start = set()
+                try:
+                    self.ared_known_labels_at_run_start = set(
+                        self.ared_adapter.get_known_labels() or []
+                    )
+                except Exception:
+                    self.ared_known_labels_at_run_start = set()
         if self.ared_known_labels_at_run_start:
+            inv = self.ared_label_inventory_at_run_start or {}
             print(
-                f"[Controller] A_RED known labels at run start "
-                f"({len(self.ared_known_labels_at_run_start)}): "
+                f"[Controller] A_RED model labels at run start "
+                f"({len(self.ared_known_labels_at_run_start)} labels, "
+                f"{inv.get('n_buffer_points', '?')} buffer pts): "
                 f"{sorted(self.ared_known_labels_at_run_start)}"
             )
+            if inv.get("buffer_counts"):
+                print(f"[Controller]   buffer counts: {inv['buffer_counts']}")
 
         # Start metrics run package (params snapshot after components exist so DB path is current)
         self._start_run_metrics_logger()
@@ -586,11 +598,15 @@ class DroneAREDController:
             p["edit_mode"] = bool(getattr(self, "edit_mode", False))
             p["label_only_mode"] = bool(getattr(self, "label_only_mode", False))
 
-            # Metrics: first-of-class handling for warm-started models
+            # Metrics: first-of-class handling for warm-started / merged models
             ml = getattr(self.config, "metrics_logging", None)
             p["first_occurrence_mode"] = getattr(ml, "first_occurrence_mode", "auto") or "auto"
             known = getattr(self, "ared_known_labels_at_run_start", None) or set()
-            p["ared_known_labels_at_run_start"] = sorted(known)
+            p["ared_known_labels_at_run_start"] = sorted(known, key=lambda s: str(s).casefold())
+            inv = getattr(self, "ared_label_inventory_at_run_start", None) or {}
+            if inv:
+                p["ared_buffer_counts_at_run_start"] = inv.get("buffer_counts") or {}
+                p["ared_buffer_points_at_run_start"] = inv.get("n_buffer_points")
         except Exception as e:
             p["collect_error"] = str(e)
         return p
