@@ -244,6 +244,13 @@ class DroneAREDController:
         if create_ared:
             self.clear_ared_model_provenance()
 
+        # CRITICAL: GUI kappa (and other live knobs) must control *this* run even when
+        # a model was loaded/merged. Load restores buffer + clusters from the pickle,
+        # which also carried the pickle's kappa; without this, every warm-start run
+        # ignores the GUI kappa and reproduces identical query decisions.
+        if self.ared_adapter is not None and not self.label_only_mode:
+            self.apply_live_ared_hyperparams()
+
         # Snapshot known labels *after* adapter is ready (warm-start / merged model)
         # but *before* streaming discovers new classes. Used by metrics first-occurrence
         # adjustment. Prefer full inventory (set ∪ buffer ∪ clusters) so merge/replay
@@ -608,6 +615,15 @@ class DroneAREDController:
         """Record that a saved A_RED model pickle was loaded into the session."""
         from pathlib import Path as _P
         p = _P(path)
+        saved_kappa = None
+        try:
+            if self.ared_adapter is not None:
+                saved_kappa = float(
+                    getattr(self.ared_adapter, "_loaded_model_kappa", None)
+                    or getattr(self.ared_adapter.ared, "kappa", None)
+                )
+        except Exception:
+            saved_kappa = None
         self.ared_model_provenance = {
             "used_existing_model": True,
             "source": "loaded",
@@ -619,8 +635,38 @@ class DroneAREDController:
             "name_a": None,
             "name_b": None,
             "saved_path": None,
+            "saved_kappa": saved_kappa,
         }
-        print(f"[Controller] A_RED model provenance: loaded {p.name}")
+        print(
+            f"[Controller] A_RED model provenance: loaded {p.name}"
+            + (f" (pickle kappa={saved_kappa})" if saved_kappa is not None else "")
+        )
+
+    def apply_live_ared_hyperparams(self) -> None:
+        """
+        Copy current ``config.ared`` decision knobs onto the live adapter.
+
+        Call after Load/Merge and on every Start so GUI kappa wins over the
+        kappa stored inside a loaded model pickle.
+        """
+        if self.ared_adapter is None:
+            return
+        try:
+            changes = self.ared_adapter.apply_runtime_hyperparams(self.config.ared)
+            if changes:
+                # Keep provenance: note effective kappa vs pickle kappa
+                prov = dict(getattr(self, "ared_model_provenance", None) or {})
+                if "kappa" in changes and prov.get("saved_kappa") is None:
+                    prov["saved_kappa"] = changes["kappa"].get("from")
+                prov["effective_kappa"] = float(self.ared_adapter.ared.kappa)
+                self.ared_model_provenance = prov
+                print(
+                    f"[Controller] Live A_RED hyperparams applied. "
+                    f"effective kappa={self.ared_adapter.ared.kappa} "
+                    f"(pickle/saved kappa={prov.get('saved_kappa', '?')})"
+                )
+        except Exception as e:
+            print(f"[Controller] WARNING: could not apply live A_RED hyperparams: {e}")
 
     def note_ared_model_merged(
         self,
@@ -677,7 +723,16 @@ class DroneAREDController:
             f = self.config.features
             ta = self.config.tile_annotations
 
+            # kappa: GUI/config intent. Also record what the live ARED is using and
+            # what was in the loaded pickle (if any) so runs are auditable.
             p["kappa"] = float(a.kappa)
+            try:
+                if self.ared_adapter is not None:
+                    p["kappa_effective"] = float(self.ared_adapter.ared.kappa)
+                else:
+                    p["kappa_effective"] = float(a.kappa)
+            except Exception:
+                p["kappa_effective"] = float(a.kappa)
             p["tile_size"] = (int(t.tile_width), int(t.tile_height))
             p["frame_stride"] = int(t.frame_stride)
             p["stride_x"] = int(t.stride_x) if t.stride_x is not None else int(t.tile_width)
@@ -777,7 +832,15 @@ class DroneAREDController:
             p["ared_model_name_a"] = prov.get("name_a")
             p["ared_model_name_b"] = prov.get("name_b")
             p["ared_model_saved_path"] = prov.get("saved_path")
+            p["ared_model_saved_kappa"] = prov.get("saved_kappa")
             p["ared_model_provenance"] = prov
+            # If live adapter still has a recorded pickle kappa, prefer that
+            try:
+                lk = getattr(self.ared_adapter, "_loaded_model_kappa", None)
+                if lk is not None:
+                    p["ared_model_saved_kappa"] = float(lk)
+            except Exception:
+                pass
             # Human one-liner for plots / audit
             if not p["ared_model_used"]:
                 p["ared_model_summary"] = "cold-start (no preloaded model)"

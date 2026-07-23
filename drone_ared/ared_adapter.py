@@ -684,13 +684,112 @@ class AREDAdapter:
             f"labeled points -> {path}"
         )
 
-    def rebuild_from_state(self, state: AREDState) -> None:
+    def apply_runtime_hyperparams(self, config: Optional["AREDConfig"] = None) -> Dict[str, Any]:
+        """
+        Push live-tunable hyperparameters from ``config`` onto the running ARED
+        instance **without** wiping the labeled buffer / clusters.
+
+        This is required after Load/Merge model: the pickle stores the kappa used
+        when the model was trained, but the GUI kappa (and a few other knobs)
+        must control *this* run's query decisions.
+
+        Safe to change on a warm-started model:
+          - kappa (paranoia / query rate)
+          - QS_VAR (comparison distance style for future updates)
+          - K_COMP_PTS (k for nearest labeled neighbors)
+          - NGHBHOOD_MERGE / SINGLETON_MERGE flags
+          - smart_forgetting_var, verbose_flags, data_augmentation_enabled
+
+        Not resized here (would require rebuild): l_buf_size.
+
+        Returns a small dict of before→after values for logging.
+        """
+        from .config import AREDConfig  # local import
+
+        cfg = config if config is not None else self.config
+        if cfg is None:
+            return {}
+
+        changes: Dict[str, Any] = {}
+        ared = self.ared
+
+        def _set(attr_ared: str, attr_cfg: str, cast=lambda x: x):
+            if not hasattr(cfg, attr_cfg):
+                return
+            old = getattr(ared, attr_ared, None)
+            new = cast(getattr(cfg, attr_cfg))
+            if old != new:
+                setattr(ared, attr_ared, new)
+                changes[attr_ared] = {"from": old, "to": new}
+            # Keep adapter.config in sync
+            try:
+                setattr(self.config, attr_cfg, new)
+            except Exception:
+                pass
+
+        _set("kappa", "kappa", float)
+        _set("QS_VAR", "qs_var", int)
+        _set("K_COMP_PTS", "k_comp_pts", int)
+        _set("NGHBHOOD_MERGE", "nghbhood_merge", bool)
+        _set("SINGLETON_MERGE", "singleton_merge", bool)
+
+        if hasattr(cfg, "smart_forgetting_var"):
+            old = getattr(ared, "SMART_FORGETTING_VAR", None)
+            new = tuple(cfg.smart_forgetting_var)
+            if old != new:
+                ared.SMART_FORGETTING_VAR = new
+                changes["SMART_FORGETTING_VAR"] = {"from": old, "to": new}
+            try:
+                self.config.smart_forgetting_var = new
+            except Exception:
+                pass
+
+        if hasattr(cfg, "verbose_flags"):
+            flags = list(cfg.verbose_flags or [])
+            ared.verbose_flags = flags
+            try:
+                self.config.verbose_flags = flags
+            except Exception:
+                pass
+
+        for attr in ("data_augmentation_enabled", "augmentation_rotations"):
+            if hasattr(cfg, attr):
+                try:
+                    setattr(self.config, attr, getattr(cfg, attr))
+                except Exception:
+                    pass
+
+        # Remember what was in the pickle vs what we are running with
+        if not hasattr(self, "_loaded_model_kappa"):
+            self._loaded_model_kappa = None
+        if changes.get("kappa"):
+            # If we never recorded the pre-apply value as "loaded", stash it
+            if self._loaded_model_kappa is None:
+                self._loaded_model_kappa = changes["kappa"]["from"]
+
+        if changes:
+            print(f"[AREDAdapter] Applied runtime hyperparams (buffer preserved): {changes}")
+        return changes
+
+    def rebuild_from_state(
+        self,
+        state: AREDState,
+        *,
+        prefer_current_kappa: bool = False,
+    ) -> None:
         """
         Create a fresh ARED and replay previously labeled points from ``state``.
 
         Preserves label store / provider / feature extractor attachments across
         the re-init. Query counts reset (warm-start is for clustering, not
         "this run" metrics).
+
+        Hyperparams for the rebuild:
+          - Buffer size / k_comp / qs from the **saved** model (structure fidelity).
+          - kappa: from saved model by default; if ``prefer_current_kappa`` use the
+            adapter's current config kappa (GUI). Regardless, Start will call
+            ``apply_runtime_hyperparams`` so the live GUI kappa always wins for
+            query decisions on the next run.
         """
         # Preserve attachments across re-init
         old_store = getattr(self, "_label_store", None)
@@ -702,8 +801,16 @@ class AREDAdapter:
         if sf is None:
             sf = getattr(self.config, "smart_forgetting_var", (3, 0.01))
 
+        # kappa for construction: optional GUI preference; Start still re-applies live.
+        kappa_for_build = float(state.kappa)
+        if prefer_current_kappa:
+            try:
+                kappa_for_build = float(self.config.kappa)
+            except Exception:
+                pass
+
         new_cfg = type(self.config)(  # type: ignore
-            kappa=state.kappa,
+            kappa=kappa_for_build,
             l_buf_size=state.l_buf_size,
             k_comp_pts=state.k_comp_pts,
             qs_var=state.qs_var,
@@ -719,6 +826,9 @@ class AREDAdapter:
         # Fresh instance (re-runs construction + open-world patches)
         self.__init__(new_cfg)
 
+        # Record kappa that came from the pickle (for metrics provenance)
+        self._loaded_model_kappa = float(state.kappa)
+
         if old_store:
             self.set_label_store(old_store)
         if old_provider:
@@ -727,7 +837,10 @@ class AREDAdapter:
             self.set_feature_extractor(old_fe)
 
         points = list(getattr(state, "labeled_points", None) or [])
-        print(f"[AREDAdapter] Replaying {len(points)} points from state...")
+        print(
+            f"[AREDAdapter] Replaying {len(points)} points from state "
+            f"(saved kappa={state.kappa}, build kappa={kappa_for_build})..."
+        )
 
         for item in points:
             self.process(
@@ -742,16 +855,23 @@ class AREDAdapter:
 
         print(
             f"[AREDAdapter] Rebuilt ARED from state. "
-            f"Current known labels: {self.get_known_labels()}"
+            f"Current known labels: {self.get_known_labels()}. "
+            f"Note: GUI kappa is applied at Start via apply_runtime_hyperparams()."
         )
 
     def load_state(
         self,
         path: str | Path,
         label_lookup: Optional[Callable[[np.ndarray], Tuple[str, bool]]] = None,
+        *,
+        prefer_current_kappa: bool = False,
     ) -> None:
         """
         Load a pickled ``AREDState`` and rebuild via replay.
+
+        Restores labeled buffer / clusters from the file. Decision hyperparameters
+        such as kappa are overridden from the GUI when you press Start
+        (``apply_runtime_hyperparams``).
 
         ``label_lookup`` is accepted for API compatibility with older callers;
         replay uses ``meta["replay"]`` and does not require the lookup.
@@ -759,8 +879,11 @@ class AREDAdapter:
         del label_lookup  # unused; kept for backward-compatible signature
         with open(path, "rb") as f:
             state: AREDState = pickle.load(f)
-        self.rebuild_from_state(state)
-        print(f"[AREDAdapter] Loaded & replayed ARED state from {path}.")
+        self.rebuild_from_state(state, prefer_current_kappa=prefer_current_kappa)
+        print(
+            f"[AREDAdapter] Loaded & replayed ARED state from {path} "
+            f"(pickle kappa={getattr(state, 'kappa', '?')})."
+        )
 
     # ------------------------------------------------------------------
     # Model merge (delegates to model_merge; keeps adapter as the façade)

@@ -1572,6 +1572,11 @@ class MainWindow:
         lines.append(f"   video(s): {', '.join(str(v) for v in vids) if vids else '?'}")
         lines.append(f"   A_RED model used: {rp.get('ared_model_used', '?')}")
         lines.append(f"   A_RED model: {rp.get('ared_model_summary') or rp.get('ared_model_name') or 'cold-start'}")
+        lines.append(
+            f"   kappa GUI/config={rp.get('kappa', '?')}  "
+            f"effective(live ARED)={rp.get('kappa_effective', '?')}  "
+            f"pickle/saved={rp.get('ared_model_saved_kappa', '—')}"
+        )
         if rp.get("ared_model_path"):
             lines.append(f"   model path: {rp.get('ared_model_path')}")
         if rp.get("ared_model_strategy"):

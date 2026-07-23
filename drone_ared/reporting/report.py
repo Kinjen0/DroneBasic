@@ -76,6 +76,8 @@ def final_metrics_table(run: RunRecord) -> str:
     lines.append("| --- | --- |")
     for key in (
         "kappa",
+        "kappa_effective",
+        "ared_model_saved_kappa",
         "tile_size",
         "stride_x",
         "stride_y",
