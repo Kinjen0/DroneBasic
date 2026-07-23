@@ -22,6 +22,8 @@ def runs_summary_table(runs: Sequence[RunRecord]) -> str:
     """Markdown table: one row per run with key params + final QP/RR/F1."""
     headers = [
         "run_id",
+        "video",
+        "A_RED model",
         "status",
         "κ",
         "tile",
@@ -44,8 +46,12 @@ def runs_summary_table(runs: Sequence[RunRecord]) -> str:
         tile_s = f"{ts[0]}x{ts[1]}" if ts else "—"
         sx, sy = r.param("stride_x"), r.param("stride_y")
         stride_s = f"{sx}x{sy}" if sx is not None else "—"
+        vid = r.video_filename() or "—"
+        model = r.param("ared_model_summary") or r.ared_model_label()
         row = [
-            r.run_id[:40],
+            r.run_id[:36],
+            str(vid)[:28],
+            str(model)[:36],
             r.status,
             _fmt(r.kappa, 3),
             tile_s,
@@ -82,7 +88,19 @@ def final_metrics_table(run: RunRecord) -> str:
         "data_augmentation_enabled",
         "label_cache_enabled",
         "metrics_checkpoint_every",
+        "video_filename",
+        "video_filenames",
         "video_paths",
+        "ared_model_used",
+        "ared_model_source",
+        "ared_model_name",
+        "ared_model_path",
+        "ared_model_strategy",
+        "ared_model_name_a",
+        "ared_model_name_b",
+        "ared_model_summary",
+        "ared_known_labels_at_run_start",
+        "first_occurrence_mode",
     ):
         if key in run.run_params:
             lines.append(f"| {key} | `{_fmt(run.run_params[key])}` |")

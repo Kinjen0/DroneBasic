@@ -175,6 +175,25 @@ class DroneAREDController:
         # Snapshot at run start — do NOT use end-of-run known labels for metrics, or classes
         # discovered mid-run would incorrectly lose their first-occurrence should-query credit.
         self.ared_known_labels_at_run_start: set = set()
+        self.ared_label_inventory_at_run_start: Dict[str, Any] = {}
+
+        # Provenance of any pre-loaded / merged A_RED model (for metrics + reports/plots).
+        # Cleared when a fresh adapter is created on Start.
+        # Example:
+        #   {"used_existing_model": True, "source": "loaded", "path": ".../m.pkl",
+        #    "name": "m.pkl", "strategy": None, "path_a": None, "path_b": None}
+        self.ared_model_provenance: Dict[str, Any] = {
+            "used_existing_model": False,
+            "source": "none",  # none | loaded | merged | session
+            "path": None,
+            "name": None,
+            "strategy": None,
+            "path_a": None,
+            "path_b": None,
+            "name_a": None,
+            "name_b": None,
+            "saved_path": None,
+        }
 
         # ------------------------------------------------------------------
         # Label Only navigation state (back/forward/jump)
@@ -221,6 +240,9 @@ class DroneAREDController:
         # Create components. We pass create_ared=False if we already have one (from Load ARED).
         create_ared = (self.ared_adapter is None)
         self._init_components(create_ared=create_ared)
+        # Fresh adapter ⇒ no warm-start provenance
+        if create_ared:
+            self.clear_ared_model_provenance()
 
         # Snapshot known labels *after* adapter is ready (warm-start / merged model)
         # but *before* streaming discovers new classes. Used by metrics first-occurrence
@@ -555,6 +577,97 @@ class DroneAREDController:
         # classes_discovered_x_of_y is populated inside evaluate_from... when ared_query_counts is passed
         return result
 
+    # ------------------------------------------------------------------
+    # A_RED model provenance (loaded / merged) for metrics & reports
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _video_basename(path: Any) -> str:
+        try:
+            from pathlib import Path as _P
+            s = str(path or "").strip().replace("\\", "/")
+            return _P(s).name if s else ""
+        except Exception:
+            return str(path or "")
+
+    def clear_ared_model_provenance(self) -> None:
+        """Mark session as cold-start (no preloaded/merged model)."""
+        self.ared_model_provenance = {
+            "used_existing_model": False,
+            "source": "none",
+            "path": None,
+            "name": None,
+            "strategy": None,
+            "path_a": None,
+            "path_b": None,
+            "name_a": None,
+            "name_b": None,
+            "saved_path": None,
+        }
+
+    def note_ared_model_loaded(self, path: str | Path) -> None:
+        """Record that a saved A_RED model pickle was loaded into the session."""
+        from pathlib import Path as _P
+        p = _P(path)
+        self.ared_model_provenance = {
+            "used_existing_model": True,
+            "source": "loaded",
+            "path": str(p),
+            "name": p.name,
+            "strategy": None,
+            "path_a": None,
+            "path_b": None,
+            "name_a": None,
+            "name_b": None,
+            "saved_path": None,
+        }
+        print(f"[Controller] A_RED model provenance: loaded {p.name}")
+
+    def note_ared_model_merged(
+        self,
+        path_a: Optional[str] = None,
+        path_b: Optional[str] = None,
+        strategy: str = "squish",
+        saved_path: Optional[str] = None,
+        used_session_as_a: bool = False,
+    ) -> None:
+        """Record that the session model came from a merge of two models."""
+        from pathlib import Path as _P
+
+        def _name(p: Optional[str], fallback: str) -> Optional[str]:
+            if not p:
+                return fallback
+            try:
+                return _P(p).name
+            except Exception:
+                return str(p)
+
+        name_a = "session" if used_session_as_a and not path_a else _name(path_a, None)
+        name_b = _name(path_b, None)
+        # Display name for plots: merge:squish(A+B) or merge:squish(session+B.pkl)
+        parts = [x for x in (name_a, name_b) if x]
+        display = f"merge:{strategy}"
+        if parts:
+            display += f"({'+'.join(parts)})"
+        if saved_path:
+            try:
+                display = _P(saved_path).name
+            except Exception:
+                pass
+
+        self.ared_model_provenance = {
+            "used_existing_model": True,
+            "source": "merged",
+            "path": str(saved_path) if saved_path else None,
+            "name": display,
+            "strategy": str(strategy),
+            "path_a": str(path_a) if path_a else ("__session__" if used_session_as_a else None),
+            "path_b": str(path_b) if path_b else None,
+            "name_a": name_a,
+            "name_b": name_b,
+            "saved_path": str(saved_path) if saved_path else None,
+        }
+        print(f"[Controller] A_RED model provenance: {display}")
+
     def _collect_run_params(self) -> Dict[str, Any]:
         """Snapshot key experiment settings at metrics computation time."""
         p: Dict[str, Any] = {}
@@ -598,6 +711,22 @@ class DroneAREDController:
             p["edit_mode"] = bool(getattr(self, "edit_mode", False))
             p["label_only_mode"] = bool(getattr(self, "label_only_mode", False))
 
+            # Videos in this run (full paths + basenames for portable reports/plots)
+            vpaths = list(self.config.video_paths or [])
+            p["video_paths"] = vpaths
+            p["video_filenames"] = [self._video_basename(v) for v in vpaths if v]
+            # Primary video (first) — handy for single-video runs / plot labels
+            p["video_filename"] = (
+                p["video_filenames"][0] if p["video_filenames"] else None
+            )
+            # Live stats may have the current file mid-run
+            try:
+                cur = (self.stats or {}).get("current_video") or ""
+                if cur:
+                    p["current_video_filename"] = self._video_basename(cur)
+            except Exception:
+                pass
+
             # Metrics: first-of-class handling for warm-started / merged models
             ml = getattr(self.config, "metrics_logging", None)
             p["first_occurrence_mode"] = getattr(ml, "first_occurrence_mode", "auto") or "auto"
@@ -607,6 +736,62 @@ class DroneAREDController:
             if inv:
                 p["ared_buffer_counts_at_run_start"] = inv.get("buffer_counts") or {}
                 p["ared_buffer_points_at_run_start"] = inv.get("n_buffer_points")
+
+            # Existing A_RED model (loaded pickle or merge result)
+            prov = dict(getattr(self, "ared_model_provenance", None) or {})
+            used = bool(prov.get("used_existing_model")) or bool(known)
+            # If we have known labels but provenance was never set, treat as session warm-start
+            if used and not prov.get("source"):
+                prov = {
+                    "used_existing_model": True,
+                    "source": "session",
+                    "path": None,
+                    "name": "session",
+                    "strategy": None,
+                    "path_a": None,
+                    "path_b": None,
+                    "name_a": None,
+                    "name_b": None,
+                    "saved_path": None,
+                }
+            if not used:
+                prov = {
+                    "used_existing_model": False,
+                    "source": "none",
+                    "path": None,
+                    "name": None,
+                    "strategy": None,
+                    "path_a": None,
+                    "path_b": None,
+                    "name_a": None,
+                    "name_b": None,
+                    "saved_path": None,
+                }
+            p["ared_model_used"] = bool(prov.get("used_existing_model"))
+            p["ared_model_source"] = prov.get("source") or "none"  # none|loaded|merged|session
+            p["ared_model_path"] = prov.get("path")
+            p["ared_model_name"] = prov.get("name")
+            p["ared_model_strategy"] = prov.get("strategy")  # merge strategy if any
+            p["ared_model_path_a"] = prov.get("path_a")
+            p["ared_model_path_b"] = prov.get("path_b")
+            p["ared_model_name_a"] = prov.get("name_a")
+            p["ared_model_name_b"] = prov.get("name_b")
+            p["ared_model_saved_path"] = prov.get("saved_path")
+            p["ared_model_provenance"] = prov
+            # Human one-liner for plots / audit
+            if not p["ared_model_used"]:
+                p["ared_model_summary"] = "cold-start (no preloaded model)"
+            elif p["ared_model_source"] == "merged":
+                p["ared_model_summary"] = (
+                    f"merged:{p.get('ared_model_strategy') or '?'} "
+                    f"A={p.get('ared_model_name_a') or '?'} "
+                    f"B={p.get('ared_model_name_b') or '?'}"
+                    + (f" → {p.get('ared_model_name')}" if p.get("ared_model_name") else "")
+                )
+            elif p["ared_model_source"] == "loaded":
+                p["ared_model_summary"] = f"loaded:{p.get('ared_model_name') or p.get('ared_model_path') or '?'}"
+            else:
+                p["ared_model_summary"] = f"session:{p.get('ared_model_name') or 'warm-start'}"
         except Exception as e:
             p["collect_error"] = str(e)
         return p

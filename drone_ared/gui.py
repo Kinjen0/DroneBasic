@@ -1558,6 +1558,27 @@ class MainWindow:
             f"Total labeled (people-tagged) tiles in DB: {result.get('n_labeled', 0)}",
         ]
         lines.extend(rp_lines)
+        # Video + A_RED model provenance (loaded / merged / cold-start)
+        rp = result.get("run_params") or {}
+        lines.append("VIDEO / A_RED MODEL:")
+        vids = rp.get("video_filenames") or (
+            [rp["video_filename"]] if rp.get("video_filename") else []
+        )
+        if not vids and rp.get("video_paths"):
+            try:
+                vids = [Path(v).name for v in rp["video_paths"]]
+            except Exception:
+                vids = list(rp.get("video_paths") or [])
+        lines.append(f"   video(s): {', '.join(str(v) for v in vids) if vids else '?'}")
+        lines.append(f"   A_RED model used: {rp.get('ared_model_used', '?')}")
+        lines.append(f"   A_RED model: {rp.get('ared_model_summary') or rp.get('ared_model_name') or 'cold-start'}")
+        if rp.get("ared_model_path"):
+            lines.append(f"   model path: {rp.get('ared_model_path')}")
+        if rp.get("ared_model_strategy"):
+            lines.append(
+                f"   merge: strategy={rp.get('ared_model_strategy')}  "
+                f"A={rp.get('ared_model_name_a')}  B={rp.get('ared_model_name_b')}"
+            )
         lines.append("---------------------------------------------------------------------")
 
         audit = result.get("detailed_breakdown") or result.get("audit", {})
@@ -2002,6 +2023,9 @@ class MainWindow:
             if self.label_store:
                 self.controller.ared_adapter.set_label_store(self.label_store)
         self.controller.ared_adapter.load_state(path, label_lookup=self._label_lookup_from_store)
+        # Track for metrics / plots (which preloaded model was used)
+        if hasattr(self.controller, "note_ared_model_loaded"):
+            self.controller.note_ared_model_loaded(path)
         # Re-apply feature extractor so data augmentation can still work after re-init inside load
         if hasattr(self.controller, "_last_feature_extractor") and self.controller._last_feature_extractor:
             self.controller.ared_adapter.set_feature_extractor(self.controller._last_feature_extractor)
@@ -2211,6 +2235,20 @@ class MainWindow:
                 if old is not None and getattr(old, "_label_provider", None):
                     result.adapter.set_label_provider(old._label_provider)
                 self.controller.ared_adapter = result.adapter
+                # Provenance for metrics / plots
+                if hasattr(self.controller, "note_ared_model_merged"):
+                    path_a_note = path_a_var.get().strip() if not use_session_var.get() else None
+                    # If A was the live session, keep prior load name when available
+                    if use_session_var.get():
+                        prev = getattr(self.controller, "ared_model_provenance", None) or {}
+                        path_a_note = prev.get("path") or prev.get("name") or path_a_note
+                    self.controller.note_ared_model_merged(
+                        path_a=path_a_note or None,
+                        path_b=path_b,
+                        strategy=strategy,
+                        saved_path=out_path or None,
+                        used_session_as_a=bool(use_session_var.get()),
+                    )
                 self._refresh_class_list()
                 self.controller.stats["ared_clusters"] = result.adapter.num_clusters
                 self.controller.stats["ared_known_labels"] = result.adapter.num_known_labels
@@ -2220,6 +2258,9 @@ class MainWindow:
                     f"{result.points_accepted} buffer pts, "
                     f"{result.summary.get('num_clusters', '?')} clusters."
                 )
+            elif out_path and hasattr(self.controller, "note_ared_model_merged"):
+                # Saved but not applied — still record if they later load that file
+                pass
 
             messagebox.showinfo("Merge ARED Models", result.pretty(), parent=dlg)
             dlg.destroy()

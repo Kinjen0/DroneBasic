@@ -128,15 +128,18 @@ def plot_run_curves(
     ax1.set_ylabel("Queries")
     ax1.grid(True, alpha=0.3)
 
-    # Param footer
+    # Param footer (video + A_RED model provenance for reproducibility)
     rp = run.run_params or {}
+    vid = run.video_filename() or rp.get("video_filename") or "?"
+    model_s = rp.get("ared_model_summary") or run.ared_model_label()
     footer = (
+        f"video={vid}  model={model_s}  "
         f"κ={rp.get('kappa', '?')}  tile={rp.get('tile_size', '?')}  "
         f"stride=({rp.get('stride_x', '?')},{rp.get('stride_y', '?')})  "
         f"frame_stride={rp.get('frame_stride', '?')}  "
         f"l_buf={rp.get('l_buf_size', '?')}  status={run.status}"
     )
-    fig.text(0.5, 0.01, footer, ha="center", fontsize=8, color="#444")
+    fig.text(0.5, 0.01, footer, ha="center", fontsize=7.5, color="#444")
 
     fig.tight_layout(rect=[0, 0.03, 1, 1])
     fig.savefig(out_path, dpi=dpi, bbox_inches="tight")

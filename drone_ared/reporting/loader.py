@@ -60,9 +60,49 @@ class RunRecord:
         except (TypeError, ValueError):
             return None
 
+    def video_filename(self) -> Optional[str]:
+        """Primary video basename for this run (portable; not full path)."""
+        v = self.param("video_filename")
+        if v:
+            return str(v)
+        names = self.param("video_filenames")
+        if isinstance(names, (list, tuple)) and names:
+            return str(names[0])
+        paths = self.param("video_paths")
+        if isinstance(paths, (list, tuple)) and paths:
+            try:
+                return Path(str(paths[0])).name
+            except Exception:
+                return str(paths[0])
+        return None
+
+    def ared_model_label(self) -> str:
+        """Short tag for whether a preloaded/merged A_RED model was used."""
+        if not self.param("ared_model_used"):
+            # Fallback: known labels at start imply warm-start even if older runs lack flags
+            known = self.param("ared_known_labels_at_run_start") or []
+            if known:
+                return "model=session"
+            return "cold"
+        src = str(self.param("ared_model_source") or "session")
+        name = self.param("ared_model_name")
+        if src == "merged":
+            strat = self.param("ared_model_strategy") or "?"
+            a = self.param("ared_model_name_a") or "?"
+            b = self.param("ared_model_name_b") or "?"
+            if name and str(name) not in (a, b):
+                return f"merge:{strat}:{name}"
+            return f"merge:{strat}({a}+{b})"
+        if src == "loaded":
+            return f"load:{name or self.param('ared_model_path') or '?'}"
+        return f"model:{name or src}"
+
     def short_label(self) -> str:
-        """Compact legend label for plots."""
+        """Compact legend label for plots (includes video + model provenance)."""
         parts = []
+        vid = self.video_filename()
+        if vid:
+            parts.append(vid)
         if self.kappa is not None:
             parts.append(f"κ={self.kappa:g}")
         ts = self.tile_size
@@ -76,6 +116,8 @@ class RunRecord:
             parts.append(f"fs={self.frame_stride}")
         if self.l_buf_size is not None:
             parts.append(f"buf={self.l_buf_size}")
+        # Always show cold vs loaded/merged so multi-run plots are distinguishable
+        parts.append(self.ared_model_label())
         if not parts:
             return self.run_id[:24]
         return " ".join(parts)
