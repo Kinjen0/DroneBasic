@@ -171,6 +171,11 @@ class DroneAREDController:
         # over only the tiles that were actually presented to the algorithm).
         self.processed_identities: List[Tuple] = []
 
+        # Labels already known to A_RED when Start was pressed (after optional Load Model).
+        # Snapshot at run start — do NOT use end-of-run known labels for metrics, or classes
+        # discovered mid-run would incorrectly lose their first-occurrence should-query credit.
+        self.ared_known_labels_at_run_start: set = set()
+
         # ------------------------------------------------------------------
         # Label Only navigation state (back/forward/jump)
         # These allow the user to move around the video without being stuck
@@ -216,6 +221,23 @@ class DroneAREDController:
         # Create components. We pass create_ared=False if we already have one (from Load ARED).
         create_ared = (self.ared_adapter is None)
         self._init_components(create_ared=create_ared)
+
+        # Snapshot known labels *after* adapter is ready (warm-start model) but *before*
+        # streaming discovers new classes. Used by metrics first-occurrence adjustment.
+        self.ared_known_labels_at_run_start = set()
+        if self.ared_adapter is not None:
+            try:
+                self.ared_known_labels_at_run_start = set(
+                    self.ared_adapter.get_known_labels() or []
+                )
+            except Exception:
+                self.ared_known_labels_at_run_start = set()
+        if self.ared_known_labels_at_run_start:
+            print(
+                f"[Controller] A_RED known labels at run start "
+                f"({len(self.ared_known_labels_at_run_start)}): "
+                f"{sorted(self.ared_known_labels_at_run_start)}"
+            )
 
         # Start metrics run package (params snapshot after components exist so DB path is current)
         self._start_run_metrics_logger()
@@ -482,13 +504,23 @@ class DroneAREDController:
             except Exception:
                 ared_qc = {}
 
+        fo_mode = "auto"
+        try:
+            ml = getattr(self.config, "metrics_logging", None)
+            fo_mode = getattr(ml, "first_occurrence_mode", "auto") or "auto"
+        except Exception:
+            fo_mode = "auto"
+        known_at_start = set(getattr(self, "ared_known_labels_at_run_start", None) or set())
+
         result = ared_metrics.evaluate_from_annotations_and_queries(
-            anns, queried, 
+            anns, queried,
             total_points=stream_total,
             ared_query_count_override=ared_query_count,
             processed_keys=processed,
             run_params=run_params,
             ared_query_counts=ared_qc,
+            known_classes_at_start=known_at_start,
+            first_occurrence_mode=fo_mode,
         )
         result["video"] = video_path
         result["n_labeled"] = labeled_total
@@ -553,6 +585,12 @@ class DroneAREDController:
             # Misc
             p["edit_mode"] = bool(getattr(self, "edit_mode", False))
             p["label_only_mode"] = bool(getattr(self, "label_only_mode", False))
+
+            # Metrics: first-of-class handling for warm-started models
+            ml = getattr(self.config, "metrics_logging", None)
+            p["first_occurrence_mode"] = getattr(ml, "first_occurrence_mode", "auto") or "auto"
+            known = getattr(self, "ared_known_labels_at_run_start", None) or set()
+            p["ared_known_labels_at_run_start"] = sorted(known)
         except Exception as e:
             p["collect_error"] = str(e)
         return p

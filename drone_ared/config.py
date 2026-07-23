@@ -102,7 +102,7 @@ class AREDConfig:
            - Lower kappa → more tolerant of variation → fewer queries.
     """
     kappa: float = 1.0          # higher = more queries (more paranoid)
-    l_buf_size: int = 2000      # memory bound for labeled points (circular)
+    l_buf_size: int = 10000      # memory bound for labeled points (circular)
     k_comp_pts: int = 5         # how many nearest to consider (enables neighborhood merge)
     qs_var: int = 1             # 0=diameter, 1=average NN distance (single link style)
     data_aug_var: Tuple[int, Tuple[int, int]] = (0, (0, 0))
@@ -202,11 +202,19 @@ class MetricsLoggingConfig:
     """Periodic running metrics + per-run save files (paper-style evaluation logs)."""
     enabled: bool = True
     # Snapshot QP/RR/F1 etc. every N tiles processed (also always on stop/finish).
-    checkpoint_every: int = 5000
+    checkpoint_every: int = 500
     # Directory for runs/<run_id>/run.json + checkpoints.csv
     output_dir: str = "runs"
     # Also write a checkpoint when each video ends (in addition to every N tiles).
     checkpoint_on_video_end: bool = True
+    # How "first appearance of a class" counts as a should-query positive:
+    #   "paper"      — paper definition: first sample of *any* class is a positive
+    #                  (fair for cold-start; unfair if a warm-started A_RED already knows the class).
+    #   "skip_known" — first-of-class is a positive only if that class was *not* already
+    #                  known to A_RED at run start (recommended when loading a prior model).
+    #                  Relevant-class samples still always count as positives.
+    #   "auto"       — use skip_known when the adapter has known labels at Start, else paper.
+    first_occurrence_mode: str = "auto"
 
 
 @dataclass

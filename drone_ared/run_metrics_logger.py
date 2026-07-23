@@ -290,6 +290,10 @@ class RunMetricsLogger:
                             "TP",
                             "FP",
                             "FN",
+                            "FIRST_OCCURRENCE_MODE",
+                            "KNOWN_CLASSES_AT_RUN_START",
+                            "FIRSTS_COUNTING_AS_SHOULD_NAMES",
+                            "FIRSTS_SKIPPED_ALREADY_KNOWN_TO_ARED",
                             "QUERY_PRECISION_WORK",
                             "RELEVANT_RECALL_WORK",
                             "F1_WORK",
@@ -305,7 +309,16 @@ class RunMetricsLogger:
                         audit_path = self.run_dir / "final_audit.txt"
                         with open(audit_path, "w", encoding="utf-8") as f:
                             f.write(str(final_metrics.get("summary", "")) + "\n\n")
+                            # Readable per-class RR block first (easy to scan)
+                            rr_lines = audit.get("RR_CLASS_REPORT_LINES") or []
+                            if rr_lines:
+                                f.write("=== PER-CLASS RR REPORT ===\n")
+                                for ln in rr_lines:
+                                    f.write(ln + "\n")
+                                f.write("\n")
                             for k, v in audit.items():
+                                if k == "RR_CLASS_REPORT_LINES":
+                                    continue  # already written above
                                 f.write(f"{k}: {v}\n")
                     except Exception as e:
                         print(f"[RunMetrics] Could not write final_audit.txt: {e}")
@@ -573,6 +586,17 @@ class RunMetricsLogger:
         ared_query_count = int((controller.stats or {}).get("ared_queries", len(queried)))
         run_params = dict(self.run_params)
 
+        # Warm-start fair eval: first-of-class only if class was unknown at Start.
+        known_at_start = set(getattr(controller, "ared_known_labels_at_run_start", None) or set())
+        fo_mode = "auto"
+        try:
+            fo_mode = (
+                (run_params or {}).get("first_occurrence_mode")
+                or "auto"
+            )
+        except Exception:
+            fo_mode = "auto"
+
         result = ared_metrics.evaluate_from_annotations_and_queries(
             anns,
             queried,
@@ -581,6 +605,8 @@ class RunMetricsLogger:
             processed_keys=processed,
             run_params=run_params,
             ared_query_counts=ared_qc,
+            known_classes_at_start=known_at_start,
+            first_occurrence_mode=str(fo_mode),
         )
         result["n_processed_in_run"] = stream_total
         result["ared_queries_made"] = ared_query_count

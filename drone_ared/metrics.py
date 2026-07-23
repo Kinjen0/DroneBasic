@@ -82,18 +82,73 @@ def make_tile_key(ann: Dict[str, Any]) -> Tuple:
 # Ground-truth "should query" computation
 # -----------------------------------------------------------------------------
 
+# Modes for counting "first appearance of a class" as a query-decision positive.
+FIRST_OCCURRENCE_PAPER = "paper"           # paper: first of any class always counts
+FIRST_OCCURRENCE_SKIP_KNOWN = "skip_known"  # warm-start: first only if class unknown to A_RED
+FIRST_OCCURRENCE_AUTO = "auto"             # skip_known if known_classes non-empty else paper
+
+
+def _norm_class_label(label: Any) -> str:
+    """Normalize class names for membership tests (strip + casefold)."""
+    try:
+        return str(label).strip().casefold()
+    except Exception:
+        return str(label) if label is not None else ""
+
+
+def _persistable_known_set(known_classes: Optional[Set[str]]) -> Set[str]:
+    """Normalized set of persistable known class names for warm-start matching."""
+    out: Set[str] = set()
+    if not known_classes:
+        return out
+    for c in known_classes:
+        if c is None:
+            continue
+        s = str(c)
+        if is_persistable_label(s):
+            n = _norm_class_label(s)
+            if n:
+                out.add(n)
+    return out
+
+
+def resolve_first_occurrence_mode(
+    mode: Optional[str],
+    known_classes: Optional[Set[str]] = None,
+) -> str:
+    """Map config mode (+ optional known set) to an effective paper|skip_known mode."""
+    m = (mode or FIRST_OCCURRENCE_AUTO).strip().lower()
+    if m in (FIRST_OCCURRENCE_PAPER, "cold", "cold_start"):
+        return FIRST_OCCURRENCE_PAPER
+    if m in (FIRST_OCCURRENCE_SKIP_KNOWN, "warm", "warm_start"):
+        return FIRST_OCCURRENCE_SKIP_KNOWN
+    # auto
+    if known_classes:
+        return FIRST_OCCURRENCE_SKIP_KNOWN
+    return FIRST_OCCURRENCE_PAPER
+
+
 def compute_should_query_from_annotations(
     annotations: List[Dict[str, Any]],
-    order_by: str = "stream"
+    order_by: str = "stream",
+    known_classes: Optional[Set[str]] = None,
+    first_occurrence_mode: str = FIRST_OCCURRENCE_PAPER,
 ) -> Dict[Tuple, bool]:
     """
     Given a list of annotations (as returned by TileAnnotationDB.get_annotations_for_video),
     return a dict: tile_key -> should_query (bool)
 
-    Matches the paper definition exactly (SPIE Sec.5):
+    Paper definition (SPIE Sec.5), cold-start / ``first_occurrence_mode="paper"``:
       Positives (should query) =
         i) the first sample of a given class, OR
        ii) samples from classes designated as relevant.
+
+    Warm-start / loaded A_RED model (``first_occurrence_mode="skip_known"``):
+      Rule (i) is adjusted: the first sample of a class counts **only if that class
+      was not already known to A_RED** at run start (``known_classes``).
+      A_RED is designed not to re-query classes it already has in memory; counting
+      those first-in-video tiles as FN would unfairly punish a correct warm-start.
+      Rule (ii) is unchanged — all samples of relevant-designated classes remain positives.
 
     "Designated as relevant" is at *class* level: if the user ever marked any
     instance of the class as relevant, then ALL samples of that class are positives.
@@ -116,19 +171,35 @@ def compute_should_query_from_annotations(
         str(a.get("label", "")) for a in anns if a.get("relevant")
     }
 
-    seen_classes: Set[str] = set()
+    # Normalized known set for robust matching against annotation labels
+    known_norm = _persistable_known_set(known_classes)
+    mode = resolve_first_occurrence_mode(first_occurrence_mode, known_norm)
+    skip_known_firsts = (mode == FIRST_OCCURRENCE_SKIP_KNOWN)
+
+    # relevant_classes may mix raw strings; match via normalized form too
+    relevant_norm = {_norm_class_label(c) for c in relevant_classes if c}
+
+    seen_classes: Set[str] = set()  # raw labels as they appear
     should_query: Dict[Tuple, bool] = {}
 
     for a in anns:
         key = make_tile_key(a)
-        label = str(a.get("label", ""))
+        label = str(a.get("label", "")).strip()
+        if not is_persistable_label(label):
+            should_query[key] = False
+            continue
 
         is_first = label not in seen_classes
         if is_first:
             seen_classes.add(label)
 
-        is_from_relevant = label in relevant_classes
-        should = is_first or is_from_relevant
+        lab_n = _norm_class_label(label)
+        # First-of-class positive only when the class is new to A_RED (warm-start mode)
+        # or always (paper / cold-start mode).
+        first_counts = is_first and not (skip_known_firsts and lab_n in known_norm)
+
+        is_from_relevant = lab_n in relevant_norm
+        should = first_counts or is_from_relevant
         should_query[key] = should
 
     return should_query
@@ -280,6 +351,8 @@ def evaluate_from_annotations_and_queries(
     processed_keys: Optional[List[Tuple]] = None,
     run_params: Optional[Dict[str, Any]] = None,
     ared_query_counts: Optional[Dict[str, int]] = None,
+    known_classes_at_start: Optional[Set[str]] = None,
+    first_occurrence_mode: str = FIRST_OCCURRENCE_AUTO,
 ) -> Dict[str, Any]:
     """
     High-level helper. Produces exhaustive data for the user.
@@ -293,6 +366,10 @@ def evaluate_from_annotations_and_queries(
         the tiles that were actually sent to A/RED in this run. This ensures we
         only count positives (firsts + relevant) for tiles/classes that were actually presented
         to A/RED.
+    known_classes_at_start: labels already known to A_RED when the run began
+        (e.g. after Load ARED Model). Used with first_occurrence_mode to avoid
+        treating first-in-video tiles of already-known classes as should-query FN.
+    first_occurrence_mode: "paper" | "skip_known" | "auto" (see MetricsLoggingConfig).
     run_params: optional dict of key experiment settings for this run, e.g.:
         {"kappa": 1.0, "tile_size": (256,256), "frame_stride": 3,
          "annotation_db": "drone_tile_annotations.db", "dino_model": "...", ...}
@@ -305,19 +382,42 @@ def evaluate_from_annotations_and_queries(
         proc_set = {normalize_tile_key(k) for k in processed_keys}
         annotations = [a for a in annotations if make_tile_key(a) in proc_set]
 
-    should = compute_should_query_from_annotations(annotations)
+    # Keep original display names for reporting; matching uses normalized form.
+    known_display: List[str] = []
+    if known_classes_at_start:
+        seen_k = set()
+        for c in known_classes_at_start:
+            if c is None:
+                continue
+            s = str(c).strip()
+            if not is_persistable_label(s):
+                continue
+            n = _norm_class_label(s)
+            if n and n not in seen_k:
+                seen_k.add(n)
+                known_display.append(s)
+    known_norm = _persistable_known_set(set(known_display) if known_display else None)
+    effective_first_mode = resolve_first_occurrence_mode(first_occurrence_mode, known_norm)
+
+    should = compute_should_query_from_annotations(
+        annotations,
+        known_classes=set(known_display) if known_display else None,
+        first_occurrence_mode=effective_first_mode,
+    )
 
     # Determine relevant classes at class level (consistent with updated should_query logic)
     relevant_classes: Set[str] = {
-        str(a.get("label", "")) for a in annotations if a.get("relevant")
+        str(a.get("label", "")).strip() for a in annotations
+        if a.get("relevant") and is_persistable_label(str(a.get("label", "")).strip())
     }
+    relevant_norm = {_norm_class_label(c) for c in relevant_classes}
 
     # Compute relevant-class-only stats for reference / detailed audit (not used for primary RR).
     # Primary RR now uses the full positives set (firsts of any class + rel samples).
     relevant_only_should = {}
     for a in annotations:
         key = make_tile_key(a)
-        if str(a.get("label", "")) in relevant_classes:
+        if _norm_class_label(str(a.get("label", "")).strip()) in relevant_norm:
             relevant_only_should[key] = True
 
     metrics = compute_query_metrics(actual_queried_keys, should, total_points)
@@ -416,12 +516,28 @@ def evaluate_from_annotations_and_queries(
     seen = set()
     first_of_class = {}
     for a in sorted(annotations, key=lambda x: (x.get("abs_frame", 0), x.get("tile_row", 0), x.get("tile_col", 0))):
-        lab = str(a.get("label", ""))
-        if lab and lab not in seen:
+        lab = str(a.get("label", "")).strip()
+        if lab and is_persistable_label(lab) and lab not in seen:
             seen.add(lab)
             first_of_class[lab] = a.get("abs_frame", -1)
 
     n_first = len(first_of_class)
+    # Firsts that still count as should-query under the active mode
+    firsts_counting = {
+        lab: fr for lab, fr in first_of_class.items()
+        if not (
+            effective_first_mode == FIRST_OCCURRENCE_SKIP_KNOWN
+            and _norm_class_label(lab) in known_norm
+        )
+    }
+    firsts_skipped_as_known = sorted(
+        lab for lab in first_of_class
+        if (
+            effective_first_mode == FIRST_OCCURRENCE_SKIP_KNOWN
+            and _norm_class_label(lab) in known_norm
+        )
+    )
+    firsts_counting_names = sorted(firsts_counting.keys())
     # n_rel_pos already in metrics; keep for any legacy refs in detailed
     n_rel_should = len(relevant_only_should)  # alias for the RR positives count
 
@@ -431,16 +547,151 @@ def evaluate_from_annotations_and_queries(
     should_from_both = 0
     for a in annotations:
         key = make_tile_key(a)
-        if not should.get(key, False): continue
-        lab = str(a.get("label", ""))
-        is_first_approx = lab in first_of_class and first_of_class.get(lab) == a.get("abs_frame", -1)
-        is_rel_class = lab in relevant_classes
+        if not should.get(key, False):
+            continue
+        lab = str(a.get("label", "")).strip()
+        is_first_approx = lab in firsts_counting and firsts_counting.get(lab) == a.get("abs_frame", -1)
+        is_rel_class = _norm_class_label(lab) in relevant_norm
         if is_first_approx and is_rel_class:
             should_from_both += 1
         elif is_first_approx:
             should_from_first += 1
         elif is_rel_class:
             should_from_relevant_only += 1
+
+    # ------------------------------------------------------------------
+    # Per-class report for RR / should-query (what the user can inspect)
+    # ------------------------------------------------------------------
+    # For each labeled class in this run: how many tiles, how many should-query
+    # positives, TP/FN among those, whether first counts, relevant, known at start.
+    per_class: Dict[str, Dict[str, Any]] = {}
+    all_class_names = sorted(
+        {str(a.get("label", "")).strip() for a in annotations
+         if is_persistable_label(str(a.get("label", "")).strip())},
+        key=lambda s: s.casefold(),
+    )
+    # Earliest should-positive tile key per class (for first_of_class reason tagging)
+    first_should_key_by_class: Dict[str, Tuple] = {}
+    for a in sorted(
+        annotations,
+        key=lambda x: (x.get("abs_frame", 0), x.get("tile_row", 0), x.get("tile_col", 0)),
+    ):
+        lab = str(a.get("label", "")).strip()
+        if not is_persistable_label(lab):
+            continue
+        key = make_tile_key(a)
+        if should.get(key, False) and lab not in first_should_key_by_class:
+            first_should_key_by_class[lab] = key
+
+    for lab in all_class_names:
+        lab_n = _norm_class_label(lab)
+        class_anns = [a for a in annotations if str(a.get("label", "")).strip() == lab]
+        n_tiles = len(class_anns)
+        n_should_c = 0
+        n_tp_c = 0
+        n_fn_c = 0
+        n_queried_any = 0
+        reasons = Counter()
+        is_relevant_class = lab_n in relevant_norm
+        first_counts_as_should = lab in firsts_counting
+
+        for a in class_anns:
+            key = make_tile_key(a)
+            was_q = key in actual_set
+            if was_q:
+                n_queried_any += 1
+            if not should.get(key, False):
+                continue
+            n_should_c += 1
+            if was_q:
+                n_tp_c += 1
+            else:
+                n_fn_c += 1
+            # Why is this tile a should-query positive?
+            if first_counts_as_should and first_should_key_by_class.get(lab) == key:
+                reasons["first_of_class"] += 1
+            if is_relevant_class:
+                reasons["relevant_class_sample"] += 1
+
+        known_at_start = lab_n in known_norm
+        first_skipped = lab in firsts_skipped_as_known
+        rr_class = round(n_tp_c / n_should_c, 4) if n_should_c > 0 else None
+
+        per_class[lab] = {
+            "n_tiles_in_eval": n_tiles,
+            "n_should_query_positives": n_should_c,
+            "tp": n_tp_c,   # should + queried
+            "fn": n_fn_c,   # should + not queried
+            "n_queried_any": n_queried_any,  # any query on this class (incl. non-should)
+            "class_recall_on_should": rr_class,
+            "is_relevant_class": is_relevant_class,
+            "known_to_ared_at_run_start": known_at_start,
+            "first_occurrence_frame": first_of_class.get(lab),
+            "first_counts_as_should_positive": first_counts_as_should,
+            "first_skipped_already_known": first_skipped,
+            "positive_reason_counts": dict(reasons),
+            "contributes_to_rr": n_should_c > 0,
+        }
+
+    # Human-readable lines for GUI / final_audit
+    rr_class_report_lines: List[str] = []
+    rr_class_report_lines.append(
+        f"First-occurrence mode: {effective_first_mode} "
+        f"(requested={first_occurrence_mode})"
+    )
+    rr_class_report_lines.append(
+        f"A_RED known at run start ({len(known_display)}): "
+        + (", ".join(sorted(known_display, key=str.casefold)) if known_display else "(none — cold start)")
+    )
+    rr_class_report_lines.append(
+        f"Firsts COUNTED as should-query ({len(firsts_counting_names)}): "
+        + (", ".join(firsts_counting_names) if firsts_counting_names else "(none)")
+    )
+    rr_class_report_lines.append(
+        f"Firsts SKIPPED (already known) ({len(firsts_skipped_as_known)}): "
+        + (", ".join(firsts_skipped_as_known) if firsts_skipped_as_known else "(none)")
+    )
+    rr_class_report_lines.append(
+        f"Relevant-designated classes ({len(relevant_classes)}): "
+        + (", ".join(sorted(relevant_classes, key=str.casefold)) if relevant_classes else "(none)")
+    )
+    rr_class_report_lines.append("--- Per-class contribution to RR (should-query positives) ---")
+    for lab in all_class_names:
+        info = per_class[lab]
+        if not info["contributes_to_rr"] and not info["first_skipped_already_known"]:
+            # Still show skipped-known briefly only; skip pure background non-positives? Show all labeled.
+            pass
+        flags = []
+        if info["is_relevant_class"]:
+            flags.append("RELEVANT")
+        if info["first_counts_as_should_positive"]:
+            flags.append("FIRST_COUNTS")
+        if info["first_skipped_already_known"]:
+            flags.append("FIRST_SKIPPED_KNOWN")
+        if info["known_to_ared_at_run_start"]:
+            flags.append("KNOWN_AT_START")
+        flag_s = ",".join(flags) if flags else "-"
+        rr_s = (
+            f"{info['class_recall_on_should']:.3f}"
+            if info["class_recall_on_should"] is not None
+            else "n/a"
+        )
+        rr_class_report_lines.append(
+            f"  {lab}: tiles={info['n_tiles_in_eval']}  "
+            f"should={info['n_should_query_positives']}  "
+            f"TP={info['tp']} FN={info['fn']}  "
+            f"class_RR={rr_s}  "
+            f"queried_any={info['n_queried_any']}  "
+            f"[{flag_s}]"
+        )
+
+    metrics["first_occurrence_mode"] = effective_first_mode
+    metrics["first_occurrence_mode_requested"] = first_occurrence_mode
+    metrics["known_classes_at_start"] = sorted(known_display, key=str.casefold)
+    metrics["firsts_skipped_known_classes"] = firsts_skipped_as_known
+    metrics["firsts_counting_as_should"] = firsts_counting_names
+    metrics["per_class_rr_report"] = per_class
+    metrics["rr_class_report_lines"] = rr_class_report_lines
 
     # Full TP/FP/FN already in metrics, but we document
     tp = metrics["tp"]
@@ -485,13 +736,35 @@ def evaluate_from_annotations_and_queries(
         "N_UNIQUE_CLASSES_IN_RUN": n_unique_in_run,
         "FIRST_OCCURRENCE_BY_CLASS": first_of_class,
         "N_FIRST_OF_CLASS": n_first,
+        "N_FIRST_OF_CLASS_COUNTING_AS_SHOULD": len(firsts_counting),
+        # Explicit names — this is what "3 class firsts" refers to under skip_known
+        "FIRSTS_COUNTING_AS_SHOULD": firsts_counting,  # {class: first_frame}
+        "FIRSTS_COUNTING_AS_SHOULD_NAMES": firsts_counting_names,
+        "FIRSTS_SKIPPED_ALREADY_KNOWN_TO_ARED": firsts_skipped_as_known,
+        "KNOWN_CLASSES_AT_RUN_START": sorted(known_display, key=str.casefold),
+        "FIRST_OCCURRENCE_MODE": effective_first_mode,
+        "FIRST_OCCURRENCE_MODE_REQUESTED": first_occurrence_mode,
         "N_SHOULD_QUERY_TOTAL": metrics["n_should_query"],
         "SHOULD_BREAKDOWN": {
             "from_first_only_approx": should_from_first,
             "from_relevant_only_approx": should_from_relevant_only,
             "from_both_approx": should_from_both,
-            "note": "Exact should computed per paper rule (positives = first of any class OR samples of relevant classes). Filtered to only tiles sent in this run if processed_keys provided."
+            "firsts_counting_names": firsts_counting_names,
+            "firsts_skipped_names": firsts_skipped_as_known,
+            "note": (
+                "Positives = (first of class that counts under first_occurrence_mode) "
+                "OR samples of relevant-designated classes. "
+                f"Mode={effective_first_mode}: "
+                + (
+                    "first-of-class skipped when class was already known to A_RED at run start."
+                    if effective_first_mode == FIRST_OCCURRENCE_SKIP_KNOWN
+                    else "paper rule — first of any class always counts."
+                )
+                + " Filtered to tiles sent this run if processed_keys provided."
+            ),
         },
+        "PER_CLASS_RR_REPORT": per_class,
+        "RR_CLASS_REPORT_LINES": rr_class_report_lines,
         "RELEVANT_CLASS_SAMPLES": n_rel_pos,
         "RELEVANT_TP": rel_tp,
         "RELEVANT_FN": rel_fn,
@@ -499,22 +772,27 @@ def evaluate_from_annotations_and_queries(
         "FP": fp,
         "FN": fn,
         "TN_NOT_TRACKED": "We only care about query decisions (positives for the query task)",
-        "QUERY_PRECISION_WORK": f"QP = {tp} / ({tp} + {fp}) = {metrics['query_precision']}   (TP/FP over ALL positives: first-of-any-class OR rel-class samples)",
-        "RELEVANT_RECALL_WORK": f"RR = {tp} / ({tp} + {fn}) = {metrics['relevant_recall']}   (TP / (TP + FN) over ALL positives, INCLUDING first appearances of classes)",
+        "QUERY_PRECISION_WORK": f"QP = {tp} / ({tp} + {fp}) = {metrics['query_precision']}   (TP/FP over should-query positives)",
+        "RELEVANT_RECALL_WORK": f"RR = {tp} / ({tp} + {fn}) = {metrics['relevant_recall']}   (TP/(TP+FN) over should-query positives; firsts adjusted by mode={effective_first_mode})",
         "F1_WORK": f"F1 = 2 * QP * RR / (QP + RR) = {metrics['f1_score']}   (harmonic mean of QP and RR)",
         "RANDOM_BASELINE": baseline,
         "RANDOM_RR_EQUALS_QUERY_RATE": metrics.get("baseline_random_relevant_recall"),
         "QP_IMPROVEMENT_RATIO_VS_RANDOM": metrics.get("qp_improvement_ratio_vs_random"),
         "RR_IMPROVEMENT_RATIO_VS_RANDOM": metrics.get("rr_improvement_ratio_vs_random"),
         "TOTAL_STREAM_TILES_USED_FOR_RATES": total,
-        "NOTE_ON_TOTAL": "total_points uses # tiles actually sent to A/RED this run (from processed). Only tiles actually sent are used for should/positives (firsts of any class + relevant class samples).",
-        "PAPER_REFERENCES": "SPIE_IVSP_2026 Sec.5 eq.8-11 (positives = i first sample or ii relevant class); IJSC_2026-1 Alg.1 + evaluation; PerformanceMetricsPlan.md"
+        "NOTE_ON_TOTAL": "total_points uses # tiles actually sent to A/RED this run (from processed). Only tiles actually sent are used for should/positives.",
+        "PAPER_REFERENCES": "SPIE_IVSP_2026 Sec.5 eq.8-11 (positives = i first sample or ii relevant class); IJSC_2026-1 Alg.1 + evaluation; PerformanceMetricsPlan.md. Warm-start adjustment: first_occurrence_mode=skip_known."
     }
 
     # Also keep the older audit for compatibility
     metrics["audit"] = metrics["detailed_breakdown"]  # alias for display
 
     # Summary string for GUI
+    mode_tag = f"firsts={effective_first_mode}"
+    if firsts_skipped_as_known:
+        mode_tag += f"(skip {len(firsts_skipped_as_known)} known)"
+    if firsts_counting_names:
+        mode_tag += f" count[{', '.join(firsts_counting_names)}]"
     metrics["summary"] = (
         f"QP={metrics['query_precision']:.3f}  "
         f"RR={metrics['relevant_recall']:.3f}  "
@@ -522,7 +800,8 @@ def evaluate_from_annotations_and_queries(
         f"Classes={classes_discovered_str}  "
         f"A/RED Queries={n_queries}  "
         f"Total relevant queried={total_relevant_tiles_queried}/{total_relevant_tiles}  "
-        f"vs Random≈{baseline['random_query_precision_approx']:.3f}"
+        f"vs Random≈{baseline['random_query_precision_approx']:.3f}  "
+        f"[{mode_tag}]"
     )
 
     # Attach caller-provided run parameters (kappa, tile size, frame stride, DB path, model, etc.)

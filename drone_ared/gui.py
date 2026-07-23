@@ -1575,37 +1575,64 @@ class MainWindow:
                 r = (audit.get("RELEVANT_CLASS_COUNTS") or {}).get(lab, 0)
                 lines.append(f"   {lab}: {cnt} total labeled ({r} relevant)")
             lines.append("")
-            lines.append("3. FIRST OCCURRENCES (new-class positives part of should):")
-            for lab, fr in sorted((audit.get("FIRST_OCCURRENCE_BY_CLASS") or {}).items(), key=lambda x:x[1]):
-                lines.append(f"   {lab} first seen at frame {fr}")
+            lines.append("3. FIRST OCCURRENCES (warm-start aware):")
+            lines.append(f"   Mode = {audit.get('FIRST_OCCURRENCE_MODE', result.get('first_occurrence_mode', '?'))} "
+                         f"(requested={audit.get('FIRST_OCCURRENCE_MODE_REQUESTED', '?')})")
+            known_start = audit.get("KNOWN_CLASSES_AT_RUN_START") or result.get("known_classes_at_start") or []
+            lines.append(f"   A_RED known at run start ({len(known_start)}): "
+                         + (", ".join(known_start) if known_start else "(none — cold start)"))
+            counting = audit.get("FIRSTS_COUNTING_AS_SHOULD_NAMES") or result.get("firsts_counting_as_should") or []
+            skipped = audit.get("FIRSTS_SKIPPED_ALREADY_KNOWN_TO_ARED") or result.get("firsts_skipped_known_classes") or []
+            lines.append(f"   Firsts COUNTED as should-query ({audit.get('N_FIRST_OF_CLASS_COUNTING_AS_SHOULD', len(counting))}): "
+                         + (", ".join(counting) if counting else "(none)"))
+            lines.append(f"   Firsts SKIPPED already-known ({len(skipped)}): "
+                         + (", ".join(skipped) if skipped else "(none)"))
+            lines.append("   All first-seen frames (for reference):")
+            counting_set = set(counting)
+            skipped_set = set(skipped)
+            for lab, fr in sorted((audit.get("FIRST_OCCURRENCE_BY_CLASS") or {}).items(), key=lambda x: x[1]):
+                tag = "COUNTED" if lab in counting_set else ("SKIPPED_KNOWN" if lab in skipped_set else "?")
+                lines.append(f"     {lab} first at frame {fr}  [{tag}]")
             lines.append("")
-            lines.append("4. SHOULD_QUERY GT POSITIVES (paper definition):")
+            lines.append("4. SHOULD_QUERY GT POSITIVES:")
             lines.append(f"   N_SHOULD_QUERY_TOTAL = {audit.get('N_SHOULD_QUERY_TOTAL', audit.get('should_query_total', '?'))}")
-            lines.append(f"   N_FIRST_OF_CLASS     = {audit.get('N_FIRST_OF_CLASS', '?')}")
+            lines.append(f"   N_FIRST_OF_CLASS (all in video) = {audit.get('N_FIRST_OF_CLASS', '?')}")
+            lines.append(f"   N_FIRST_COUNTING_AS_SHOULD     = {audit.get('N_FIRST_OF_CLASS_COUNTING_AS_SHOULD', '?')}")
             lines.append(f"   N_RELEVANT_CLASS_SAMPLES = {audit.get('RELEVANT_CLASS_SAMPLES', audit.get('RELEVANT_POSITIVES_FOR_RR', '?'))}")
-            lines.append("   (Note: RR uses ALL positives per paper: first appearances of any class + samples from relevant classes. See section 6.)")
+            bd = audit.get("SHOULD_BREAKDOWN") or {}
+            if bd:
+                lines.append(f"   breakdown: first_only≈{bd.get('from_first_only_approx')}  "
+                             f"rel_only≈{bd.get('from_relevant_only_approx')}  "
+                             f"both≈{bd.get('from_both_approx')}")
             lines.append("")
-            lines.append("5. A/RED QUERY OUTCOMES (broad positives for QP and RR):")
+            lines.append("5. PER-CLASS RR REPORT (each class counted toward Relevant Recall):")
+            rr_lines = audit.get("RR_CLASS_REPORT_LINES") or result.get("rr_class_report_lines") or []
+            if rr_lines:
+                for ln in rr_lines:
+                    lines.append(f"   {ln}")
+            else:
+                lines.append("   (no per-class report available)")
+            lines.append("")
+            lines.append("6. A/RED QUERY OUTCOMES (should-query positives for QP and RR):")
             lines.append(f"   TP (queried a positive) = {result.get('tp', audit.get('TP', '?'))}")
             lines.append(f"   FP (queried but not a positive) = {result.get('fp', audit.get('FP', '?'))}")
             lines.append(f"   FN (positive but not queried) = {result.get('fn', audit.get('FN', '?'))}")
-            lines.append("   Note: positives = (first sample of any class) OR (any sample of a relevant-designated class)")
+            lines.append("   Note: positives = (first of NEW class under mode) OR (any sample of a relevant class)")
             lines.append("")
             lines.append("   (For reference: relevant-class samples only)")
             lines.append(f"   relevant class samples = {audit.get('RELEVANT_CLASS_SAMPLES', result.get('n_relevant_positives', '?'))}")
             lines.append(f"   relevant TP (queried among them) = {result.get('relevant_tp', audit.get('RELEVANT_TP', '?'))}")
             lines.append(f"   relevant FN = {result.get('relevant_fn', audit.get('RELEVANT_FN', '?'))}")
             lines.append("")
-            lines.append("6. EXACT CALCULATIONS (formulas + numbers from papers):")
+            lines.append("7. EXACT CALCULATIONS (formulas + numbers from papers):")
             lines.append(f"   QP = TP / (TP + FP)   --> {result.get('query_precision', 0)}")
             lines.append(f"   RR = TP / (TP + FN)   --> {result.get('relevant_recall', 0)}")
             lines.append(f"   F1 = 2 * QP * RR / (QP + RR)   --> {result.get('f1_score', 0)}")
             lines.append(f"   Classes discovered (queried by A/RED this run / unique classes in run): {result.get('classes_discovered_x_of_y', '?')}")
-            lines.append(f"   (RR includes first appearances of classes + relevant samples)")
             lines.append(f"   (Cache-satisfied A/RED decisions are included in the query count above.)")
             lines.append("")
             bl = audit.get("RANDOM_BASELINE", {})
-            lines.append("7. RANDOM BASELINE (from papers at same query count):")
+            lines.append("8. RANDOM BASELINE (from papers at same query count):")
             lines.append(f"   approx QP = relevant_rate = {bl.get('relevant_rate', '?')}")
 
         if "summary" in result:
