@@ -37,6 +37,7 @@ from .annotation_domain import TileKey, AnnotationFilter
 from .tile_database import TileAnnotationDB
 from .gui_bulk_dialog import BulkLabelOpsDialog  # modular bulk editing UI
 from .logutil import vprint, set_terminal_logging
+from .tile_selection import linear_select_tile_indices, tile_explorer_modifier_flags
 # GridTiler is imported lazily inside the browser (to avoid pulling numpy/PIL deps at gui module load
 # if not already present from other paths).
 
@@ -2888,6 +2889,7 @@ class LabelReviewWindow(tk.Toplevel):
 
 
 # Bulk ops dialog extracted to gui_bulk_dialog.py (imported at top)
+# Tile multi-select helpers: tile_selection.py (pure; unit-tested)
 
 # =============================================================================
 # MultiFrameLabelBrowser - NEW visual scrollable multi-frame overview + per-frame labeling
@@ -2906,6 +2908,9 @@ class MultiFrameLabelBrowser(tk.Toplevel):
           (generated live with GridTiler).
         * Labeled tiles show their current label + relevant marker.
         * Click any tile → Quick assign dialog (existing classes + new + relevant).
+        * Ctrl+click toggles multi-select; Shift+click selects a contiguous range in
+          display order; Ctrl+Shift+click adds a range to the current selection;
+          "Label selected" applies one label to the whole set.
         * Saves directly to the exact TileAnnotationDB.
     - Also supports jumping the main Label Only sequential cursor to the frame.
     - Focused on visual review/scrolling of labels (complements the single-tile
@@ -4244,6 +4249,11 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         Critical UX: the canvas must keep a correct scrollregion and support mouse-wheel
         scrolling. Without that, dense non-overlapping grids (small tile sizes → many rows)
         appear "cut off" after ~3–4 visible rows.
+
+        Multi-select (additive; plain click baseline unchanged):
+        - Ctrl+click: toggle tile in/out of selection
+        - Shift+click: rectangular range from anchor to clicked tile (tile_row/col)
+        - "Label selected (N)": one dialog applies label to the whole set
         """
         if self.selected_frame is None or not self.current_video:
             messagebox.showinfo("Explorer", "Select a frame first.")
@@ -4255,12 +4265,71 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         explorer.minsize(900, 600)
         explorer.resizable(True, True)
 
-        top = ttk.Frame(explorer)
-        top.pack(fill="x", padx=8, pady=6)
-        info_var = tk.StringVar(value=f"Frame {self.selected_frame} — click any tile to label/edit  |  scroll for more rows")
-        ttk.Label(top, textvariable=info_var).pack(side="left")
-        # Keep a handle so populate can update the status line with tile counts
+        # Multi-select state lives on this explorer window only (cleared on retile).
+        explorer._selected_tile_idxs = set()
+        explorer._selection_anchor = None
+        explorer._tile_card_by_idx = {}
+        explorer._tile_obj_by_idx = {}
+        explorer._sel_count_var = tk.StringVar(value="Label selected (0)")
+
+        # ---- Compact header: toolbar row (always fits) + wrapping status ----
+        # Previously one packed row mixed a long status Label with buttons; the
+        # label forced the bar wider than the window and hid "Label selected".
+        header = ttk.Frame(explorer)
+        header.pack(fill="x", padx=8, pady=(6, 2))
+
+        toolbar = ttk.Frame(header)
+        toolbar.pack(fill="x")
+
+        # Left: preview size only
+        left_tools = ttk.Frame(toolbar)
+        left_tools.pack(side="left")
+        ttk.Label(left_tools, text="Preview:").pack(side="left")
+        preview_var = tk.IntVar(value=int(getattr(self, "tile_preview_size", 300) or 300))
+        explorer._tile_preview_var = preview_var
+        preview_scale = ttk.Scale(
+            left_tools, from_=120, to=480, variable=preview_var, orient="horizontal", length=100,
+        )
+        preview_scale.pack(side="left", padx=4)
+        preview_lbl = ttk.Label(left_tools, text=f"{preview_var.get()}px", width=5)
+        preview_lbl.pack(side="left")
+
+        # Right: primary actions (packed first on the right so they stay visible)
+        right_tools = ttk.Frame(toolbar)
+        right_tools.pack(side="right")
+
+        def _label_selected():
+            self._label_selected_tiles(explorer, tile_container, canvas)
+
+        def _clear_sel():
+            self._clear_tile_selection(explorer)
+
+        sel_btn = ttk.Button(right_tools, textvariable=explorer._sel_count_var, command=_label_selected)
+        sel_btn.pack(side="left", padx=(0, 4))
+        explorer._label_selected_btn = sel_btn
+        ttk.Button(right_tools, text="Clear", command=_clear_sel).pack(side="left", padx=2)
+        ttk.Button(
+            right_tools, text="Refresh",
+            command=lambda: self._populate_frame_tile_grid(explorer, tile_container, canvas),
+        ).pack(side="left", padx=2)
+
+        # Status under toolbar — wraps inside the window width (never pushes buttons)
+        info_var = tk.StringVar(
+            value=f"Frame {self.selected_frame}  ·  click=label  Ctrl=toggle  Shift=range  Ctrl+Shift=add"
+        )
         explorer._tile_explorer_info_var = info_var
+        status_lbl = ttk.Label(header, textvariable=info_var, justify="left", anchor="w")
+        status_lbl.pack(fill="x", pady=(4, 2))
+        explorer._tile_explorer_status_lbl = status_lbl
+
+        def _sync_status_wrap(_event=None):
+            try:
+                w = max(200, int(header.winfo_width()) - 16)
+                status_lbl.configure(wraplength=w)
+            except Exception:
+                pass
+
+        header.bind("<Configure>", _sync_status_wrap)
 
         # Body: canvas + vertical (and horizontal) scrollbars so tall/wide grids are fully reachable
         body = ttk.Frame(explorer)
@@ -4283,17 +4352,6 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         explorer._tile_canvas = canvas
         explorer._tile_container = tile_container
         explorer._tile_win_id = win_id
-
-        # Preview size control (default 300×300; upscales small native tiles for easier viewing)
-        ttk.Label(top, text="  Preview:").pack(side="left", padx=(12, 0))
-        preview_var = tk.IntVar(value=int(getattr(self, "tile_preview_size", 300) or 300))
-        explorer._tile_preview_var = preview_var
-        preview_scale = ttk.Scale(
-            top, from_=120, to=480, variable=preview_var, orient="horizontal", length=120,
-        )
-        preview_scale.pack(side="left", padx=4)
-        preview_lbl = ttk.Label(top, text=f"{preview_var.get()}px", width=5)
-        preview_lbl.pack(side="left")
 
         def _sync_preview_lbl(*_):
             try:
@@ -4364,14 +4422,146 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         explorer._bind_tile_wheel = _bind_wheel_recursive
         explorer._on_tile_mousewheel = _on_mousewheel
 
-        ttk.Button(
-            top, text="Refresh / Re-tile",
-            command=lambda: self._populate_frame_tile_grid(explorer, tile_container, canvas),
-        ).pack(side="right", padx=4)
+        def _on_escape(_event=None):
+            self._clear_tile_selection(explorer)
+            return "break"
+
+        def _on_return_label(_event=None):
+            # Only when a multi-selection exists (do not steal plain single-tile flow).
+            if getattr(explorer, "_selected_tile_idxs", None):
+                self._label_selected_tiles(explorer, tile_container, canvas)
+                return "break"
+
+        explorer.bind("<Escape>", _on_escape)
+        explorer.bind("<Return>", _on_return_label)
+        explorer.focus_set()
 
         explorer.update_idletasks()
+        _sync_status_wrap()
         self.after(30, lambda: self._populate_frame_tile_grid(explorer, tile_container, canvas))
         self.after(100, _on_canvas_configure)
+
+    def _clear_tile_selection(self, explorer_win):
+        """Clear multi-select set and visuals on a tile explorer window."""
+        try:
+            explorer_win._selected_tile_idxs = set()
+            explorer_win._selection_anchor = None
+        except Exception:
+            return
+        self._refresh_tile_selection_visuals(explorer_win)
+
+    def _refresh_tile_selection_visuals(self, explorer_win):
+        """Update card borders + toolbar label for the current multi-select set."""
+        selected = getattr(explorer_win, "_selected_tile_idxs", None) or set()
+        cards = getattr(explorer_win, "_tile_card_by_idx", None) or {}
+        for idx, card in list(cards.items()):
+            try:
+                if idx in selected:
+                    card.configure(
+                        highlightbackground="#3aa0ff",
+                        highlightcolor="#3aa0ff",
+                        highlightthickness=3,
+                        bd=1,
+                        relief="solid",
+                        bg="#2a3a4a",
+                    )
+                else:
+                    card.configure(
+                        highlightbackground="#555555",
+                        highlightcolor="#555555",
+                        highlightthickness=1,
+                        bd=1,
+                        relief="groove",
+                        bg="#2b2b2b",
+                    )
+            except Exception:
+                pass
+        n = len(selected)
+        try:
+            explorer_win._sel_count_var.set(f"Label selected ({n})")
+        except Exception:
+            pass
+        info_var = getattr(explorer_win, "_tile_explorer_info_var", None)
+        base = getattr(explorer_win, "_tile_explorer_info_base", None)
+        if info_var is not None and base:
+            if n:
+                info_var.set(f"{base}  ·  {n} selected")
+            else:
+                info_var.set(base)
+
+    def _on_tile_explorer_click(self, event, explorer_win, tile, idx, grid_container, canvas_ref):
+        """Route tile clicks: Ctrl toggle, Shift linear range, plain click = baseline single-label.
+
+        Shift range is **list order** (how tiles are shown: left→right, top→bottom), not a
+        spatial (tile_row, tile_col) box. A spatial box from the first tile of row 0 to the
+        first tile of row 1 only kept column 0 and dropped the rest of row 0.
+
+        - Shift: replace selection with [anchor .. click]
+        - Ctrl+Shift: union that range into the existing selection (add another block)
+        - Ctrl: toggle one tile and move the range anchor to it (use this to start a new block)
+        """
+        ctrl, shift = tile_explorer_modifier_flags(getattr(event, "state", 0))
+        n_tiles = len(getattr(self, "current_frame_tiles", None) or [])
+
+        if shift:
+            anchor = getattr(explorer_win, "_selection_anchor", None)
+            if anchor is None or n_tiles == 0:
+                # No anchor yet: this click becomes the range start.
+                explorer_win._selected_tile_idxs = {idx}
+                explorer_win._selection_anchor = idx
+            else:
+                new_range = linear_select_tile_indices(n_tiles, int(anchor), int(idx))
+                if ctrl:
+                    # Add range to existing selection (do not wipe earlier blocks).
+                    prev = getattr(explorer_win, "_selected_tile_idxs", None) or set()
+                    explorer_win._selected_tile_idxs = set(prev) | new_range
+                else:
+                    # Replace with contiguous block from anchor → click.
+                    explorer_win._selected_tile_idxs = new_range
+                # Keep anchor fixed so repeated Shift+clicks adjust the same range end.
+            self._refresh_tile_selection_visuals(explorer_win)
+            return
+
+        if ctrl:
+            selected = getattr(explorer_win, "_selected_tile_idxs", None)
+            if selected is None:
+                selected = set()
+                explorer_win._selected_tile_idxs = selected
+            if idx in selected:
+                selected.discard(idx)
+            else:
+                selected.add(idx)
+            # Anchor moves here so the next Shift+click ranges from this tile
+            # (start a new block: Ctrl+click start, then Shift+click end).
+            explorer_win._selection_anchor = idx
+            self._refresh_tile_selection_visuals(explorer_win)
+            return
+
+        # Baseline: plain click opens single-tile label dialog (unchanged behavior).
+        self._clear_tile_selection(explorer_win)
+        self._quick_label_tile(explorer_win, tile, idx, grid_container, canvas_ref)
+
+    def _label_selected_tiles(self, explorer_win, grid_container, canvas_ref):
+        """Open the quick-label dialog for all currently multi-selected tiles."""
+        selected = sorted(getattr(explorer_win, "_selected_tile_idxs", None) or [])
+        if not selected:
+            messagebox.showinfo(
+                "Label selected",
+                "No tiles selected.\n"
+                "Ctrl+click a start tile, Shift+click the end (range in display order).\n"
+                "Ctrl+Shift+click adds another range. Esc clears.",
+            )
+            return
+        tiles = list(getattr(self, "current_frame_tiles", None) or [])
+        targets = []
+        for i in selected:
+            if 0 <= i < len(tiles):
+                targets.append((tiles[i], i))
+        if not targets:
+            messagebox.showinfo("Label selected", "Selection is stale; try Refresh / Re-tile.")
+            self._clear_tile_selection(explorer_win)
+            return
+        self._quick_label_tiles(explorer_win, targets, grid_container, canvas_ref)
 
     def _populate_frame_tile_grid(self, explorer_win, container, canvas_ref=None):
         """Build a fully scrollable grid of every tile on the selected frame.
@@ -4379,6 +4569,9 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         Uses live tile size + stride (overlap if enabled). Thumb size scales down when
         there are many tiles (typical for small non-overlapping sizes) so more of the
         frame is visible without scrolling, while the canvas still scrolls to the rest.
+
+        Multi-select indices are cleared on every rebuild (retile / preview resize) so
+        they cannot point at stale tile slots.
         """
         for w in container.winfo_children():
             w.destroy()
@@ -4386,6 +4579,17 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         self.current_frame_tiles = []
         self.current_frame_tile_labels = {}
         self._tile_photo_refs.clear()
+
+        # Reset multi-select maps on this explorer (indices would be invalid after rebuild).
+        try:
+            explorer_win._selected_tile_idxs = set()
+            explorer_win._selection_anchor = None
+            explorer_win._tile_card_by_idx = {}
+            explorer_win._tile_obj_by_idx = {}
+            if hasattr(explorer_win, "_sel_count_var"):
+                explorer_win._sel_count_var.set("Label selected (0)")
+        except Exception:
+            pass
 
         if not self.current_video or self.selected_frame is None:
             ttk.Label(container, text="Could not load frame.").pack()
@@ -4456,13 +4660,24 @@ class MultiFrameLabelBrowser(tk.Toplevel):
             max_r = max((t.tile_row for t in tiles), default=0) + 1
             max_c = max((t.tile_col for t in tiles), default=0) + 1
 
+            # Keep status short; long one-line text used to blow out the header width.
+            info_base = (
+                f"Frame {self.selected_frame}  ·  {n_tiles} tiles "
+                f"({max_c}×{max_r}, {tw}×{th}, stride {sx}×{sy})  ·  "
+                f"click=label  Ctrl=toggle  Shift=range  Ctrl+Shift=add"
+            )
+            explorer_win._tile_explorer_info_base = info_base
             info_var = getattr(explorer_win, "_tile_explorer_info_var", None)
             if info_var is not None:
-                info_var.set(
-                    f"Frame {self.selected_frame}  |  {n_tiles} tiles  "
-                    f"({max_c}×{max_r} grid, tile {tw}×{th}, stride {sx}×{sy})  "
-                    f"|  scroll for all rows  |  click a tile to label"
-                )
+                info_var.set(info_base)
+            # Re-wrap status to current header width after text change
+            try:
+                st = getattr(explorer_win, "_tile_explorer_status_lbl", None)
+                if st is not None:
+                    w = max(200, int(st.winfo_toplevel().winfo_width()) - 40)
+                    st.configure(wraplength=w)
+            except Exception:
+                pass
 
             for idx, tile in enumerate(tiles):
                 label = None
@@ -4481,10 +4696,23 @@ class MultiFrameLabelBrowser(tk.Toplevel):
                     pass
 
                 self.current_frame_tile_labels[idx] = (label, rel)
+                explorer_win._tile_obj_by_idx[idx] = tile
 
-                card = ttk.Frame(container, relief="groove", borderwidth=2, padding=3)
+                # tk.Frame (not ttk) so multi-select highlight borders are visible.
+                card = tk.Frame(
+                    container,
+                    relief="groove",
+                    borderwidth=1,
+                    highlightthickness=1,
+                    highlightbackground="#555555",
+                    highlightcolor="#555555",
+                    bg="#2b2b2b",
+                    padx=3,
+                    pady=3,
+                )
                 r, c = divmod(idx, cols)
                 card.grid(row=r, column=c, padx=4, pady=4, sticky="nsew")
+                explorer_win._tile_card_by_idx[idx] = card
 
                 # Scale to a fixed preview box (upscale small tiles, downscale large ones).
                 # thumbnail() never enlarges; resize() does, which is what we want for
@@ -4499,26 +4727,38 @@ class MultiFrameLabelBrowser(tk.Toplevel):
                 tkimg = ImageTk.PhotoImage(small)
                 self._tile_photo_refs.append(tkimg)
 
-                img_lbl = ttk.Label(card, image=tkimg)
+                img_lbl = tk.Label(card, image=tkimg, bg="#2b2b2b", bd=0)
                 img_lbl.pack()
 
                 status = f"r{tile.tile_row}c{tile.tile_col}  {label or 'unlabeled'}{' [R]' if rel else ''}"
-                ttk.Label(card, text=status, width=max(18, thumb_size // 10), anchor="center").pack(pady=2)
+                tk.Label(
+                    card, text=status, width=max(18, thumb_size // 10), anchor="center",
+                    bg="#2b2b2b", fg="#e0e0e0",
+                ).pack(pady=2)
 
-                def make_edit(t=tile, i=idx):
-                    return lambda e: self._quick_label_tile(explorer_win, t, i, container, canvas_ref)
+                def make_click(t=tile, i=idx):
+                    return lambda e: self._on_tile_explorer_click(
+                        e, explorer_win, t, i, container, canvas_ref
+                    )
 
-                for child in (card, img_lbl):
-                    child.bind("<Button-1>", make_edit())
-                    # Wheel over cards must still scroll the outer canvas
-                    mw = getattr(explorer_win, "_on_tile_mousewheel", None)
-                    if mw is not None:
-                        try:
+                click_handler = make_click()
+                # Bind image + card; also status label so clicks anywhere on the cell work.
+                for child in card.winfo_children():
+                    child.bind("<Button-1>", click_handler)
+                card.bind("<Button-1>", click_handler)
+
+                mw = getattr(explorer_win, "_on_tile_mousewheel", None)
+                if mw is not None:
+                    try:
+                        card.bind("<MouseWheel>", mw)
+                        card.bind("<Button-4>", mw)
+                        card.bind("<Button-5>", mw)
+                        for child in card.winfo_children():
                             child.bind("<MouseWheel>", mw)
                             child.bind("<Button-4>", mw)
                             child.bind("<Button-5>", mw)
-                        except Exception:
-                            pass
+                    except Exception:
+                        pass
 
             for i in range(cols):
                 container.columnconfigure(i, weight=1)
@@ -4550,16 +4790,49 @@ class MultiFrameLabelBrowser(tk.Toplevel):
             traceback.print_exc()
             messagebox.showerror("Tile Explorer", str(e))
 
+    def _save_tile_label(self, tile: "Tile", tile_local_idx: int, name: str, rel: bool) -> None:
+        """Persist one tile label via the same DB path used by single-tile labeling."""
+        cx, cy = tile.bbox[0], tile.bbox[1]
+        sx, sy = self._get_live_stride(tile.width, tile.height)
+        if self.annotation_manager:
+            key = TileKey(
+                self.current_video, tile.frame_idx, tile.tile_row, tile.tile_col,
+                tile.width, tile.height, stride_x=sx, stride_y=sy,
+            )
+            self.annotation_manager.db.set_annotation_for_key(
+                key, name, rel, embedding=None, crop_x=cx, crop_y=cy
+            )
+        else:
+            self.tile_db.set_annotation(
+                self.current_video, tile.frame_idx,
+                tile.tile_row, tile.tile_col, tile.width, tile.height,
+                name, rel, embedding=None, crop_x=cx, crop_y=cy,
+            )
+        self.current_frame_tile_labels[tile_local_idx] = (name, rel)
 
     def _quick_label_tile(self, parent, tile: "Tile", tile_local_idx: int, grid_container, canvas_ref):
         """Quick label dialog for a specific tile. Saves to DB and refreshes grid."""
+        self._quick_label_tiles(parent, [(tile, tile_local_idx)], grid_container, canvas_ref)
+
+    def _quick_label_tiles(self, parent, targets, grid_container, canvas_ref):
+        """Quick label dialog for one or more tiles. Same UX as single-tile; multi applies to all.
+
+        ``targets`` is a list of ``(tile, local_idx)``. Baseline single-click passes one entry.
+        """
+        if not targets:
+            return
+        tile0, idx0 = targets[0]
+        n = len(targets)
+
         q = tk.Toplevel(parent)
-        q.title(f"Label Tile r{tile.tile_row}c{tile.tile_col} (f{tile.frame_idx})")
+        if n == 1:
+            q.title(f"Label Tile r{tile0.tile_row}c{tile0.tile_col} (f{tile0.frame_idx})")
+        else:
+            q.title(f"Label {n} tiles on frame {tile0.frame_idx}")
         q.geometry("680x980")
 
-        s = self.ui_scale
         # Image: upscale small tiles so they are easy to see in the edit dialog
-        big = tile.image.copy()
+        big = tile0.image.copy()
         target = max(300, int(getattr(self, "tile_preview_size", 300) or 300))
         target = min(520, max(target, 420))  # roomy default for the dialog
         ow, oh = big.size
@@ -4571,14 +4844,31 @@ class MultiFrameLabelBrowser(tk.Toplevel):
 
         tkbig = ImageTk.PhotoImage(big)
         ttk.Label(q, image=tkbig).pack(pady=4)
-        # keep ref on q
         q._img_ref = tkbig
 
-        # Current
-        cur = self.current_frame_tile_labels.get(tile_local_idx, (None, False))
-        cur_label, cur_rel = cur
+        if n > 1:
+            ttk.Label(
+                q,
+                text=f"Applying to {n} selected tiles (preview shows first: r{tile0.tile_row}c{tile0.tile_col})",
+            ).pack()
 
-        ttk.Label(q, text=f"Current: {cur_label or 'unlabeled'}  (relevant={cur_rel})").pack()
+        # Current label summary
+        labels_seen = []
+        rels_seen = []
+        for _t, li in targets:
+            cur_l, cur_r = self.current_frame_tile_labels.get(li, (None, False))
+            labels_seen.append(cur_l)
+            rels_seen.append(bool(cur_r))
+        uniq_labels = {x for x in labels_seen}
+        if len(uniq_labels) == 1:
+            cur_label = next(iter(uniq_labels))
+            cur_rel = all(rels_seen) if cur_label else False
+            cur_txt = f"Current: {cur_label or 'unlabeled'}  (relevant={cur_rel})"
+        else:
+            cur_label = None
+            cur_rel = False
+            cur_txt = f"Current: mixed labels across {n} tiles"
+        ttk.Label(q, text=cur_txt).pack()
 
         # Known classes from DB (good for this browser)
         known = []
@@ -4588,8 +4878,8 @@ class MultiFrameLabelBrowser(tk.Toplevel):
             pass
         if not known and self.main_window:
             try:
-                known = list(getattr(self.main_window, 'discovered_classes', [])) or []
-            except:
+                known = list(getattr(self.main_window, "discovered_classes", [])) or []
+            except Exception:
                 pass
 
         # Determine suggested relevant flag from known class relevance (auto-apply to prevent errors)
@@ -4597,21 +4887,20 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         if cur_label and cur_label in self.class_relevance:
             suggested_rel = self.class_relevance[cur_label]
 
-        large_font = ("TkDefaultFont", int(10*self.ui_scale))
+        large_font = ("TkDefaultFont", int(10 * self.ui_scale))
 
         ttk.Label(q, text="Existing classes (double-click or select + Assign):").pack(anchor="w", padx=8)
         lb = tk.Listbox(q, height=10, exportselection=False, font=large_font)
         lb.pack(fill="x", padx=8)
-        for k in sorted(set(known)):
+        known_sorted = sorted(set(known))
+        for k in known_sorted:
             lb.insert("end", k)
-        if cur_label and cur_label in known:
+        if cur_label and cur_label in known_sorted:
             try:
-                idx = sorted(set(known)).index(cur_label)
-                lb.selection_set(idx)
-            except:
+                lb.selection_set(known_sorted.index(cur_label))
+            except Exception:
                 pass
 
-        # When user selects a class from the list, auto-update the relevant checkbox
         def _on_class_selected(event=None):
             try:
                 sel = lb.get(lb.curselection())
@@ -4621,7 +4910,18 @@ class MultiFrameLabelBrowser(tk.Toplevel):
                 pass
         lb.bind("<<ListboxSelect>>", _on_class_selected)
 
-        # New class
+        def _on_double_assign(event=None):
+            try:
+                sel = lb.get(lb.curselection())
+                if sel:
+                    new_var.set(sel)
+                    if sel in self.class_relevance:
+                        rel_var.set(self.class_relevance[sel])
+                    do_assign()
+            except Exception:
+                pass
+        lb.bind("<Double-Button-1>", _on_double_assign)
+
         newf = ttk.Frame(q)
         newf.pack(fill="x", padx=8, pady=4)
         ttk.Label(newf, text="New / Edit class:").pack(side="left")
@@ -4638,48 +4938,40 @@ class MultiFrameLabelBrowser(tk.Toplevel):
                 return
             rel = rel_var.get()
             # Enforce class-level relevance: if this class is known relevant, the tile must be too.
-            # This prevents the common mistake of forgetting to tick "relevant" on every instance.
             if name in self.class_relevance and self.class_relevance[name]:
                 rel = True
-            # If the user marked this (new) class as relevant, remember it for future tiles
             if rel:
                 self.class_relevance[name] = True
             try:
-                cx, cy = tile.bbox[0], tile.bbox[1]
-                sx, sy = self._get_live_stride(tile.width, tile.height)
-                if self.annotation_manager:
-                    key = TileKey(self.current_video, tile.frame_idx, tile.tile_row, tile.tile_col,
-                                  tile.width, tile.height, stride_x=sx, stride_y=sy)
-                    self.annotation_manager.db.set_annotation_for_key(key, name, rel, embedding=None, crop_x=cx, crop_y=cy)
-                else:
-                    self.tile_db.set_annotation(
-                        self.current_video, tile.frame_idx,
-                        tile.tile_row, tile.tile_col, tile.width, tile.height,
-                        name, rel, embedding=None, crop_x=cx, crop_y=cy
-                    )
-                # Update local
-                self.current_frame_tile_labels[tile_local_idx] = (name, rel)
+                for t, li in targets:
+                    self._save_tile_label(t, li, name, rel)
                 q.destroy()
-                # Refresh the grid
+                # Clear multi-select before rebuild (rebuild also clears, but keep explicit).
+                try:
+                    parent._selected_tile_idxs = set()
+                    parent._selection_anchor = None
+                except Exception:
+                    pass
                 self._populate_frame_tile_grid(parent, grid_container, canvas_ref)
-                # Light refresh: update counts on strip cards, keep thumbs loaded
                 self._refresh_annotations_light()
 
-                # Make the name known immediately for clickability in the main lists.
-                # Do NOT bump any "query count" here — this is manual labeling in the browser,
-                # not an A/RED query decision. The A/RED query counts come only from the adapter.
+                # Make the name known immediately. Do NOT bump A/RED query counts.
                 try:
                     if self.main_window is not None:
                         self.main_window.discovered_classes.add(name)
-                        if hasattr(self.main_window, '_refresh_class_list'):
+                        if hasattr(self.main_window, "_refresh_class_list"):
                             self.main_window._refresh_class_list()
                 except Exception:
                     pass
             except Exception as e:
                 messagebox.showerror("Save", str(e))
 
-        ttk.Button(q, text="Assign / Update Label", command=do_assign).pack(fill="x", padx=8, pady=6)
-        ttk.Button(q, text="Mark Background", command=lambda: (new_var.set("__BACKGROUND__"), rel_var.set(False), do_assign())).pack(fill="x", padx=8)
+        assign_txt = "Assign / Update Label" if n == 1 else f"Assign / Update Label on {n} tiles"
+        ttk.Button(q, text=assign_txt, command=do_assign).pack(fill="x", padx=8, pady=6)
+        ttk.Button(
+            q, text="Mark Background",
+            command=lambda: (new_var.set("__BACKGROUND__"), rel_var.set(False), do_assign()),
+        ).pack(fill="x", padx=8)
         ttk.Button(q, text="Cancel", command=q.destroy).pack(fill="x", padx=8, pady=2)
 
     def _edit_selected_tile_from_list(self):
