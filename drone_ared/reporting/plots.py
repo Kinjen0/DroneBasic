@@ -147,6 +147,231 @@ def plot_run_curves(
     return out_path
 
 
+def plot_batch_curves(
+    run: RunRecord,
+    out_path: Union[str, Path],
+    metrics: Sequence[str] = (
+        "batch_query_precision",
+        "batch_relevant_recall",
+        "batch_f1_score",
+        "section_query_rate",
+        "section_relevant_rate",
+    ),
+    title: Optional[str] = None,
+    dpi: int = 140,
+) -> Path:
+    """
+    Batch-window QP / RR / F1 (plus section rates) vs tiles processed.
+
+    Each point is the score for tiles since the previous checkpoint only —
+    not cumulative stream quality. Title/legend make that explicit.
+    """
+    plt = _plt()
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    metric_labels = {
+        "batch_query_precision": "Batch QP",
+        "batch_relevant_recall": "Batch RR",
+        "batch_f1_score": "Batch F1",
+        "query_precision": "Batch QP",
+        "relevant_recall": "Batch RR",
+        "f1_score": "Batch F1",
+        "section_query_rate": "Query rate (section)",
+        "section_relevant_rate": "Relevant rate (section)",
+        "batch_query_rate": "Batch query rate",
+        "batch_relevant_rate": "Batch relevant rate",
+    }
+    metric_styles = {
+        "batch_query_precision": {"linestyle": "-", "linewidth": 1.8},
+        "batch_relevant_recall": {"linestyle": "-", "linewidth": 1.8},
+        "batch_f1_score": {"linestyle": "-", "linewidth": 1.8},
+        "section_query_rate": {"linestyle": "--", "linewidth": 1.6},
+        "section_relevant_rate": {"linestyle": "--", "linewidth": 1.6},
+        "batch_query_rate": {"linestyle": "--", "linewidth": 1.6},
+        "batch_relevant_rate": {"linestyle": "--", "linewidth": 1.6},
+    }
+
+    # Normalize bare names to batch_ fields for series lookup
+    resolved = []
+    for m in metrics:
+        if m in (
+            "query_precision",
+            "relevant_recall",
+            "f1_score",
+            "query_rate",
+            "relevant_rate",
+        ):
+            resolved.append(f"batch_{m}")
+        else:
+            resolved.append(m)
+
+    fig, axes = plt.subplots(
+        2, 1, figsize=(9.5, 7.5), sharex=True, gridspec_kw={"height_ratios": [2.4, 1.2]}
+    )
+    ax0, ax1 = axes
+
+    any_line = False
+    for m in resolved:
+        series = run.checkpoint_series(m)
+        if not series:
+            continue
+        xs = [t for t, _ in series]
+        ys = [v for _, v in series]
+        style = metric_styles.get(m, {"linestyle": "-", "linewidth": 1.5})
+        ax0.plot(
+            xs,
+            ys,
+            marker="o",
+            markersize=3,
+            label=metric_labels.get(m, m),
+            **style,
+        )
+        any_line = True
+
+    if not any_line:
+        ax0.text(
+            0.5,
+            0.5,
+            "No batch metric checkpoints yet\n"
+            "(need DB labels during run + batch metrics enabled)",
+            ha="center",
+            va="center",
+            transform=ax0.transAxes,
+            fontsize=11,
+            color="#666",
+        )
+    else:
+        ax0.legend(loc="best", fontsize=8, ncol=2)
+        ax0.set_ylim(-0.02, 1.05)
+
+    ax0.set_ylabel("Batch score / rate")
+    ax0.set_title(title or f"Batch-window metrics — {run.short_label()}")
+    ax0.grid(True, alpha=0.3)
+    ax0.axhline(0, color="#ccc", linewidth=0.5)
+    ax0.axhline(1, color="#ccc", linewidth=0.5)
+
+    # Lower panel: section queries per batch + section query rate
+    sec_q = run.checkpoint_series("section_ared_queries")
+    if sec_q:
+        ax1.bar(
+            [t for t, _ in sec_q],
+            [v for _, v in sec_q],
+            width=max(1, (sec_q[-1][0] - sec_q[0][0]) / max(1, len(sec_q) * 2)),
+            color="#d62728",
+            alpha=0.55,
+            label="Queries in batch",
+        )
+    sec_qr = run.checkpoint_series("section_query_rate")
+    if sec_qr:
+        ax1b = ax1.twinx()
+        ax1b.plot(
+            [t for t, _ in sec_qr],
+            [v for _, v in sec_qr],
+            color="#ff7f0e",
+            linestyle=":",
+            marker="^",
+            markersize=3,
+            linewidth=1.4,
+            label="Section query rate",
+        )
+        ax1b.set_ylabel("Section QR", color="#ff7f0e")
+        ax1b.tick_params(axis="y", labelcolor="#ff7f0e")
+        ax1b.set_ylim(-0.02, max(1.05, max((v for _, v in sec_qr), default=0.1) * 1.15))
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax1b.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left", fontsize=8)
+    else:
+        ax1.legend(loc="upper left", fontsize=8)
+
+    ax1.set_xlabel("Tiles processed (end of batch)")
+    ax1.set_ylabel("Batch queries")
+    ax1.grid(True, alpha=0.3)
+
+    rp = run.run_params or {}
+    vid = run.video_filename() or rp.get("video_filename") or "?"
+    model_s = rp.get("ared_model_summary") or run.ared_model_label()
+    footer = (
+        f"BATCH metrics (per checkpoint window)  "
+        f"video={vid}  model={model_s}  "
+        f"κ={rp.get('kappa', '?')}  tile={rp.get('tile_size', '?')}  "
+        f"ckpt_every={rp.get('metrics_checkpoint_every', '?')}  "
+        f"status={run.status}"
+    )
+    fig.text(0.5, 0.01, footer, ha="center", fontsize=7.5, color="#444")
+
+    fig.tight_layout(rect=[0, 0.03, 1, 1])
+    fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+def plot_batch_vs_cumulative(
+    run: RunRecord,
+    metric: str = "relevant_recall",
+    out_path: Union[str, Path] = "batch_vs_cumul.png",
+    title: Optional[str] = None,
+    dpi: int = 140,
+) -> Path:
+    """Overlay cumulative vs batch-window series for one quality metric."""
+    plt = _plt()
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    bare = metric[6:] if str(metric).startswith("batch_") else metric
+    cumul = run.checkpoint_series(bare)
+    batch = run.batch_series(bare)
+
+    labels = {
+        "query_precision": "Query Precision (QP)",
+        "relevant_recall": "Relevant Recall (RR)",
+        "f1_score": "F1 score",
+    }
+    nice = labels.get(bare, bare)
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    if cumul:
+        ax.plot(
+            [t for t, _ in cumul],
+            [v for _, v in cumul],
+            marker="o",
+            markersize=3,
+            linewidth=1.8,
+            label=f"Cumulative {nice}",
+        )
+    if batch:
+        ax.plot(
+            [t for t, _ in batch],
+            [v for _, v in batch],
+            marker="s",
+            markersize=3,
+            linewidth=1.6,
+            linestyle="--",
+            label=f"Batch {nice}",
+        )
+    if not cumul and not batch:
+        ax.text(
+            0.5,
+            0.5,
+            f"No '{bare}' / batch data",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+        )
+    else:
+        ax.legend(loc="best", fontsize=8)
+        ax.set_ylim(-0.02, 1.05)
+
+    ax.set_xlabel("Tiles processed")
+    ax.set_ylabel(nice)
+    ax.set_title(title or f"Cumulative vs batch — {nice} — {run.short_label()}")
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
 def plot_compare_metric(
     runs: Sequence[RunRecord],
     metric: str = "relevant_recall",
@@ -167,6 +392,11 @@ def plot_compare_metric(
         "relevant_rate": "Relevant rate (cumul.)",
         "section_query_rate": "Query rate (section)",
         "section_relevant_rate": "Relevant rate (section)",
+        "batch_query_precision": "Batch Query Precision (QP)",
+        "batch_relevant_recall": "Batch Relevant Recall (RR)",
+        "batch_f1_score": "Batch F1 score",
+        "batch_query_rate": "Batch query rate",
+        "batch_relevant_rate": "Batch relevant rate",
     }
 
     fig, ax = plt.subplots(figsize=(9, 5))
@@ -190,7 +420,14 @@ def plot_compare_metric(
                 ha="center", va="center", transform=ax.transAxes)
     else:
         ax.legend(loc="best", fontsize=8)
-        if metric in ("query_precision", "relevant_recall", "f1_score"):
+        if metric in (
+            "query_precision",
+            "relevant_recall",
+            "f1_score",
+            "batch_query_precision",
+            "batch_relevant_recall",
+            "batch_f1_score",
+        ):
             ax.set_ylim(-0.02, 1.05)
 
     ax.set_xlabel("Tiles processed")

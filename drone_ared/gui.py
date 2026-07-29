@@ -1040,6 +1040,14 @@ class MainWindow:
             text="Also checkpoint when each video ends",
             variable=self.metrics_ckpt_on_video_var,
         ).pack(anchor="w", pady=int(1*s))
+        self.metrics_batch_enabled_var = tk.BooleanVar(
+            value=bool(getattr(ml0, "batch_metrics_enabled", True))
+        )
+        ttk.Checkbutton(
+            metrics_log_frame,
+            text="Also log batch-window QP/RR (per N tiles)",
+            variable=self.metrics_batch_enabled_var,
+        ).pack(anchor="w", pady=int(1*s))
         self._metrics_run_line_var = tk.StringVar(value="No metrics run yet.")
         ttk.Label(
             metrics_log_frame,
@@ -1206,6 +1214,9 @@ class MainWindow:
             ).strip() or "runs"
             self.config.metrics_logging.checkpoint_on_video_end = bool(
                 self.metrics_ckpt_on_video_var.get()
+            )
+            self.config.metrics_logging.batch_metrics_enabled = bool(
+                self.metrics_batch_enabled_var.get()
             )
 
             # Terminal logging (repeating prints + optional A_REDIN VERBOSE_FLAGS)

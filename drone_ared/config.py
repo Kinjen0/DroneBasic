@@ -103,7 +103,7 @@ class AREDConfig:
     """
     kappa: float = 1.0          # higher = more queries (more paranoid)
     l_buf_size: int = 10000      # memory bound for labeled points (circular)
-    k_comp_pts: int = 5         # how many nearest to consider (enables neighborhood merge)
+    k_comp_pts: int = 2         # how many nearest to consider (enables neighborhood merge)
     qs_var: int = 1             # 0=diameter, 1=average NN distance (single link style)
     data_aug_var: Tuple[int, Tuple[int, int]] = (0, (0, 0))
     nghbhood_merge: bool = True
@@ -207,6 +207,10 @@ class MetricsLoggingConfig:
     output_dir: str = "runs"
     # Also write a checkpoint when each video ends (in addition to every N tiles).
     checkpoint_on_video_end: bool = True
+    # Secondary track: QP/RR/F1 for each checkpoint window only (batch metrics).
+    # Cumulative running metrics are always written when enabled=True; this flag
+    # only toggles the per-window batch_* fields and batches.csv rows.
+    batch_metrics_enabled: bool = True
     # How "first appearance of a class" counts as a should-query positive:
     #   "paper"      — paper definition: first sample of *any* class is a positive
     #                  (fair for cold-start; unfair if a warm-started A_RED already knows the class).

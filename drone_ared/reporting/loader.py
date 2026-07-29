@@ -136,6 +136,25 @@ class RunRecord:
                 continue
         return out
 
+    @property
+    def has_batch_metrics(self) -> bool:
+        """True if any checkpoint recorded batch-window QP/RR."""
+        for c in self.checkpoints:
+            if c.get("batch_metrics_available"):
+                return True
+            if c.get("batch_query_precision") is not None:
+                return True
+        return False
+
+    def batch_series(self, metric: str = "query_precision") -> List[tuple]:
+        """List of (tiles_processed, value) for a batch-window metric.
+
+        ``metric`` may be a bare name (``query_precision``) or already prefixed
+        (``batch_query_precision``).
+        """
+        field = metric if str(metric).startswith("batch_") else f"batch_{metric}"
+        return self.checkpoint_series(field)
+
     def final_value(self, *keys: str, default: Any = None) -> Any:
         """Look up a final metric by trying keys in order (final_metrics then last checkpoint)."""
         fm = self.final_metrics or {}

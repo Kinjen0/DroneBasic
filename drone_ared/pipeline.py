@@ -304,6 +304,7 @@ class DroneAREDController:
                 run_params=params,
                 enabled=True,
                 checkpoint_on_video_end=bool(getattr(ml, "checkpoint_on_video_end", True)),
+                batch_metrics_enabled=bool(getattr(ml, "batch_metrics_enabled", True)),
             )
             # Surface path for GUI
             self.stats["metrics_run_dir"] = str(self.run_metrics_logger.run_dir)

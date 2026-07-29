@@ -66,6 +66,33 @@ result.adapter.save_state("merged.pkl")
 
 Headless tests: `python -m unittest drone_ared.tests.test_model_merge -v`
 
+## Running metrics (cumulative + batch)
+
+With **Running Metrics Log** enabled, each Start writes `runs/<run_id>/`:
+
+| File | Contents |
+|------|----------|
+| `run.json` | Params + checkpoints + final metrics |
+| `checkpoints.csv` | Cumulative QP/RR/F1 **and** `batch_*` window scores |
+| `batches.csv` | Batch-window extract for alternate reporting |
+| `final_metrics.json` / `final_audit.txt` | Full-run (cumulative) package |
+
+- **Cumulative** fields (`query_precision`, …): scores over all tiles from run start → checkpoint.
+- **Batch** fields (`batch_query_precision`, …): scores for tiles since the previous checkpoint only. First-of-class still uses full-stream context (no double-counting across batches).
+
+```bash
+# Cumulative curves / report (unchanged defaults)
+python run_report.py curves --runs-dir runs
+python run_report.py report --runs-dir runs --out reports/latest
+
+# Batch-window curves / report
+python run_report.py batch-curves --runs-dir runs
+python run_report.py batch-report --runs-dir runs --out reports/batch_latest
+python run_report.py compare --metric batch_relevant_recall --runs-dir runs
+```
+
+Tests: `python -m unittest drone_ared.tests.test_batch_metrics -v`
+
 ## Expandability
 
 - All major pieces are in their own files with ABCs or clear hooks:

@@ -4,10 +4,15 @@ RunMetricsLogger — periodic running metrics + per-run disk packages.
 Every N tiles (default 5000), computes QP / RR / F1 via the same paper formulas
 as metrics.evaluate_from_annotations_and_queries, and appends a checkpoint.
 
+Each checkpoint also records **batch-window** scores (QP/RR/F1 for tiles since
+the previous checkpoint only). Cumulative fields keep their original names;
+batch fields use a ``batch_`` prefix.
+
 Each Start creates:
   runs/<run_id>/
     run.json           full document (params + checkpoints + final)
-    checkpoints.csv    flat table for plotting
+    checkpoints.csv    flat table for plotting (cumulative + batch columns)
+    batches.csv        batch-window extract (alternate reporting convenience)
     final_audit.txt    human-readable final summary (on finalize)
 """
 
@@ -22,7 +27,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
 from . import metrics as ared_metrics
-from .metrics import summarize_for_checkpoint, make_tile_key
+from .metrics import (
+    summarize_for_checkpoint,
+    summarize_for_batch_checkpoint,
+    make_tile_key,
+)
 from .label_sentinels import is_persistable_label
 from .logutil import vprint
 
@@ -63,12 +72,69 @@ CHECKPOINT_CSV_FIELDS = [
     "qp_improvement_ratio_vs_random",
     "rr_improvement_ratio_vs_random",
     "relevant_recall_strict",
+    # Batch-window quality scores (tiles since previous checkpoint only)
+    "batch_tile_start",
+    "batch_tile_end",
+    "batch_tiles",
+    "batch_index",
+    "batch_query_precision",
+    "batch_relevant_recall",
+    "batch_f1_score",
+    "batch_n_should_query",
+    "batch_tp",
+    "batch_fp",
+    "batch_fn",
+    "batch_query_rate",
+    "batch_relevant_rate",
+    "batch_baseline_random_qp",
+    "batch_baseline_random_rr",
+    "batch_qp_improvement_ratio_vs_random",
+    "batch_rr_improvement_ratio_vs_random",
+    "batch_relevant_recall_strict",
+    "batch_total_relevant_tiles",
+    "batch_total_relevant_tiles_queried",
+    "batch_metrics_available",
+    "batch_note",
     "ared_clusters",
     "ared_known_labels",
     "elapsed_sec",
     "current_video",
     "metrics_available",
     "note",
+]
+
+# Convenience extract for alternate batch reporting (subset + shared counters)
+BATCH_CSV_FIELDS = [
+    "checkpoint_index",
+    "reason",
+    "tiles_processed",
+    "batch_index",
+    "batch_tile_start",
+    "batch_tile_end",
+    "batch_tiles",
+    "section_ared_queries",
+    "section_query_rate",
+    "section_relevant_rate",
+    "batch_query_precision",
+    "batch_relevant_recall",
+    "batch_f1_score",
+    "batch_n_should_query",
+    "batch_tp",
+    "batch_fp",
+    "batch_fn",
+    "batch_query_rate",
+    "batch_relevant_rate",
+    "batch_baseline_random_qp",
+    "batch_baseline_random_rr",
+    "batch_qp_improvement_ratio_vs_random",
+    "batch_rr_improvement_ratio_vs_random",
+    "batch_relevant_recall_strict",
+    "batch_total_relevant_tiles",
+    "batch_total_relevant_tiles_queried",
+    "batch_metrics_available",
+    "batch_note",
+    "elapsed_sec",
+    "current_video",
 ]
 
 
@@ -118,12 +184,15 @@ class RunMetricsLogger:
         run_params: Optional[Dict[str, Any]] = None,
         enabled: bool = True,
         checkpoint_on_video_end: bool = True,
+        batch_metrics_enabled: bool = True,
     ):
         self.enabled = bool(enabled)
         self.checkpoint_every = max(1, int(checkpoint_every or 5000))
         self.checkpoint_on_video_end = bool(checkpoint_on_video_end)
+        self.batch_metrics_enabled = bool(batch_metrics_enabled)
         self.run_params: Dict[str, Any] = dict(run_params or {})
         self.run_params["metrics_checkpoint_every"] = self.checkpoint_every
+        self.run_params["batch_metrics_enabled"] = self.batch_metrics_enabled
 
         self.run_id = make_run_id(self.run_params)
         self.base_dir = Path(output_dir).resolve()
@@ -142,11 +211,13 @@ class RunMetricsLogger:
         self.status = "running"
         self.checkpoints: List[Dict[str, Any]] = []
         self.final_metrics: Optional[Dict[str, Any]] = None
+        self.final_batch_metrics: Optional[Dict[str, Any]] = None
         self.last_checkpoint: Optional[Dict[str, Any]] = None
         self._lock = threading.Lock()
         self._last_checkpoint_tiles = 0
         self._finalized = False
         self._csv_path = self.run_dir / "checkpoints.csv"
+        self._batch_csv_path = self.run_dir / "batches.csv"
         self._json_path = self.run_dir / "run.json"
 
         if self.enabled:
@@ -191,6 +262,9 @@ class RunMetricsLogger:
                 f"F1={snap.get('f1_score')}  "
                 f"QR={snap.get('query_rate')} RelRate={snap.get('relevant_rate')}  "
                 f"secQR={snap.get('section_query_rate')} secRel={snap.get('section_relevant_rate')}  "
+                f"batch QP={snap.get('batch_query_precision')} "
+                f"RR={snap.get('batch_relevant_recall')} "
+                f"F1={snap.get('batch_f1_score')}  "
                 f"queries={snap.get('ared_queries')}  ({reason})"
             )
             vprint(line)
@@ -336,6 +410,22 @@ class RunMetricsLogger:
                         print(f"[RunMetrics] Could not write final_audit.txt: {e}")
 
             self.final_metrics = _json_safe(compact) if compact else None
+            # Last batch window summary (does not replace cumulative final_metrics)
+            if self.last_checkpoint and self.last_checkpoint.get("batch_metrics_available"):
+                self.final_batch_metrics = _json_safe(
+                    {
+                        k: self.last_checkpoint.get(k)
+                        for k in BATCH_CSV_FIELDS
+                        if k.startswith("batch_") or k in (
+                            "checkpoint_index",
+                            "section_ared_queries",
+                            "section_query_rate",
+                            "section_relevant_rate",
+                        )
+                    }
+                )
+            else:
+                self.final_batch_metrics = None
             self.status = status
             self.ended_at = _utc_now_iso()
 
@@ -353,6 +443,7 @@ class RunMetricsLogger:
                             "ended_at": self.ended_at,
                             "run_params": _json_safe(self.run_params),
                             "final_metrics": full_doc,
+                            "final_batch_metrics": self.final_batch_metrics,
                             "last_checkpoint": _json_safe(self.last_checkpoint),
                         },
                         f,
@@ -366,10 +457,13 @@ class RunMetricsLogger:
             qp = (self.final_metrics or {}).get("query_precision")
             rr = (self.final_metrics or {}).get("relevant_recall")
             f1 = (self.final_metrics or {}).get("f1_score")
+            bqp = (self.last_checkpoint or {}).get("batch_query_precision")
+            brr = (self.last_checkpoint or {}).get("batch_relevant_recall")
             err = (self.final_metrics or {}).get("error")
             print(
                 f"[RunMetrics] Finalized run → {self.run_dir} (status={status}) "
                 f"QP={qp} RR={rr} F1={f1}"
+                f" | last batch QP={bqp} RR={brr}"
                 + (f" ERROR={err}" if err else "")
             )
             return self.last_checkpoint
@@ -378,6 +472,15 @@ class RunMetricsLogger:
         c = self.last_checkpoint
         if not c:
             return "No metrics checkpoint yet."
+        batch_bit = ""
+        if c.get("batch_metrics_available"):
+            batch_bit = (
+                f" | batch QP={c.get('batch_query_precision')}  "
+                f"RR={c.get('batch_relevant_recall')}  "
+                f"F1={c.get('batch_f1_score')}"
+            )
+        elif c.get("batch_note"):
+            batch_bit = f" | batch pending ({c.get('batch_note')})"
         if c.get("metrics_available"):
             return (
                 f"Running @ {c.get('tiles_processed')} tiles: "
@@ -387,12 +490,14 @@ class RunMetricsLogger:
                 f"secQR={c.get('section_query_rate')}  secRel={c.get('section_relevant_rate')}  "
                 f"queries={c.get('ared_queries')}  frames={c.get('frames_read')}  "
                 f"classes={c.get('classes_discovered_x_of_y')}"
+                f"{batch_bit}"
             )
         return (
             f"Running @ {c.get('tiles_processed')} tiles: "
             f"queries={c.get('ared_queries')} frames={c.get('frames_read')}  "
             f"QR={c.get('query_rate')} secQR={c.get('section_query_rate')}  "
             f"(QP/RR/RelRate pending — need more DB labels)"
+            f"{batch_bit}"
         )
 
     # ------------------------------------------------------------------
@@ -463,6 +568,38 @@ class RunMetricsLogger:
         denom = max(1, hi - lo)
         return round(n_rel / denom, 4)
 
+    def _empty_batch_fields(
+        self,
+        tiles_prev: int,
+        tiles_now: int,
+        note: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Default batch_* keys when batch metrics are skipped or unavailable."""
+        return {
+            "batch_tile_start": tiles_prev,
+            "batch_tile_end": tiles_now,
+            "batch_tiles": max(0, tiles_now - tiles_prev),
+            "batch_index": len(self.checkpoints) + 1,
+            "batch_query_precision": None,
+            "batch_relevant_recall": None,
+            "batch_f1_score": None,
+            "batch_n_should_query": None,
+            "batch_tp": None,
+            "batch_fp": None,
+            "batch_fn": None,
+            "batch_query_rate": None,
+            "batch_relevant_rate": None,
+            "batch_baseline_random_qp": None,
+            "batch_baseline_random_rr": None,
+            "batch_qp_improvement_ratio_vs_random": None,
+            "batch_rr_improvement_ratio_vs_random": None,
+            "batch_relevant_recall_strict": None,
+            "batch_total_relevant_tiles": None,
+            "batch_total_relevant_tiles_queried": None,
+            "batch_metrics_available": False,
+            "batch_note": note,
+        }
+
     def _build_snapshot(self, controller: "DroneAREDController", reason: str) -> Dict[str, Any]:
         stats = controller.stats or {}
         tiles = int(stats.get("tiles_processed", 0) or 0)
@@ -510,6 +647,7 @@ class RunMetricsLogger:
             "metrics_available": False,
             "note": None,
         }
+        base.update(self._empty_batch_fields(tiles_prev, tiles))
 
         # Section relevant rate (needs DB labels for tiles in this window)
         try:
@@ -522,10 +660,27 @@ class RunMetricsLogger:
         # Label-only: counters only
         if getattr(controller, "label_only_mode", False):
             base["note"] = "label_only_mode (no A/RED query decisions)"
+            base["batch_note"] = "label_only_mode"
             return base
 
+        # Load annotations once; reuse for cumulative + batch evaluation
+        processed: List[Tuple] = []
+        queried: List[Tuple] = []
+        anns: List[Dict[str, Any]] = []
         try:
-            result = self._compute_full_metrics(controller)
+            processed = list(getattr(controller, "processed_identities", None) or [])
+            queried = list(getattr(controller, "queried_identities", None) or [])
+            if processed:
+                videos = sorted({p[0] for p in processed if p and p[0]})
+                for v in videos:
+                    anns.extend(self._load_annotations_for_video(controller, v))
+        except Exception as e:
+            vprint(f"[RunMetrics] annotation preload failed: {e}")
+
+        try:
+            result = self._compute_full_metrics(
+                controller, processed=processed, queried=queried, annotations=anns
+            )
             if result and "error" not in result:
                 summ = summarize_for_checkpoint(result)
                 base.update({
@@ -557,45 +712,90 @@ class RunMetricsLogger:
             base["note"] = f"metrics_error: {e}"
             print(f"[RunMetrics] Checkpoint metrics failed: {e}")
 
+        # Secondary track: batch-window QP/RR for (tiles_prev, tiles]
+        if self.batch_metrics_enabled:
+            try:
+                batch_result = self._compute_batch_metrics(
+                    controller,
+                    tiles_prev=tiles_prev,
+                    tiles_now=tiles,
+                    section_queries=int(section.get("section_ared_queries") or 0),
+                    batch_index=int(base["checkpoint_index"]),
+                    processed=processed,
+                    queried=queried,
+                    annotations=anns,
+                )
+                batch_summ = summarize_for_batch_checkpoint(batch_result or {})
+                base.update(batch_summ)
+                # Align batch rates with section counters when batch eval succeeded
+                if batch_summ.get("batch_metrics_available"):
+                    if base.get("batch_query_rate") is None:
+                        base["batch_query_rate"] = base.get("section_query_rate")
+                    if base.get("batch_relevant_rate") is None:
+                        base["batch_relevant_rate"] = base.get("section_relevant_rate")
+            except Exception as e:
+                base["batch_note"] = f"batch_metrics_error: {e}"
+                base["batch_metrics_available"] = False
+                print(f"[RunMetrics] Batch metrics failed: {e}")
+        else:
+            base["batch_note"] = "batch_metrics_disabled"
+
         return base
 
-    def _compute_full_metrics(self, controller: "DroneAREDController") -> Optional[Dict[str, Any]]:
-        """Evaluate over all processed tiles this run (multi-video aware)."""
-        processed = list(getattr(controller, "processed_identities", None) or [])
-        queried = list(getattr(controller, "queried_identities", None) or [])
-        if not processed:
-            return {"error": "no processed tiles"}
-
-        # Annotations for every video that appears in processed keys
-        videos = sorted({p[0] for p in processed if p and p[0]})
-        anns: List[Dict[str, Any]] = []
-        for v in videos:
-            anns.extend(self._load_annotations_for_video(controller, v))
-
-        if not anns:
-            return {"error": "no annotations in DB for processed tiles yet"}
-
+    def _eval_context(self, controller: "DroneAREDController") -> Dict[str, Any]:
+        """Shared warm-start / query-count knobs for cumulative and batch eval."""
+        run_params = dict(self.run_params)
+        known_at_start = set(
+            getattr(controller, "ared_known_labels_at_run_start", None) or set()
+        )
+        fo_mode = "auto"
+        try:
+            fo_mode = (run_params or {}).get("first_occurrence_mode") or "auto"
+        except Exception:
+            fo_mode = "auto"
         ared_qc = {}
         if getattr(controller, "ared_adapter", None):
             try:
                 ared_qc = controller.ared_adapter.get_query_counts() or {}
             except Exception:
                 ared_qc = {}
+        return {
+            "run_params": run_params,
+            "known_at_start": known_at_start,
+            "fo_mode": str(fo_mode),
+            "ared_qc": ared_qc,
+        }
 
+    def _compute_full_metrics(
+        self,
+        controller: "DroneAREDController",
+        *,
+        processed: Optional[List[Tuple]] = None,
+        queried: Optional[List[Tuple]] = None,
+        annotations: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Evaluate over all processed tiles this run (multi-video aware)."""
+        if processed is None:
+            processed = list(getattr(controller, "processed_identities", None) or [])
+        if queried is None:
+            queried = list(getattr(controller, "queried_identities", None) or [])
+        if not processed:
+            return {"error": "no processed tiles"}
+
+        if annotations is None:
+            videos = sorted({p[0] for p in processed if p and p[0]})
+            anns: List[Dict[str, Any]] = []
+            for v in videos:
+                anns.extend(self._load_annotations_for_video(controller, v))
+        else:
+            anns = list(annotations)
+
+        if not anns:
+            return {"error": "no annotations in DB for processed tiles yet"}
+
+        ctx = self._eval_context(controller)
         stream_total = len(processed)
         ared_query_count = int((controller.stats or {}).get("ared_queries", len(queried)))
-        run_params = dict(self.run_params)
-
-        # Warm-start fair eval: first-of-class only if class was unknown at Start.
-        known_at_start = set(getattr(controller, "ared_known_labels_at_run_start", None) or set())
-        fo_mode = "auto"
-        try:
-            fo_mode = (
-                (run_params or {}).get("first_occurrence_mode")
-                or "auto"
-            )
-        except Exception:
-            fo_mode = "auto"
 
         result = ared_metrics.evaluate_from_annotations_and_queries(
             anns,
@@ -603,14 +803,84 @@ class RunMetricsLogger:
             total_points=stream_total,
             ared_query_count_override=ared_query_count,
             processed_keys=processed,
-            run_params=run_params,
-            ared_query_counts=ared_qc,
-            known_classes_at_start=known_at_start,
-            first_occurrence_mode=str(fo_mode),
+            run_params=ctx["run_params"],
+            ared_query_counts=ctx["ared_qc"],
+            known_classes_at_start=ctx["known_at_start"],
+            first_occurrence_mode=ctx["fo_mode"],
         )
         result["n_processed_in_run"] = stream_total
         result["ared_queries_made"] = ared_query_count
         return result
+
+    def _compute_batch_metrics(
+        self,
+        controller: "DroneAREDController",
+        *,
+        tiles_prev: int,
+        tiles_now: int,
+        section_queries: int,
+        batch_index: int,
+        processed: Optional[List[Tuple]] = None,
+        queried: Optional[List[Tuple]] = None,
+        annotations: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Evaluate QP/RR for the batch window (tiles_prev, tiles_now]."""
+        if processed is None:
+            processed = list(getattr(controller, "processed_identities", None) or [])
+        if queried is None:
+            queried = list(getattr(controller, "queried_identities", None) or [])
+        if not processed:
+            return {
+                "error": "no processed tiles",
+                "batch_tile_start": tiles_prev,
+                "batch_tile_end": tiles_now,
+                "batch_tiles": 0,
+                "batch_index": batch_index,
+            }
+
+        lo = max(0, min(int(tiles_prev), len(processed)))
+        hi = max(lo, min(int(tiles_now), len(processed)))
+        if hi <= lo:
+            return {
+                "error": "empty batch window",
+                "batch_tile_start": lo,
+                "batch_tile_end": hi,
+                "batch_tiles": 0,
+                "batch_index": batch_index,
+            }
+
+        if annotations is None:
+            # Only need videos that appear in the prefix through hi
+            prefix = processed[:hi]
+            videos = sorted({p[0] for p in prefix if p and p[0]})
+            anns: List[Dict[str, Any]] = []
+            for v in videos:
+                anns.extend(self._load_annotations_for_video(controller, v))
+        else:
+            anns = list(annotations)
+
+        if not anns:
+            return {
+                "error": "no annotations in DB for batch stream prefix yet",
+                "batch_tile_start": lo,
+                "batch_tile_end": hi,
+                "batch_tiles": hi - lo,
+                "batch_index": batch_index,
+            }
+
+        ctx = self._eval_context(controller)
+        return ared_metrics.evaluate_batch_window(
+            anns,
+            queried,
+            processed,
+            batch_start=lo,
+            batch_end=hi,
+            ared_query_count_override=int(section_queries),
+            known_classes_at_start=ctx["known_at_start"],
+            first_occurrence_mode=ctx["fo_mode"],
+            run_params=ctx["run_params"],
+            batch_index=batch_index,
+        )
 
     def _load_annotations_for_video(self, controller: "DroneAREDController", video_path: str) -> List[Dict[str, Any]]:
         sx = sy = None
@@ -653,6 +923,12 @@ class RunMetricsLogger:
                 w.writeheader()
         except Exception as e:
             print(f"[RunMetrics] CSV init failed: {e}")
+        try:
+            with open(self._batch_csv_path, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=BATCH_CSV_FIELDS, extrasaction="ignore")
+                w.writeheader()
+        except Exception as e:
+            print(f"[RunMetrics] batches.csv init failed: {e}")
 
     def _append_csv(self, snap: Dict[str, Any]) -> None:
         try:
@@ -662,10 +938,17 @@ class RunMetricsLogger:
                 f.flush()
         except Exception as e:
             print(f"[RunMetrics] CSV append failed: {e}")
+        try:
+            with open(self._batch_csv_path, "a", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=BATCH_CSV_FIELDS, extrasaction="ignore")
+                w.writerow({k: snap.get(k) for k in BATCH_CSV_FIELDS})
+                f.flush()
+        except Exception as e:
+            print(f"[RunMetrics] batches.csv append failed: {e}")
 
     def _document(self) -> Dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "run_id": self.run_id,
             "status": self.status,
             "started_at": self.started_at,
@@ -674,7 +957,11 @@ class RunMetricsLogger:
             "run_params": _json_safe(self.run_params),
             "checkpoints": _json_safe(self.checkpoints),
             "final_metrics": self.final_metrics,
-            "notes": "",
+            "final_batch_metrics": self.final_batch_metrics,
+            "notes": (
+                "schema_version 2: checkpoints include cumulative QP/RR plus "
+                "batch_* window scores; see also batches.csv"
+            ),
         }
 
     def _write_json(self) -> None:

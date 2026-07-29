@@ -889,6 +889,286 @@ def summarize_for_checkpoint(result: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # -----------------------------------------------------------------------------
+# Batch-window metrics (secondary track: scores for one section of the stream)
+# -----------------------------------------------------------------------------
+
+def evaluate_batch_window(
+    annotations: List[Dict[str, Any]],
+    actual_queried_keys: List[Tuple],
+    processed_keys: List[Tuple],
+    batch_start: int,
+    batch_end: int,
+    *,
+    ared_query_count_override: Optional[int] = None,
+    known_classes_at_start: Optional[Set[str]] = None,
+    first_occurrence_mode: str = FIRST_OCCURRENCE_AUTO,
+    run_params: Optional[Dict[str, Any]] = None,
+    batch_index: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Paper QP/RR/F1 restricted to one batch window of the stream.
+
+    First-occurrence / should-query positives are computed over the **stream
+    prefix** ``processed_keys[:batch_end]`` (so a class first seen earlier is
+    not re-counted as a first inside this batch). TP/FP/FN, rates, and
+    baselines use only tiles in ``processed_keys[batch_start:batch_end]``.
+
+    ``batch_start`` / ``batch_end`` are half-open indices into ``processed_keys``
+    (same convention as Python slicing).
+    """
+    processed_keys = [normalize_tile_key(k) for k in (processed_keys or [])]
+    actual_queried_keys = [normalize_tile_key(k) for k in (actual_queried_keys or [])]
+
+    n_proc = len(processed_keys)
+    lo = max(0, min(int(batch_start), n_proc))
+    hi = max(lo, min(int(batch_end), n_proc))
+    batch_keys = processed_keys[lo:hi]
+    prefix_keys = processed_keys[:hi]
+
+    meta = {
+        "batch_tile_start": lo,
+        "batch_tile_end": hi,
+        "batch_tiles": len(batch_keys),
+        "batch_index": batch_index,
+        "stream_prefix_tiles": len(prefix_keys),
+    }
+
+    if not batch_keys:
+        return {
+            "error": "empty batch window",
+            **meta,
+            "query_precision": None,
+            "relevant_recall": None,
+            "f1_score": None,
+        }
+    if not prefix_keys:
+        return {
+            "error": "no processed tiles in stream prefix",
+            **meta,
+        }
+
+    # Annotations / should-query over the full prefix (first-occurrence context)
+    prefix_set = set(prefix_keys)
+    prefix_anns = [a for a in (annotations or []) if make_tile_key(a) in prefix_set]
+    if not prefix_anns:
+        return {
+            "error": "no annotations in DB for batch stream prefix yet",
+            **meta,
+        }
+
+    known_display: List[str] = []
+    if known_classes_at_start:
+        seen_k: Set[str] = set()
+        for c in known_classes_at_start:
+            if c is None:
+                continue
+            s = str(c).strip()
+            if not is_persistable_label(s):
+                continue
+            n = _norm_class_label(s)
+            if n and n not in seen_k:
+                seen_k.add(n)
+                known_display.append(s)
+    known_norm = _persistable_known_set(set(known_display) if known_display else None)
+    effective_first_mode = resolve_first_occurrence_mode(first_occurrence_mode, known_norm)
+
+    should_prefix = compute_should_query_from_annotations(
+        prefix_anns,
+        known_classes=set(known_display) if known_display else None,
+        first_occurrence_mode=effective_first_mode,
+    )
+
+    # Restrict should-map and queries to this batch window only
+    batch_keyset = set(batch_keys)
+    should_batch = {k: v for k, v in should_prefix.items() if k in batch_keyset}
+    queried_batch = [k for k in actual_queried_keys if k in batch_keyset]
+
+    total_batch = len(batch_keys)
+    metrics = compute_query_metrics(queried_batch, should_batch, total_points=total_batch)
+
+    # Relevant-class designation from prefix annotations (class-level, same as full eval)
+    relevant_classes: Set[str] = {
+        str(a.get("label", "")).strip()
+        for a in prefix_anns
+        if a.get("relevant") and is_persistable_label(str(a.get("label", "")).strip())
+    }
+    relevant_norm = {_norm_class_label(c) for c in relevant_classes}
+
+    # Strict RR over relevant-class tiles *in this batch only*
+    batch_anns = [a for a in prefix_anns if make_tile_key(a) in batch_keyset]
+    relevant_only_batch: Dict[Tuple, bool] = {}
+    for a in batch_anns:
+        lab = str(a.get("label", "")).strip()
+        if _norm_class_label(lab) in relevant_norm:
+            relevant_only_batch[make_tile_key(a)] = True
+    actual_batch_set = set(queried_batch)
+    n_rel_pos = len(relevant_only_batch)
+    rel_tp = sum(1 for k in relevant_only_batch if k in actual_batch_set)
+    rel_fn = n_rel_pos - rel_tp
+    metrics["relevant_recall_strict"] = (
+        round(rel_tp / n_rel_pos, 4) if n_rel_pos > 0 else 0.0
+    )
+    metrics["relevant_tp"] = rel_tp
+    metrics["relevant_fn"] = rel_fn
+    metrics["n_relevant_positives"] = n_rel_pos
+
+    # Authoritative batch query count (section queries when provided)
+    n_queries = (
+        int(ared_query_count_override)
+        if ared_query_count_override is not None
+        else metrics["n_actual_queries"]
+    )
+    if ared_query_count_override is not None:
+        metrics["n_actual_queries"] = n_queries
+
+    # Paper relevant rate for the batch: fraction of *streamed batch* points that
+    # are relevant-class (denominator = batch stream size, not only labeled).
+    n_rel_class_points = sum(
+        1
+        for a in batch_anns
+        if str(a.get("label", "")).strip() in relevant_classes
+        and is_persistable_label(str(a.get("label", "")).strip())
+    )
+    rel_rate = n_rel_class_points / max(1, total_batch)
+    metrics["relevant_rate"] = round(rel_rate, 4)
+    metrics["query_rate"] = round(n_queries / max(1, total_batch), 4)
+
+    baseline = random_baseline_at_budget(n_queries, total_batch, rel_rate)
+    metrics.update({f"baseline_{k}": v for k, v in baseline.items()})
+    query_rate = metrics["query_rate"]
+    metrics["baseline_random_relevant_recall"] = round(query_rate, 4)
+    metrics["baseline_random_relevant_recall_note"] = (
+        "Paper: RelevantRecall_RDM = Query Rate (fraction of batch stream queried at random)."
+    )
+    qp = metrics["query_precision"]
+    rr = metrics["relevant_recall"]
+    qp_rdm = baseline.get("random_query_precision_approx") or rel_rate
+    rr_rdm = query_rate
+    metrics["qp_improvement_ratio_vs_random"] = (
+        round(qp / qp_rdm, 3) if qp_rdm and qp_rdm > 0 else None
+    )
+    metrics["rr_improvement_ratio_vs_random"] = (
+        round(rr / rr_rdm, 3) if rr_rdm and rr_rdm > 0 else None
+    )
+
+    # Relevant tiles in batch (for checkpoint columns)
+    total_relevant_tiles = n_rel_class_points
+    total_relevant_tiles_queried = sum(
+        1
+        for a in batch_anns
+        if str(a.get("label", "")).strip() in relevant_classes
+        and is_persistable_label(str(a.get("label", "")).strip())
+        and make_tile_key(a) in actual_batch_set
+    )
+
+    metrics["first_occurrence_mode"] = effective_first_mode
+    metrics["first_occurrence_mode_requested"] = first_occurrence_mode
+    metrics["known_classes_at_start"] = sorted(known_display, key=str.casefold)
+    metrics["batch_tile_start"] = lo
+    metrics["batch_tile_end"] = hi
+    metrics["batch_tiles"] = len(batch_keys)
+    metrics["batch_index"] = batch_index
+    metrics["stream_prefix_tiles"] = len(prefix_keys)
+    metrics["n_processed_in_batch"] = len(batch_keys)
+    metrics["ared_queries_in_batch"] = n_queries
+    metrics["total_relevant_tiles"] = total_relevant_tiles
+    metrics["total_relevant_tiles_queried"] = total_relevant_tiles_queried
+    # detailed_breakdown-compatible keys for summarize_for_checkpoint
+    metrics["detailed_breakdown"] = {
+        "TOTAL_RELEVANT_TILES": total_relevant_tiles,
+        "TOTAL_RELEVANT_TILES_QUERIED": total_relevant_tiles_queried,
+        "TOTAL_QUERIES_ARED_MADE": n_queries,
+        "BATCH_TILE_START": lo,
+        "BATCH_TILE_END": hi,
+        "BATCH_TILES": len(batch_keys),
+        "STREAM_PREFIX_TILES": len(prefix_keys),
+        "FIRST_OCCURRENCE_MODE": effective_first_mode,
+        "NOTE": (
+            "Batch metrics: should-query firsts use stream prefix through batch_end; "
+            "TP/FP/FN and rates restricted to batch window only."
+        ),
+    }
+    metrics["audit"] = metrics["detailed_breakdown"]
+
+    if run_params:
+        metrics["run_params"] = dict(run_params)
+    else:
+        metrics["run_params"] = None
+
+    metrics["summary"] = (
+        f"BATCH[{lo}:{hi}] "
+        f"QP={metrics['query_precision']:.3f}  "
+        f"RR={metrics['relevant_recall']:.3f}  "
+        f"F1={metrics['f1_score']:.3f}  "
+        f"Queries={n_queries}  "
+        f"tiles={len(batch_keys)}  "
+        f"should={metrics['n_should_query']}  "
+        f"vs Random≈{baseline['random_query_precision_approx']:.3f}"
+    )
+    return metrics
+
+
+def summarize_for_batch_checkpoint(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Compact batch-window fields with ``batch_`` prefix for CSV / snapshots.
+
+    Safe with partial/error results; missing keys become None.
+    """
+    if not result or result.get("error"):
+        return {
+            "batch_query_precision": None,
+            "batch_relevant_recall": None,
+            "batch_f1_score": None,
+            "batch_n_should_query": None,
+            "batch_tp": None,
+            "batch_fp": None,
+            "batch_fn": None,
+            "batch_query_rate": None,
+            "batch_relevant_rate": None,
+            "batch_baseline_random_qp": None,
+            "batch_baseline_random_rr": None,
+            "batch_qp_improvement_ratio_vs_random": None,
+            "batch_rr_improvement_ratio_vs_random": None,
+            "batch_relevant_recall_strict": None,
+            "batch_total_relevant_tiles": None,
+            "batch_total_relevant_tiles_queried": None,
+            "batch_tile_start": result.get("batch_tile_start") if result else None,
+            "batch_tile_end": result.get("batch_tile_end") if result else None,
+            "batch_tiles": result.get("batch_tiles") if result else None,
+            "batch_index": result.get("batch_index") if result else None,
+            "batch_metrics_available": False,
+            "batch_note": (result or {}).get("error") or "no batch metrics",
+            "batch_summary": None,
+        }
+
+    summ = summarize_for_checkpoint(result)
+    return {
+        "batch_query_precision": summ.get("query_precision"),
+        "batch_relevant_recall": summ.get("relevant_recall"),
+        "batch_f1_score": summ.get("f1_score"),
+        "batch_n_should_query": summ.get("n_should_query"),
+        "batch_tp": summ.get("tp"),
+        "batch_fp": summ.get("fp"),
+        "batch_fn": summ.get("fn"),
+        "batch_query_rate": summ.get("query_rate"),
+        "batch_relevant_rate": summ.get("relevant_rate"),
+        "batch_baseline_random_qp": summ.get("baseline_random_qp"),
+        "batch_baseline_random_rr": summ.get("baseline_random_rr"),
+        "batch_qp_improvement_ratio_vs_random": summ.get("qp_improvement_ratio_vs_random"),
+        "batch_rr_improvement_ratio_vs_random": summ.get("rr_improvement_ratio_vs_random"),
+        "batch_relevant_recall_strict": summ.get("relevant_recall_strict"),
+        "batch_total_relevant_tiles": summ.get("total_relevant_tiles"),
+        "batch_total_relevant_tiles_queried": summ.get("total_relevant_tiles_queried"),
+        "batch_tile_start": result.get("batch_tile_start"),
+        "batch_tile_end": result.get("batch_tile_end"),
+        "batch_tiles": result.get("batch_tiles"),
+        "batch_index": result.get("batch_index"),
+        "batch_metrics_available": True,
+        "batch_note": None,
+        "batch_summary": result.get("summary"),
+    }
+
+
+# -----------------------------------------------------------------------------
 # Helper for live runs: collect queried identities
 # -----------------------------------------------------------------------------
 

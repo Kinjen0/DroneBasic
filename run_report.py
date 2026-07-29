@@ -5,22 +5,34 @@ Generate paper-style charts and reports from saved A/RED run packages.
 Each pipeline Start (with metrics logging enabled) writes:
   runs/<run_id>/
     run.json
-    checkpoints.csv
+    checkpoints.csv      # cumulative + batch_* columns
+    batches.csv          # batch-window extract
     final_audit.txt
+
+Two metric tracks
+-----------------
+  cumulative (default)  QP/RR/F1 over all tiles from run start → checkpoint
+  batch                 QP/RR/F1 for tiles since the previous checkpoint only
 
 Examples
 --------
-  # Curves for the latest run under ./runs
+  # Curves for the latest run under ./runs (cumulative)
   python run_report.py curves --runs-dir runs
 
-  # Curves for a specific run directory
-  python run_report.py curves --run runs/20260714_...__kappa5__...
+  # Batch-window curves for a specific run
+  python run_report.py batch-curves --run runs/20260714_...__kappa5__...
 
   # Compare RR across all runs (different κ, etc.)
   python run_report.py compare --runs-dir runs --metric relevant_recall
 
+  # Compare batch RR across runs
+  python run_report.py compare --runs-dir runs --metric batch_relevant_recall
+
   # Full markdown report + figures into reports/<timestamp>/
   python run_report.py report --runs-dir runs --out reports/latest
+
+  # Batch-focused markdown report + batch figures
+  python run_report.py batch-report --runs-dir runs --out reports/batch_latest
 
   # Print summary table only (no plots)
   python run_report.py table --runs-dir runs
@@ -44,10 +56,14 @@ from drone_ared.reporting import (
     load_runs,
     discover_runs,
     plot_run_curves,
+    plot_batch_curves,
+    plot_batch_vs_cumulative,
     plot_compare_metric,
     plot_query_burden,
     write_markdown_report,
+    write_batch_markdown_report,
     runs_summary_table,
+    batch_runs_summary_table,
 )
 from drone_ared.reporting.plots import plot_final_qp_rr_scatter
 
@@ -72,6 +88,15 @@ def cmd_table(args) -> int:
     return 0
 
 
+def cmd_batch_table(args) -> int:
+    runs = _resolve_runs(args)
+    if not runs:
+        print("No runs found.")
+        return 1
+    print(batch_runs_summary_table(runs))
+    return 0
+
+
 def cmd_curves(args) -> int:
     runs = _resolve_runs(args)
     if not runs:
@@ -83,6 +108,28 @@ def cmd_curves(args) -> int:
         out = out_dir / f"{run.run_id}_curves.png"
         path = plot_run_curves(run, out)
         print(f"Wrote {path}")
+    return 0
+
+
+def cmd_batch_curves(args) -> int:
+    runs = _resolve_runs(args)
+    if not runs:
+        print("No runs found.")
+        return 1
+    out_dir = Path(args.out or "reports/figures")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for run in runs:
+        out = out_dir / f"{run.run_id}_batch_curves.png"
+        path = plot_batch_curves(run, out)
+        print(f"Wrote {path}")
+        if args.also_vs_cumulative:
+            for metric in ("query_precision", "relevant_recall", "f1_score"):
+                p = plot_batch_vs_cumulative(
+                    run,
+                    metric=metric,
+                    out_path=out_dir / f"{run.run_id}_batch_vs_cumul_{metric}.png",
+                )
+                print(f"Wrote {p}")
     return 0
 
 
@@ -111,11 +158,16 @@ def cmd_report(args) -> int:
     fig_dir = out_dir / "figures"
     fig_dir.mkdir(exist_ok=True)
 
+    mode = getattr(args, "mode", None) or "cumulative"
+
     figure_paths = {}
     # Per-run curves
     for run in runs:
         p = plot_run_curves(run, fig_dir / f"{run.run_id}_curves.png")
         figure_paths[f"Curves — {run.short_label()}"] = p
+        if mode in ("both",) and run.has_batch_metrics:
+            bp = plot_batch_curves(run, fig_dir / f"{run.run_id}_batch_curves.png")
+            figure_paths[f"Batch curves — {run.short_label()}"] = bp
 
     # Cross-run comparisons when >1 run
     if len(runs) > 1:
@@ -130,6 +182,16 @@ def cmd_report(args) -> int:
                 runs, metric=metric, out_path=fig_dir / f"compare_{metric}.png", title=title
             )
             figure_paths[title] = p
+        if mode == "both":
+            for metric, title in (
+                ("batch_relevant_recall", "Batch Relevant Recall comparison"),
+                ("batch_query_precision", "Batch Query Precision comparison"),
+                ("batch_f1_score", "Batch F1 comparison"),
+            ):
+                p = plot_compare_metric(
+                    runs, metric=metric, out_path=fig_dir / f"compare_{metric}.png", title=title
+                )
+                figure_paths[title] = p
         figure_paths["Query burden"] = plot_query_burden(runs, fig_dir / "query_burden.png")
         figure_paths["QP vs RR"] = plot_final_qp_rr_scatter(runs, fig_dir / "qp_rr_scatter.png")
     else:
@@ -140,11 +202,62 @@ def cmd_report(args) -> int:
         out_dir / "report.md",
         figure_paths=figure_paths,
         title=args.title or "A/RED Drone Run Report",
+        mode=mode,
     )
     print(f"Report written to {md}")
     print(f"Figures in {fig_dir}")
     print()
     print(runs_summary_table(runs))
+    return 0
+
+
+def cmd_batch_report(args) -> int:
+    runs = _resolve_runs(args)
+    if not runs:
+        print("No runs found.")
+        return 1
+    out_dir = Path(
+        args.out or f"reports/batch_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    )
+    out_dir.mkdir(parents=True, exist_ok=True)
+    fig_dir = out_dir / "figures"
+    fig_dir.mkdir(exist_ok=True)
+
+    figure_paths = {}
+    for run in runs:
+        p = plot_batch_curves(run, fig_dir / f"{run.run_id}_batch_curves.png")
+        figure_paths[f"Batch curves — {run.short_label()}"] = p
+        if args.also_vs_cumulative:
+            for metric in ("query_precision", "relevant_recall"):
+                vp = plot_batch_vs_cumulative(
+                    run,
+                    metric=metric,
+                    out_path=fig_dir / f"{run.run_id}_batch_vs_cumul_{metric}.png",
+                )
+                figure_paths[f"Batch vs cumul {metric} — {run.short_label()}"] = vp
+
+    if len(runs) > 1:
+        for metric, title in (
+            ("batch_relevant_recall", "Batch Relevant Recall comparison"),
+            ("batch_query_precision", "Batch Query Precision comparison"),
+            ("batch_f1_score", "Batch F1 comparison"),
+            ("section_query_rate", "Section query rate comparison"),
+        ):
+            p = plot_compare_metric(
+                runs, metric=metric, out_path=fig_dir / f"compare_{metric}.png", title=title
+            )
+            figure_paths[title] = p
+
+    md = write_batch_markdown_report(
+        runs,
+        out_dir / "batch_report.md",
+        figure_paths=figure_paths,
+        title=args.title or "A/RED Drone Batch Metrics Report",
+    )
+    print(f"Batch report written to {md}")
+    print(f"Figures in {fig_dir}")
+    print()
+    print(batch_runs_summary_table(runs))
     return 0
 
 
@@ -157,7 +270,11 @@ def cmd_list(args) -> int:
     for d in dirs:
         try:
             r = load_run(d)
-            print(f"{r.run_id:60s}  status={r.status:10s}  ckpts={len(r.checkpoints):3d}  {r.short_label()}")
+            batch_tag = "batch=yes" if r.has_batch_metrics else "batch=no"
+            print(
+                f"{r.run_id:60s}  status={r.status:10s}  "
+                f"ckpts={len(r.checkpoints):3d}  {batch_tag:9s}  {r.short_label()}"
+            )
         except Exception as e:
             print(f"{d.name}: ERROR {e}")
     return 0
@@ -188,11 +305,35 @@ def main(argv: Optional[List[str]] = None) -> int:
     sp.add_argument("--run", action="append", help="Specific run dir (repeatable)")
     sp.set_defaults(func=cmd_table)
 
+    # batch-table
+    sp = sub.add_parser(
+        "batch-table",
+        parents=[common],
+        help="Print batch-window mean/median summary table",
+    )
+    sp.add_argument("--run", action="append", help="Specific run dir (repeatable)")
+    sp.set_defaults(func=cmd_batch_table)
+
     # curves
     sp = sub.add_parser("curves", parents=[common], help="QP/RR/F1 vs tiles for each run")
     sp.add_argument("--run", action="append", help="Specific run dir (repeatable)")
     sp.add_argument("--out", default=None, help="Output directory for PNGs")
     sp.set_defaults(func=cmd_curves)
+
+    # batch-curves
+    sp = sub.add_parser(
+        "batch-curves",
+        parents=[common],
+        help="Batch-window QP/RR/F1 vs tiles for each run",
+    )
+    sp.add_argument("--run", action="append", help="Specific run dir (repeatable)")
+    sp.add_argument("--out", default=None, help="Output directory for PNGs")
+    sp.add_argument(
+        "--also-vs-cumulative",
+        action="store_true",
+        help="Also write cumulative vs batch overlay plots",
+    )
+    sp.set_defaults(func=cmd_batch_curves)
 
     # compare
     sp = sub.add_parser("compare", parents=[common], help="Overlay one metric across runs")
@@ -209,6 +350,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             "section_query_rate",
             "section_relevant_rate",
             "ared_queries",
+            "batch_query_precision",
+            "batch_relevant_recall",
+            "batch_f1_score",
+            "batch_query_rate",
+            "batch_relevant_rate",
         ],
     )
     sp.add_argument("--out", default=None, help="Output PNG path")
@@ -220,7 +366,29 @@ def main(argv: Optional[List[str]] = None) -> int:
     sp.add_argument("--run", action="append", help="Specific run dir (repeatable)")
     sp.add_argument("--out", default=None, help="Output directory")
     sp.add_argument("--title", default=None, help="Report title")
+    sp.add_argument(
+        "--mode",
+        default="cumulative",
+        choices=["cumulative", "batch", "both"],
+        help="Report focus (default: cumulative; use both to include batch tables)",
+    )
     sp.set_defaults(func=cmd_report)
+
+    # batch-report
+    sp = sub.add_parser(
+        "batch-report",
+        parents=[common],
+        help="Batch-window markdown report + batch figures",
+    )
+    sp.add_argument("--run", action="append", help="Specific run dir (repeatable)")
+    sp.add_argument("--out", default=None, help="Output directory")
+    sp.add_argument("--title", default=None, help="Report title")
+    sp.add_argument(
+        "--also-vs-cumulative",
+        action="store_true",
+        help="Also include cumulative vs batch overlay figures",
+    )
+    sp.set_defaults(func=cmd_batch_report)
 
     args = p.parse_args(argv)
     return int(args.func(args) or 0)
