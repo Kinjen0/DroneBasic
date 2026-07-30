@@ -248,6 +248,65 @@ class TileAnnotationDB:
         self.conn.commit()
         print(f"[TileDB] Saved/updated annotation: {Path(vpath).name} f{key.abs_frame} [{key.tile_row},{key.tile_col}] -> '{label}' (rel={relevant})")
 
+    def bulk_set_annotations(
+        self,
+        rows: List[Tuple[TileKey, str, bool]],
+        *,
+        quiet: bool = True,
+        commit_every: int = 2000,
+    ) -> int:
+        """Upsert many annotations in one or few transactions (high-volume GT materialization).
+
+        Each row is ``(TileKey, label, relevant)``. Control sentinels and empty labels are skipped.
+        Returns the number of rows written. When ``quiet`` is True (default), suppresses per-row logs.
+        """
+        if not rows:
+            return 0
+        cur = self.conn.cursor()
+        written = 0
+        pending = 0
+        ts = time.time()
+        sql = """
+            INSERT INTO annotations
+                (video_path, abs_frame, tile_row, tile_col, tile_width, tile_height,
+                 stride_x, stride_y, crop_x, crop_y, label, relevant, embedding, embedding_dim, updated_ts)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
+            ON CONFLICT(video_path, abs_frame, tile_row, tile_col, tile_width, tile_height)
+            DO UPDATE SET
+                label=excluded.label,
+                relevant=excluded.relevant,
+                stride_x=COALESCE(excluded.stride_x, stride_x),
+                stride_y=COALESCE(excluded.stride_y, stride_y),
+                crop_x=COALESCE(excluded.crop_x, crop_x),
+                crop_y=COALESCE(excluded.crop_y, crop_y),
+                updated_ts=excluded.updated_ts
+        """
+        for key, label, relevant in rows:
+            if not key.video_path or not label or not is_persistable_label(label):
+                continue
+            vpath = self._normalize_video_path(key.video_path)
+            cx = key.tile_col * key.tile_width
+            cy = key.tile_row * key.tile_height
+            cur.execute(sql, (
+                vpath, int(key.abs_frame), int(key.tile_row), int(key.tile_col),
+                int(key.tile_width), int(key.tile_height),
+                key.stride_x, key.stride_y,
+                int(cx), int(cy),
+                str(label), 1 if relevant else 0,
+                ts,
+            ))
+            written += 1
+            pending += 1
+            if pending >= max(1, int(commit_every)):
+                self.conn.commit()
+                pending = 0
+                ts = time.time()
+        if pending:
+            self.conn.commit()
+        if written > 0:
+            print(f"[TileDB] bulk_set_annotations wrote {written} row(s)")
+        return written
+
     def get_annotations_for_video(self, video_path: str, limit: Optional[int] = None,
                                   tile_width: Optional[int] = None,
                                   tile_height: Optional[int] = None,

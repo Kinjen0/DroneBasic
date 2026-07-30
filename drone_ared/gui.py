@@ -836,7 +836,18 @@ class MainWindow:
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self._on_closing)
         menubar.add_cascade(label="File", menu=file_menu)
+
+        # Side pipeline: SeaDronesSee auto-labels from COCO boxes (isolated window).
+        # Does not alter interactive labeling / multi-frame browser behavior.
+        tools_menu = tk.Menu(menubar, tearoff=0)
+        tools_menu.add_command(
+            label="SeaDronesSee Auto Pipeline…",
+            command=self._open_seadronesee_window,
+        )
+        menubar.add_cascade(label="Tools", menu=tools_menu)
+
         self.root.config(menu=menubar)
+        self._sds_window = None
 
         # ---- Scrollable main area (control bar + params can exceed viewport height) ----
         # Outer: canvas + vertical scrollbar so buttons/params at the bottom stay reachable.
@@ -2046,6 +2057,30 @@ class MainWindow:
             self.controller.set_label_store(self.label_store)
             self._refresh_class_list()
             messagebox.showinfo("Label Cache", f"Loaded cache with {len(self.label_store)} entries.")
+
+    def _open_seadronesee_window(self):
+        """Open the isolated SeaDronesSee auto-labeled A/RED side window.
+
+        Completely separate controller/DB from the interactive drone path.
+        """
+        try:
+            from .seadronesee.gui_panel import open_seadronesee_window
+        except Exception as e:
+            messagebox.showerror(
+                "SeaDronesSee",
+                f"Could not load SeaDronesSee panel:\n{e}",
+            )
+            return
+        # Reuse existing window if still open
+        win = getattr(self, "_sds_window", None)
+        try:
+            if win is not None and win.winfo_exists():
+                win.lift()
+                win.focus_force()
+                return
+        except Exception:
+            pass
+        self._sds_window = open_seadronesee_window(parent=self.root)
 
     def _save_ared_state(self):
         if not self.controller.ared_adapter:

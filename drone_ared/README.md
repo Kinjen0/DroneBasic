@@ -103,11 +103,48 @@ python run_report.py compare --metric batch_relevant_recall --runs-dir runs
 
 Tests: `python -m unittest drone_ared.tests.test_batch_metrics -v`
 
+## SeaDronesSee Auto Pipeline (side path)
+
+Auto-labeled A/RED on `SeaDroneSeeProcessedDataExport` using **COCO bounding boxes**
+as ground truth (no multi-frame human labeling). Isolated from the interactive path.
+
+### GUI
+
+From the main app: **Tools → SeaDronesSee Auto Pipeline…**  
+Opens a separate window (does not change interactive labeling behavior).
+
+### CLI
+
+```bash
+# Smoke: raw 32×32 tiles, 2 images
+python -m drone_ared.seadronesee --mode raw --tile 32 --split train --max-images 2
+
+# Full train split, DINOv3 features
+python -m drone_ared.seadronesee --mode dino --tile 32 --split train
+
+# Save model after run
+python -m drone_ared.seadronesee --mode raw --tile 32 --max-tiles 5000 --save-model sds_raw32.pkl
+```
+
+### Behavior
+
+| Item | Detail |
+|------|--------|
+| Labels | Tile ∩ COCO box → category name + relevant; else `water` / not relevant |
+| Features | **raw** flattened pixels or **DINOv3** (same HF extractor as interactive) |
+| Tile size | Adjustable (16 / 32 / …) |
+| Metrics | Same QP/RR/F1 + `runs/<run_id>/` packages (`pipeline=seadronesee_auto`) |
+| Model I/O | Same A_RED `.pkl` save/load via `AREDAdapter` |
+| Annotation DB | Default `seadronesee_tile_annotations.db` (not the interactive drone DB) |
+
+Package: `drone_ared/seadronesee/`. Tests: `python -m unittest drone_ared.tests.test_sds_* -v`
+
 ## Expandability
 
 - All major pieces are in their own files with ABCs or clear hooks:
   - `frame_source.py` — video files and image directories as one stream interface
   - `tiling.py` — add new tiler strategies
+  - `seadronesee/` — COCO auto-label side path (raw or DINO → A_RED)
 
 ## Tiling and Overlap
 
