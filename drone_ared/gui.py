@@ -826,6 +826,7 @@ class MainWindow:
         menubar = tk.Menu(self.root)
         file_menu = tk.Menu(menubar, tearoff=0)
         file_menu.add_command(label="Load Video(s)...", command=self._load_videos)
+        file_menu.add_command(label="Load Image Folder...", command=self._load_image_folder)
         file_menu.add_command(label="Save Label Cache", command=self._save_label_cache)
         file_menu.add_command(label="Load Label Cache", command=self._load_label_cache)
         file_menu.add_separator()
@@ -895,6 +896,7 @@ class MainWindow:
 
         s = self.ui_scale
         ttk.Button(ctrl, text="Load Videos", command=self._load_videos).pack(side="left", padx=int(2*s))
+        ttk.Button(ctrl, text="Load Image Folder", command=self._load_image_folder).pack(side="left", padx=int(2*s))
         self.start_btn = ttk.Button(ctrl, text="Start", command=self._start)
         self.start_btn.pack(side="left", padx=int(2*s))
         ttk.Button(ctrl, text="Pause", command=self.controller.pause).pack(side="left", padx=int(2*s))
@@ -1240,6 +1242,30 @@ class MainWindow:
         if files:
             self.config.video_paths = list(files)
             self.status_var.set(f"Loaded {len(files)} video(s). Ready to Start.")
+
+    def _load_image_folder(self):
+        """Treat a directory of images as one video-equivalent stream."""
+        folder = filedialog.askdirectory(title="Select image folder (one stream)")
+        if not folder:
+            return
+        try:
+            from .frame_source import list_image_files
+            n = len(list_image_files(folder))
+        except Exception:
+            n = 0
+        if n == 0:
+            messagebox.showwarning(
+                "Image Folder",
+                f"No supported images found in:\n{folder}\n\n"
+                "Expected extensions: .jpg .jpeg .png .bmp .tif .tiff .webp",
+            )
+            return
+        # Replace current source list with this folder (same UX as Load Videos).
+        self.config.video_paths = [folder]
+        name = Path(folder).name
+        self.status_var.set(
+            f"Loaded image folder: {name} ({n} frames). Ready to Start."
+        )
 
     def _start(self):
         self._read_params_into_config()
@@ -3178,6 +3204,7 @@ class MultiFrameLabelBrowser(tk.Toplevel):
 
         ttk.Button(top, text="Reload", command=self._load_videos).pack(side="left", padx=4)
         ttk.Button(top, text="Browse any video file (unlabeled OK)", command=self._browse_video_file).pack(side="left", padx=4)
+        ttk.Button(top, text="Browse image folder", command=self._browse_image_folder).pack(side="left", padx=4)
 
         ttk.Separator(top, orient="vertical").pack(side="left", fill="y", padx=8)
 
@@ -3384,6 +3411,29 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         )
         if not path:
             return
+        self._set_browser_media_path(path)
+
+    def _browse_image_folder(self):
+        """Pick a directory of images as a video-equivalent stream for the browser."""
+        from tkinter import filedialog
+        folder = filedialog.askdirectory(title="Select image folder to browse/label")
+        if not folder:
+            return
+        try:
+            from .frame_source import list_image_files
+            n = len(list_image_files(folder))
+        except Exception:
+            n = 0
+        if n == 0:
+            messagebox.showwarning(
+                "Image Folder",
+                f"No supported images found in:\n{folder}",
+            )
+            return
+        self._set_browser_media_path(folder)
+
+    def _set_browser_media_path(self, path: str):
+        """Remember *path* (video file or image folder) and reload the frame strip."""
         # Remember full path; show basename in the combo when it matches a DB key.
         known = getattr(self, "_known_video_paths", None)
         if known is None:
@@ -3393,7 +3443,7 @@ class MultiFrameLabelBrowser(tk.Toplevel):
             known.append(path)
         self.current_video = path
         base = Path(path).name
-        # Prefer selecting the DB key (filename) if annotations exist under it
+        # Prefer selecting the DB key (filename / folder name) if annotations exist under it
         try:
             db_vids = list(self.tile_db.list_videos() or [])
         except Exception:
@@ -3418,10 +3468,15 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         if not v:
             return
 
-        # Resolve filename-only DB keys to a real openable path (cv2 needs a file on disk).
+        # Resolve filename-only DB keys to a real openable path (video file or image folder).
         openable = self._resolve_video_for_open(v)
-        if openable is None and Path(v).is_file():
-            openable = str(Path(v).resolve())
+        if openable is None:
+            try:
+                pv = Path(v)
+                if pv.is_file() or pv.is_dir():
+                    openable = str(pv.resolve())
+            except Exception:
+                pass
         self.current_video = openable or v  # openable for decode; v still used for DB (basename OK)
 
         # Always go through the helper so we read the live entry boxes the user just typed.
@@ -3468,15 +3523,14 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         except Exception:
             stride = 3
 
-        # Get total frames from video so we can show EVERY frame according to stride (not just annotated ones)
+        # Get total frames from video / image folder so we can show EVERY frame
+        # according to stride (not just annotated ones).
         total_frames = 0
         if openable:
             try:
-                import cv2
-                cap = cv2.VideoCapture(openable)
-                if cap.isOpened():
-                    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-                cap.release()
+                from .frame_source import open_frame_source
+                with open_frame_source(openable) as src:
+                    total_frames = int(src.frame_count or 0)
             except Exception:
                 total_frames = 0
 
@@ -3928,19 +3982,19 @@ class MultiFrameLabelBrowser(tk.Toplevel):
         if not self.current_video:
             return None
         try:
-            import cv2
-            cap = cv2.VideoCapture(self.current_video)
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_idx))
-            ret, frame = cap.read()
-            cap.release()
-            if not ret or frame is None:
+            from .frame_source import open_frame_source
+            with open_frame_source(self.current_video) as src:
+                rgb = src.read_frame(int(frame_idx))
+            if rgb is None:
                 return None
-            h, w = frame.shape[:2]
+            h, w = rgb.shape[:2]
             scale = min(max_w / max(1, w), max_h / max(1, h), 1.0)
             nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
-            small = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
-            rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
-            return Image.fromarray(rgb).convert("RGB")
+            img = Image.fromarray(rgb).convert("RGB")
+            if (nw, nh) != (w, h):
+                resample = getattr(getattr(Image, "Resampling", Image), "BILINEAR", Image.BILINEAR)
+                img = img.resize((nw, nh), resample)
+            return img
         except Exception as e:
             print(f"[MultiFrameBrowser] PIL generate error for frame {frame_idx}: {e}")
             return None
@@ -4607,16 +4661,13 @@ class MultiFrameLabelBrowser(tk.Toplevel):
             return
 
         try:
-            import cv2
-            cap = cv2.VideoCapture(self.current_video)
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(self.selected_frame))
-            ret, frame = cap.read()
-            cap.release()
-            if not ret or frame is None:
+            from .frame_source import open_frame_source
+            with open_frame_source(self.current_video) as src:
+                frame_rgb = src.read_frame(int(self.selected_frame))
+            if frame_rgb is None:
                 ttk.Label(container, text="Could not decode frame.").pack()
                 return
 
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             frame_h, frame_w = frame_rgb.shape[:2]
 
             try:
@@ -5002,7 +5053,14 @@ class MultiFrameLabelBrowser(tk.Toplevel):
                 ann.get("crop_y", ann["tile_row"]*ann["tile_height"]) + ann["tile_height"])
 
         paths, dirs = self._video_search_context()
-        openable = self.current_video if (self.current_video and Path(self.current_video).is_file()) else None
+        openable = None
+        if self.current_video:
+            try:
+                cp = Path(self.current_video)
+                if cp.is_file() or cp.is_dir():
+                    openable = str(cp)
+            except Exception:
+                openable = None
         if not openable:
             openable = self._resolve_video_for_open(ann.get("video_path") or "")
         img = extract_tile_from_video(

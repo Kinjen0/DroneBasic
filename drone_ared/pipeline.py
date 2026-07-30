@@ -2,7 +2,7 @@
 Pipeline / Controller.
 
 Owns the background threads that:
-  1. Read video frames (cv2 preferred)
+  1. Read frames via FrameSource (video file or image directory)
   2. Tile them (GridTiler)
   3. Extract features (DINO)
   4. Feed embeddings into AREDAdapter (which may request labels via queue)
@@ -25,13 +25,6 @@ from typing import Optional, List, Callable, Any, Dict, Tuple  # List still used
 import numpy as np
 from PIL import Image
 
-try:
-    import cv2
-    HAS_CV2 = True
-except ImportError:
-    HAS_CV2 = False
-    print("[pipeline] WARNING: opencv (cv2) not found. Video reading will be limited.")
-
 from .config import PipelineConfig
 from .tiling import GridTiler, Tile
 from .feature_extractor import DINOFeatureExtractor, FeatureExtractor
@@ -49,6 +42,7 @@ from .label_sentinels import (
 )
 from .run_metrics_logger import RunMetricsLogger
 from .logutil import vprint
+from .frame_source import open_frame_source
 
 
 class LabelRequest:
@@ -1088,16 +1082,25 @@ class DroneAREDController:
                     pass
 
     def _process_one_video(self, video_path: str):
-        if not HAS_CV2:
-            print("[Controller] cv2 not available - cannot read video.")
+        # FrameSource covers video files and image directories. Label-only opens its own source.
+        if self.label_only_mode:
+            # Delegate entirely to the dedicated label-only processor.
+            # It handles its own frame reading, stride, navigation (back/forward/jump),
+            # resume skipping, and labeling. This avoids interference with the
+            # normal A/RED frame-batching loop.
+            self._process_label_only_tiles(video_path)
+            print(f"[Pipeline] Finished label-only for video: {video_path}")
             return
 
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            print(f"[Controller] Failed to open {video_path}")
+        try:
+            src = open_frame_source(video_path)
+        except Exception as e:
+            print(f"[Controller] Failed to open frame source {video_path}: {e}")
             return
 
-        print(f"[Pipeline] Starting video: {video_path}")
+        # Prefer the source's identity path (resolved dir/file) for tile DB keys.
+        identity = getattr(src, "identity_path", None) or video_path
+        print(f"[Pipeline] Starting source: {identity}")
 
         # Log tiling configuration (helps confirm overlap is active)
         try:
@@ -1107,15 +1110,6 @@ class DroneAREDController:
                   f"frame_stride={t.frame_stride}")
         except Exception:
             pass
-
-        if self.label_only_mode:
-            # Delegate entirely to the dedicated label-only processor.
-            # It handles its own video reading, stride, navigation (back/forward/jump),
-            # resume skipping, and labeling. This avoids interference with the
-            # normal A/RED frame-batching loop.
-            self._process_label_only_tiles(video_path)
-            print(f"[Pipeline] Finished label-only for video: {video_path}")
-            return
 
         frame_idx = -1
         frame_stride = max(1, self.config.tiling.frame_stride)
@@ -1130,8 +1124,8 @@ class DroneAREDController:
                     if self._stop_event.is_set():
                         break
 
-                    ret, frame = cap.read()
-                    if not ret:
+                    ret, frame_rgb = src.read()
+                    if not ret or frame_rgb is None:
                         break
 
                     frame_idx += 1
@@ -1142,14 +1136,11 @@ class DroneAREDController:
 
                     vprint(f"[Pipeline] Processing frame {frame_idx} (stride={frame_stride})")
 
-                    # Convert BGR (cv2) -> RGB
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-
-                    # Tile - attach full identity (video + absolute frame). This is crucial
+                    # Tile - attach full identity (video/folder + absolute frame). This is crucial
                     # so that the exact label DB can recall previous human decisions even when
                     # frame_stride changes between runs.
                     tiles = self.tiler.tile_frame(frame_rgb, frame_idx, self._global_tile_counter,
-                                                  video_path=video_path)
+                                                  video_path=identity)
                     if not tiles:
                         continue
 
@@ -1181,12 +1172,12 @@ class DroneAREDController:
                 if batch_imgs:
                     self._process_batch(batch_tiles, batch_imgs)
 
-                print(f"[Pipeline] Finished video: {video_path}. Total tiles processed so far: {self.stats['tiles_processed']}")
+                print(f"[Pipeline] Finished source: {identity}. Total tiles processed so far: {self.stats['tiles_processed']}")
 
             finally:
-                cap.release()
+                src.release()
         except Exception as e:
-            print(f"[Pipeline] ERROR while processing video {video_path}: {e}")
+            print(f"[Pipeline] ERROR while processing source {video_path}: {e}")
             import traceback
             traceback.print_exc()
 
@@ -1306,41 +1297,43 @@ class DroneAREDController:
         if self.tile_db is None:
             print("[Pipeline] Label Only mode: No tile_db configured. Labels will not be saved.")
 
-        # Initialize navigation cursor state for this video
-        self._label_only_current_video = video_path
+        try:
+            src = open_frame_source(video_path)
+        except Exception as e:
+            print(f"[Pipeline] Label Only: could not open {video_path} for seeking/navigation: {e}")
+            return
+
+        identity = getattr(src, "identity_path", None) or video_path
+
+        # Initialize navigation cursor state for this video / image folder
+        self._label_only_current_video = identity
         self._label_only_current_frame = 0
         self._label_only_current_tile_idx = 0
         self._label_only_nav_command = None
         self._label_only_navigation_event.clear()
         self._label_only_force_present = False  # when True (after explicit nav), present even labeled tiles (for review)
 
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            print(f"[Pipeline] Label Only: could not open {video_path} for seeking/navigation")
-            return
-
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 999999)
+        total_frames = int(src.frame_count) if src.frame_count else 999999
         frame_stride = max(1, self.config.tiling.frame_stride)
 
-        # Probe once to learn how many tiles the GridTiler produces for frames of this video.
-        # This is constant for uniform grid + fixed video resolution (typical case).
+        # Probe once to learn how many tiles the GridTiler produces for frames of this source.
+        # This is constant for uniform grid + fixed resolution (typical case).
         # We use it for proper modular wrap-around instead of magic numbers.
         tiles_per_frame = 1
         try:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            ret, probe = cap.read()
-            if ret and probe is not None:
-                prgb = cv2.cvtColor(probe, cv2.COLOR_BGR2RGB)
-                probe_tiles = self.tiler.tile_frame(prgb, 0, 0, video_path=video_path)
-                if probe_tiles:
-                    tiles_per_frame = len(probe_tiles)
+            if src.seek(0):
+                ret, probe = src.read()
+                if ret and probe is not None:
+                    probe_tiles = self.tiler.tile_frame(probe, 0, 0, video_path=identity)
+                    if probe_tiles:
+                        tiles_per_frame = len(probe_tiles)
         except Exception:
             pass
         if tiles_per_frame < 1:
             tiles_per_frame = 1
 
         # Reset seek head
-        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        src.seek(0)
 
         auto_skip_count = 0
 
@@ -1386,15 +1379,15 @@ class DroneAREDController:
                     time.sleep(0.01)
 
                 # Seek + decode the frame indicated by current cursor
-                cap.set(cv2.CAP_PROP_POS_FRAMES, self._label_only_current_frame)
-                ret, frame = cap.read()
-                if not ret or frame is None:
-                    # Reached end or unreadable frame; stop for this video
+                if not src.seek(self._label_only_current_frame):
+                    break
+                ret, frame_rgb = src.read()
+                if not ret or frame_rgb is None:
+                    # Reached end or unreadable frame; stop for this source
                     break
 
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 tiles_on_frame = self.tiler.tile_frame(frame_rgb, self._label_only_current_frame,
-                                                       0, video_path=video_path)
+                                                       0, video_path=identity)
                 if not tiles_on_frame:
                     # No tiles possible on this frame (very small resolution?); move forward
                     self._label_only_force_present = False
@@ -1418,7 +1411,7 @@ class DroneAREDController:
                         # Use current tiler stride so we scope correctly under overlap
                         sx = getattr(self.tiler, 'stride_x', None) if self.tiler else None
                         sy = getattr(self.tiler, 'stride_y', None) if self.tiler else None
-                        key = TileKey(video_path, tile.frame_idx, tile.tile_row, tile.tile_col,
+                        key = TileKey(identity, tile.frame_idx, tile.tile_row, tile.tile_col,
                                       tile.width, tile.height, stride_x=sx, stride_y=sy)
                         existing = self.tile_db.lookup_key(key)
                     except Exception:
@@ -1441,7 +1434,7 @@ class DroneAREDController:
 
                     if auto_skip_count % 20 == 0 and self.on_stats:
                         self.on_stats(self.stats.copy())
-                    time.sleep(0.002)  # yield; prevents 100% CPU spin on video decode for skips
+                    time.sleep(0.002)  # yield; prevents 100% CPU spin on decode for skips
                     continue
 
                 # Reset skip counter when we actually present something
@@ -1449,7 +1442,7 @@ class DroneAREDController:
 
                 # Present this tile to the (persistent) labeling dialog
                 req = LabelRequest(tile=tile, embedding=np.zeros(1, dtype=np.float32), meta={
-                    "video_path": video_path,
+                    "video_path": identity,
                     "frame": tile.frame_idx,
                     "abs_frame": tile.frame_idx,
                     "row": tile.tile_row,
@@ -1505,7 +1498,7 @@ class DroneAREDController:
                 if self.tile_db is not None:
                     try:
                         cx, cy = tile.bbox[0], tile.bbox[1]
-                        key = TileKey(video_path, tile.frame_idx, tile.tile_row, tile.tile_col,
+                        key = TileKey(identity, tile.frame_idx, tile.tile_row, tile.tile_col,
                                       tile.width, tile.height)
                         self.tile_db.set_annotation_for_key(key, label, rel, embedding=None, crop_x=cx, crop_y=cy)
                     except Exception as e:
@@ -1521,7 +1514,7 @@ class DroneAREDController:
                     self._advance_label_only_cursor(1, frame_stride, total_frames, tiles_per_frame)
 
         finally:
-            cap.release()
+            src.release()
 
     def _advance_label_only_cursor(self, delta: int, stride: int, total_frames: int, tiles_per_frame: int = 30):
         """Internal helper to move the labeling cursor (used by both normal flow and nav commands).

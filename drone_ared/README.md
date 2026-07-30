@@ -19,13 +19,23 @@ python run_drone_ared.py
 
 ## High-Level Flow
 
-1. Videos are read frame-by-frame (every Nth frame).
+1. Media is read frame-by-frame (every Nth frame): either a video file **or** a directory of images.
 2. Each selected frame is split into tiles (default 224x224 grid).
 3. Tiles are passed through a DINOv2 (or v3) model → embeddings.
 4. Embeddings are streamed into A_REDIN (the original implementation, imported without modification).
 5. When A_RED decides a tile is anomalous or near a relevant cluster, the GUI asks the user for a label + relevance flag.
 6. A persistent label store (embedding NN cache) can auto-answer repeated/similar tiles on this or future runs.
 7. Optional: save the current A_RED cluster state ("model") and reload it later for warm-start on similar data.
+
+### Image folders as video
+
+Use **File → Load Image Folder...** (or the toolbar button) to point at a directory of
+`.jpg` / `.png` / etc. The folder is treated as one stream: images are natural-sorted,
+non-recursive, and each file is frame index `0..N-1`. Annotation DB keys use the
+**folder basename** (same rules as video filenames). `frame_stride` still applies.
+
+Frame I/O is abstracted in `frame_source.py` (`VideoFileFrameSource` /
+`ImageSequenceFrameSource`); core A_RED is untouched.
 
 ## GUI Features (as requested)
 
@@ -96,6 +106,7 @@ Tests: `python -m unittest drone_ared.tests.test_batch_metrics -v`
 ## Expandability
 
 - All major pieces are in their own files with ABCs or clear hooks:
+  - `frame_source.py` — video files and image directories as one stream interface
   - `tiling.py` — add new tiler strategies
 
 ## Tiling and Overlap

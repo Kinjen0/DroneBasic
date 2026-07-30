@@ -766,12 +766,12 @@ def resolve_video_file(
     search_dirs: Optional[List[str | Path]] = None,
 ) -> Optional[str]:
     """
-    Map a DB video key (often just a filename like ``DJI_0018.MP4``) to a real
-    filesystem path that ``cv2.VideoCapture`` can open.
+    Map a DB video key (filename or folder basename) to a real filesystem path
+    that ``open_frame_source`` can open (video file **or** image directory).
 
     Search order:
-      1. ``name_or_path`` itself if it already exists on disk
-      2. Any path in ``search_paths`` whose basename matches
+      1. ``name_or_path`` itself if it is an existing file or directory
+      2. Any path in ``search_paths`` whose basename matches (file or dir)
       3. ``basename`` joined under each directory in ``search_dirs``
 
     Returns an absolute path string, or None if nothing is found.
@@ -783,10 +783,10 @@ def resolve_video_file(
     if not raw:
         return None
 
-    # 1) Already a usable path?
+    # 1) Already a usable path (video file or image folder)?
     try:
         p = Path(raw)
-        if p.is_file():
+        if p.is_file() or p.is_dir():
             return str(p.resolve())
     except Exception:
         pass
@@ -799,19 +799,26 @@ def resolve_video_file(
     if not base:
         return None
 
-    # 2) Known full paths (e.g. videos loaded in the main GUI this session)
+    def _basename_match(path: Path) -> bool:
+        try:
+            return path.name == base
+        except Exception:
+            return False
+
+    # 2) Known full paths (videos or image folders loaded in the GUI this session)
     for cand in search_paths or []:
         try:
             cp = Path(cand)
-            if cp.is_file() and cp.name == base:
+            if not (cp.is_file() or cp.is_dir()):
+                continue
+            if _basename_match(cp):
                 return str(cp.resolve())
-            # Also accept exact string match after normalize
-            if os.path.basename(str(cand).replace("\\", "/")) == base and cp.is_file():
+            if os.path.basename(str(cand).replace("\\", "/")) == base:
                 return str(cp.resolve())
         except Exception:
             continue
 
-    # 3) Look under candidate directories
+    # 3) Look under candidate directories (file or subfolder with matching name)
     seen_dirs = set()
     for d in search_dirs or []:
         try:
@@ -823,7 +830,7 @@ def resolve_video_file(
                 continue
             seen_dirs.add(key)
             hit = dp / base
-            if hit.is_file():
+            if hit.is_file() or hit.is_dir():
                 return str(hit.resolve())
         except Exception:
             continue
@@ -832,7 +839,7 @@ def resolve_video_file(
 
 
 # ------------------------------------------------------------------
-# Small helper to re-materialize a tile image from source video (no stored pixels)
+# Small helper to re-materialize a tile image from source media (no stored pixels)
 # ------------------------------------------------------------------
 
 def extract_tile_from_video(
@@ -844,18 +851,20 @@ def extract_tile_from_video(
     search_dirs: Optional[List[str | Path]] = None,
 ) -> Optional["Image.Image"]:
     """
-    Re-decode a specific frame from the video file and return the exact tile crop as PIL Image.
+    Re-decode a specific frame from a video file **or image folder** and return
+    the exact tile crop as a PIL Image.
+
     Used for review/edit UI so we never need to store the actual image data.
 
-    ``video_path`` may be a full path or a filename-only DB key. When it is only a
-    name, pass ``search_paths`` / ``search_dirs`` (or rely on callers to resolve first).
+    ``video_path`` may be a full path, a filename-only DB key, or a folder
+    basename (image-sequence sources). When it is only a name, pass
+    ``search_paths`` / ``search_dirs`` (or rely on callers to resolve first).
 
     Returns None if seek/read fails (common on some video containers or very large seeks).
     Note: frame-accurate seeking is not guaranteed for all compressed videos, but is usually
-    good enough for review/correction workflows.
+    good enough for review/correction workflows. Image-sequence seeks are exact by index.
     """
     try:
-        import cv2
         from PIL import Image
     except ImportError:
         return None
@@ -869,22 +878,28 @@ def extract_tile_from_video(
     if not openable:
         return None
 
-    cap = cv2.VideoCapture(openable)
-    if not cap.isOpened():
-        return None
-
     try:
-        # Try exact frame seek
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(abs_frame))
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            # Fallback: try to read sequentially a bit (rare)
-            cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(abs_frame) - 2))
-            for _ in range(5):
-                ret, frame = cap.read()
-                if ret and frame is not None:
+        from .frame_source import open_frame_source
+    except Exception:
+        try:
+            from drone_ared.frame_source import open_frame_source  # type: ignore
+        except Exception:
+            return None
+
+    src = None
+    try:
+        src = open_frame_source(openable)
+        frame = src.read_frame(int(abs_frame))
+        if frame is None:
+            # Mild fallback for imperfect video seeks: try nearby indices
+            for delta in (-1, 1, -2, 2):
+                alt = int(abs_frame) + delta
+                if alt < 0:
+                    continue
+                frame = src.read_frame(alt)
+                if frame is not None:
                     break
-        if not ret or frame is None:
+        if frame is None:
             return None
 
         x0, y0, x1, y1 = bbox
@@ -899,10 +914,13 @@ def extract_tile_from_video(
         crop = frame[y0:y1, x0:x1]
         if crop.size == 0:
             return None
-        rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-        return Image.fromarray(rgb).convert("RGB")
+        return Image.fromarray(crop).convert("RGB")
     except Exception as e:
         print(f"[TileDB] Warning: failed to re-extract tile from {video_path} frame {abs_frame}: {e}")
         return None
     finally:
-        cap.release()
+        if src is not None:
+            try:
+                src.release()
+            except Exception:
+                pass

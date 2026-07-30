@@ -234,6 +234,8 @@ class PipelineConfig:
     metrics_logging: MetricsLoggingConfig = field(default_factory=MetricsLoggingConfig)
 
     # Misc
+    # Each entry is a video file path *or* a directory of images (treated as one stream).
+    # Image folders use the directory basename as the annotation DB key.
     video_paths: list[str] = field(default_factory=list)
     output_dir: str = "outputs"
     random_seed: int = 42
